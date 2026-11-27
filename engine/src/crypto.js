@@ -264,6 +264,16 @@ function liftX(x) {
   return [x, (y & 1n) === 0n ? y : P - y];
 }
 
+export function isValidXOnlyPubkey(pubKeyBytes) {
+  try {
+    const pk = typeof pubKeyBytes === 'string' ? hexToBytes(pubKeyBytes) : pubKeyBytes;
+    if (!(pk instanceof Uint8Array) || pk.length !== 32) return false;
+    return liftX(bytesToBigInt(pk)) !== null;
+  } catch {
+    return false;
+  }
+}
+
 export function getPublicKey(privKeyBytes) {
   const priv = typeof privKeyBytes === 'string' ? hexToBytes(privKeyBytes) : privKeyBytes;
   if (priv.length !== 32) throw new Error('Private key must be 32 bytes');

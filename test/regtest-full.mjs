@@ -1,15 +1,18 @@
 #!/usr/bin/env node
-// Full-stack Bitcoin regtest E2E verification for eyezero (i0):
-//   1. Pure-JS Taproot HTLC Claim path on live bitcoind 31.3 (deriveTaprootHtlc + buildAndSignHtlcClaimTx),
-//      extracting secret S straight from Bitcoin L1 witness to settle HTLC_CLAIM on eyezero!
-//   2. Pure-JS Taproot HTLC CLTV Refund path on live bitcoind 31.3 (proves pre-timeout rejection + post-timeout confirm).
-//   3. Standalone Miner CLI (miner/src/cli.mjs -> runMinerOnce) syncing from ord 0.29.1, grinding real 0000...i0
-//      block offline, broadcasting commit+reveal, and verifying cold sync.
+// Full-stack Bitcoin regtest E2E verification for eyezero (i0) in the SAFE atomic swap order:
+//   1. Standalone Miner CLI (miner/src/cli.mjs) confirms Genesis, Block #1 (Alice earns I0),
+//      and Block #2 (Alice confirms HTLC_LOCK of 250 I0 for Bob with hashlock H, timeout T+20).
+//   2. Bob independently cold-syncs & verifies Alice's confirmed I0 escrow before funding BTC!
+//   3. Bob funds 0.05 real regtest BTC to the matching Taproot HTLC (CLTV T+8 < T+20).
+//   4. Alice claims 0.05 BTC via pure-JS Taproot HTLC Claim TX, revealing secret S in Bitcoin witness.
+//   5. Bob extracts S straight from the confirmed Bitcoin witness & settles HTLC_CLAIM in Block #3!
+//   6. Separately verifies the exact adjacent CLTV refund boundary:
+//      rejected when tip = H - 1 (cannot confirm in block H), accepted when tip = H, confirms in block H + 1!
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,13 +20,10 @@ import { join } from 'node:path';
 import {
   UNIT,
   V1_TEST_PARAMS,
-  applyBlock,
   assertStateConservation,
   buildAndSignHtlcClaimTx,
   buildAndSignHtlcRefundTx,
-  buildCandidateBlock,
   computeSwapId,
-  createGenesisState,
   deriveTaprootHtlc,
   getBalance,
   getPublicKeyHex,
@@ -31,14 +31,10 @@ import {
   signTx,
 } from '../engine/src/index.js';
 import { runMinerOnce, syncChainFromOrd } from '../miner/src/cli.mjs';
-import { mineVanityInscription } from '../miner/src/vanity.mjs';
+import { loadOrdInscribeDeps, mineVanityInscription } from '../miner/src/vanity.mjs';
 
-const ORD_INSCRIBE_ROOT =
-  process.env.ORD_INSCRIBE_ROOT ??
-  '/mnt/storagebox-workspaces/checkouts/ordinals-lab/ord-inscribe';
-const { BitcoindProvider, KeySigner, OrdClient, fundingUtxos } = await import(
-  `${ORD_INSCRIBE_ROOT}/dist/index.js`
-);
+const { ordInscribe } = await loadOrdInscribeDeps();
+const { BitcoindProvider, KeySigner, OrdClient, fundingUtxos } = ordInscribe;
 
 const BITCOIND =
   process.env.BITCOIND ??
@@ -158,94 +154,13 @@ async function waitOrdInsc(id) {
 }
 
 // =========================================================================
-// PART 1: Pure-JS Taproot HTLC Claim + CLTV Timeout Refund on live bitcoind
+// PART 1: Safe Atomic Swap Ordering (I0 HTLC_LOCK confirms BEFORE BTC funding!)
 // =========================================================================
 const aliceSk = '0000000000000000000000000000000000000000000000000000000000000021';
 const bobSk = '0000000000000000000000000000000000000000000000000000000000000022';
 const alicePk = getPublicKeyHex(aliceSk);
 const bobPk = getPublicKeyHex(bobSk);
 
-const secret1 = randomBytes(32).toString('hex');
-const hashlock1 = sha256Hex(Buffer.from(secret1, 'hex'));
-const htlc1 = deriveTaprootHtlc({
-  alicePubkey: alicePk,
-  bobPubkey: bobPk,
-  hashlock: hashlock1,
-  timeoutBtcHeight: 120,
-  network: 'regtest',
-});
-assert.ok(htlc1.address.startsWith('bcrt1p'), `expected bcrt1p Taproot address, got ${htlc1.address}`);
-
-// Bob funds 0.05 real regtest BTC to Taproot HTLC address
-const fundTxid1 = await rpc('sendtoaddress', [htlc1.address, 0.05], 'faucet');
-await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
-const fundTx1 = await rpc('getrawtransaction', [fundTxid1, true]);
-const out1 = fundTx1.vout.find((v) => v.scriptPubKey.address === htlc1.address);
-assert.ok(out1, 'HTLC output not found');
-
-// Alice builds & signs Taproot HTLC claim tx with pure-JS engine/src/btc-htlc.js
-const claimTx = buildAndSignHtlcClaimTx({
-  utxo: { txid: fundTxid1, vout: out1.n, value: BigInt(Math.round(out1.value * 1e8)) },
-  htlc: htlc1,
-  secretHex: secret1,
-  alicePrivKey: aliceSk,
-  destinationAddress: aliceBtcDest,
-  feeSats: 500n,
-});
-const broadcastClaimId = await rpc('sendrawtransaction', [claimTx.txHex]);
-assert.equal(broadcastClaimId, claimTx.txid);
-await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
-
-// Bob extracts the revealed secret S straight from the confirmed Bitcoin L1 witness!
-const confirmedClaim = await rpc('getrawtransaction', [claimTx.txid, true]);
-const revealedSecret = confirmedClaim.vin[0].txinwitness[1];
-assert.equal(revealedSecret, secret1, 'Secret extracted from Bitcoin L1 witness must match S');
-console.log(`[htlc-btc] PASS Claim: Taproot ${htlc1.address} claimed in ${claimTx.txid}, secret S extracted from witness!`);
-
-// Test CLTV Timeout Refund path
-let curH = await rpc('getblockcount');
-const refundHeight = curH + 3;
-const secret2 = randomBytes(32).toString('hex');
-const hashlock2 = sha256Hex(Buffer.from(secret2, 'hex'));
-const htlc2 = deriveTaprootHtlc({
-  alicePubkey: alicePk,
-  bobPubkey: bobPk,
-  hashlock: hashlock2,
-  timeoutBtcHeight: refundHeight,
-  network: 'regtest',
-});
-const fundTxid2 = await rpc('sendtoaddress', [htlc2.address, 0.03], 'faucet');
-await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
-const fundTx2 = await rpc('getrawtransaction', [fundTxid2, true]);
-const out2 = fundTx2.vout.find((v) => v.scriptPubKey.address === htlc2.address);
-
-const refundTx = buildAndSignHtlcRefundTx({
-  utxo: { txid: fundTxid2, vout: out2.n, value: BigInt(Math.round(out2.value * 1e8)) },
-  htlc: htlc2,
-  bobPrivKey: bobSk,
-  destinationAddress: bobBtcDest,
-  feeSats: 500n,
-});
-
-// Before refundHeight, bitcoind MUST reject the CLTV refund tx!
-let rejectedEarly = false;
-try {
-  await rpc('sendrawtransaction', [refundTx.txHex]);
-} catch (err) {
-  rejectedEarly = /non-final|locktime/i.test(err.message);
-}
-assert.ok(rejectedEarly, 'bitcoind must reject CLTV refund before timeoutBtcHeight');
-
-// Advance Bitcoin height to refundHeight -> bitcoind MUST accept & confirm Bob's refund!
-await rpc('generatetoaddress', [3, faucetAddr], 'faucet');
-const broadcastRefundId = await rpc('sendrawtransaction', [refundTx.txHex]);
-assert.equal(broadcastRefundId, refundTx.txid);
-await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
-console.log(`[htlc-btc] PASS CLTV Refund: rejected early, accepted & confirmed at height #${refundHeight} (${refundTx.txid})`);
-
-// =========================================================================
-// PART 2: Standalone Miner CLI (runMinerOnce) + full HTLC_CLAIM settlement
-// =========================================================================
 const tprv = KeySigner.generateThrowaway('regtest');
 const minerKeySigner = KeySigner.fromSecret(tprv, 'regtest');
 const addrs = await minerKeySigner.getAddresses();
@@ -279,6 +194,7 @@ await waitOrdHeight(btcH);
 await waitOrdInsc(gMined.inscriptionId);
 const genesisId = gMined.inscriptionId;
 
+const recoveryDir = join(work, 'recovery');
 const cliBase = {
   network: 'regtest',
   genesis: genesisId,
@@ -289,22 +205,29 @@ const cliBase = {
   'miner-pubkey': alicePk,
   'pow-bits': 12,
   'checkpoint-interval': 4,
+  'recovery-dir': recoveryDir,
 };
 
-// Block 1 via standalone Miner CLI (Alice mines 1,000 I0)
+// Step 1: Block #1 via standalone Miner CLI (Alice earns 1,000 I0)
 const r1 = await runMinerOnce({ ...cliBase, tip: genesisId });
 assert.ok(r1.inscriptionId.startsWith('000') && r1.broadcast);
+assert.ok(existsSync(r1.recoveryPath), 'Miner CLI must persist recovery bundle before broadcast');
 await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
 btcH = await rpc('getblockcount');
 await waitOrdHeight(btcH);
 await waitOrdInsc(r1.inscriptionId);
 console.log(`[miner-cli] Block #1 mined & confirmed: ${r1.inscriptionId} (${r1.hashes} hashes)`);
 
-// Block 2 via standalone Miner CLI: Alice submits HTLC_LOCK using hashlock1 from Part 1!
+// Step 2: Block #2: Alice locks 250 I0 in confirmed HTLC_LOCK BEFORE Bob funds any BTC!
 const chainId = genesisId.slice(0, 16);
+const secret1 = randomBytes(32).toString('hex');
+const hashlock1 = sha256Hex(Buffer.from(secret1, 'hex'));
+const i0Timeout = btcH + 24;
+const btcTimeout = btcH + 10;
+
 const lockTx = signTx(chainId, {
   type: 'HTLC_LOCK', from: alicePk, recipient: bobPk, amount: (250n * UNIT).toString(),
-  hashlock: hashlock1, timeoutBtcHeight: btcH + 20, nonce: 1, fee: '0',
+  hashlock: hashlock1, timeoutBtcHeight: i0Timeout, nonce: 1, fee: '0',
 }, aliceSk);
 const txFile2 = join(work, 'txs2.json');
 writeFileSync(txFile2, JSON.stringify([lockTx]));
@@ -316,8 +239,66 @@ await waitOrdHeight(btcH);
 await waitOrdInsc(r2.inscriptionId);
 console.log(`[miner-cli] Block #2 mined & confirmed (HTLC_LOCK): ${r2.inscriptionId}`);
 
-// Block 3 via standalone Miner CLI: Bob submits HTLC_CLAIM using the EXACT secret S extracted from Bitcoin L1 witness in Part 1!
+// Step 3: Bob independently cold-syncs & verifies Alice's CONFIRMED I0 escrow BEFORE funding BTC!
 const swapId = computeSwapId(chainId, alicePk, 1);
+const { state: bobVerifiedBeforeFund } = await syncChainFromOrd({
+  ordUrl,
+  genesisId,
+  tipId: r2.inscriptionId,
+  params: { ...V1_TEST_PARAMS, powMinBits: 12, checkpointInterval: 4 },
+  rpcUrl,
+  rpcAuth: `${rpcUser}:${rpcPass}`,
+});
+const confirmedEscrow = bobVerifiedBeforeFund.htlcs.get(swapId);
+assert.ok(confirmedEscrow, 'Bob must verify confirmed I0 escrow before funding BTC');
+assert.equal(confirmedEscrow.hashlock, hashlock1);
+assert.equal(confirmedEscrow.recipient, bobPk);
+assert.equal(confirmedEscrow.amount, 250n * UNIT);
+assert.ok(confirmedEscrow.timeoutBtcHeight >= btcTimeout + 12, 'Safe timeout margin must hold');
+
+// Step 4: Now Bob derives & funds 0.05 real regtest BTC to the matching Taproot HTLC!
+const htlc1 = deriveTaprootHtlc({
+  alicePubkey: alicePk,
+  bobPubkey: bobPk,
+  hashlock: hashlock1,
+  timeoutBtcHeight: btcTimeout,
+  network: 'regtest',
+});
+assert.ok(htlc1.address.startsWith('bcrt1p'));
+const fundTxid1 = await rpc('sendtoaddress', [htlc1.address, 0.05], 'faucet');
+await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
+btcH = await rpc('getblockcount');
+await waitOrdHeight(btcH);
+const fundTx1 = await rpc('getrawtransaction', [fundTxid1, true]);
+const out1 = fundTx1.vout.find((v) => v.scriptPubKey.address === htlc1.address);
+assert.ok(out1, 'HTLC output not found');
+
+// Step 5: Alice claims 0.05 BTC via pure-JS Taproot HTLC Claim TX, revealing secret S in Bitcoin witness!
+const claimTx = buildAndSignHtlcClaimTx({
+  utxo: {
+    txid: fundTxid1,
+    vout: out1.n,
+    value: BigInt(Math.round(out1.value * 1e8)),
+    scriptPubKeyHex: out1.scriptPubKey.hex,
+  },
+  htlc: htlc1,
+  secretHex: secret1,
+  alicePrivKey: aliceSk,
+  destinationAddress: aliceBtcDest,
+  feeSats: 500n,
+});
+const broadcastClaimId = await rpc('sendrawtransaction', [claimTx.txHex]);
+assert.equal(broadcastClaimId, claimTx.txid);
+await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
+btcH = await rpc('getblockcount');
+await waitOrdHeight(btcH);
+
+// Step 6: Bob extracts revealed secret S straight from confirmed Bitcoin witness & submits HTLC_CLAIM!
+const confirmedClaim = await rpc('getrawtransaction', [claimTx.txid, true]);
+const revealedSecret = confirmedClaim.vin[0].txinwitness[1];
+assert.equal(revealedSecret, secret1, 'Secret extracted from Bitcoin L1 witness must match S');
+console.log(`[htlc-btc] PASS Claim: Taproot ${htlc1.address} claimed in ${claimTx.txid}, secret S extracted from witness!`);
+
 const claimI0Tx = signTx(chainId, {
   type: 'HTLC_CLAIM', from: bobPk, swapId, preimage: revealedSecret, nonce: 1, fee: '0',
 }, bobSk);
@@ -329,18 +310,76 @@ await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
 btcH = await rpc('getblockcount');
 await waitOrdHeight(btcH);
 await waitOrdInsc(r3.inscriptionId);
-console.log(`[miner-cli] Block #3 mined & confirmed (HTLC_CLAIM from BTC witness): ${r3.inscriptionId}`);
 
-// Cold sync from ord 0.29.1 and verify Bob now owns 250 I0 on eyezero while Alice owns the 0.05 BTC on Bitcoin L1!
 const { state: finalState } = await syncChainFromOrd({
   ordUrl,
   genesisId,
   tipId: r3.inscriptionId,
   params: { ...V1_TEST_PARAMS, powMinBits: 12, checkpointInterval: 4 },
+  rpcUrl,
+  rpcAuth: `${rpcUser}:${rpcPass}`,
 });
 assertStateConservation(finalState, { ...V1_TEST_PARAMS, powMinBits: 12, checkpointInterval: 4 });
 assert.equal(getBalance(finalState, bobPk, 0), 250n * UNIT, 'Bob must receive 250 I0 after revealing BTC HTLC secret');
-console.log(`[full-e2e] PASS: Complete cross-chain BTC <-> I0 Taproot HTLC atomic swap + Miner CLI verified on bitcoind 31.3 + ord 0.29.1!`);
+console.log(`[full-e2e] PASS: Safe-order cross-chain BTC <-> I0 Taproot HTLC atomic swap verified!`);
+
+// =========================================================================
+// PART 2: Exact Adjacent CLTV Refund Boundary (rejected at tip H-1, eligible at tip H, confirms in H+1)
+// =========================================================================
+let curH = await rpc('getblockcount');
+const refundHeight = curH + 2; // funding confirms at curH+1 = H-1; exact adjacent boundary!
+const secret2 = randomBytes(32).toString('hex');
+const hashlock2 = sha256Hex(Buffer.from(secret2, 'hex'));
+const htlc2 = deriveTaprootHtlc({
+  alicePubkey: alicePk,
+  bobPubkey: bobPk,
+  hashlock: hashlock2,
+  timeoutBtcHeight: refundHeight,
+  network: 'regtest',
+});
+const fundTxid2 = await rpc('sendtoaddress', [htlc2.address, 0.03], 'faucet');
+await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
+curH = await rpc('getblockcount');
+assert.equal(curH, refundHeight - 1, 'Tip must sit at exact boundary H - 1');
+
+const fundTx2 = await rpc('getrawtransaction', [fundTxid2, true]);
+const out2 = fundTx2.vout.find((v) => v.scriptPubKey.address === htlc2.address);
+
+const refundTx = buildAndSignHtlcRefundTx({
+  utxo: {
+    txid: fundTxid2,
+    vout: out2.n,
+    value: BigInt(Math.round(out2.value * 1e8)),
+    scriptPubKeyHex: out2.scriptPubKey.hex,
+  },
+  htlc: htlc2,
+  bobPrivKey: bobSk,
+  destinationAddress: bobBtcDest,
+  feeSats: 500n,
+});
+
+// At tip = H - 1 (next block = H), bitcoind MUST reject non-final CLTV refund!
+let rejectedAtHMinus1 = false;
+try {
+  await rpc('sendrawtransaction', [refundTx.txHex]);
+} catch (err) {
+  rejectedAtHMinus1 = /non-final|locktime/i.test(err.message);
+}
+assert.ok(rejectedAtHMinus1, `bitcoind must reject CLTV refund at tip H-1 (${refundHeight - 1})`);
+
+// Advance exactly 1 block to tip = H -> mempool accepts now and confirms in block H + 1!
+await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
+assert.equal(await rpc('getblockcount'), refundHeight);
+const broadcastRefundId = await rpc('sendrawtransaction', [refundTx.txHex]);
+assert.equal(broadcastRefundId, refundTx.txid);
+await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
+const refundConfirmedHeight = await rpc('getblockcount');
+assert.equal(refundConfirmedHeight, refundHeight + 1);
+const confirmedRefundTx = await rpc('getrawtransaction', [refundTx.txid, true]);
+assert.equal(confirmedRefundTx.confirmations, 1);
+console.log(
+  `[htlc-btc] PASS Exact CLTV Boundary: rejected at tip #${refundHeight - 1}, mempool-accepted at tip #${refundHeight}, confirmed in block #${refundConfirmedHeight}!`,
+);
 
 for (const p of [...procs].reverse()) if (p.exitCode === null) p.kill('SIGTERM');
 process.exit(0);

@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 // Builds self-contained OrdStudio inscription assets:
-//   dist/ordstudio/g-rules.js         (single-file pinned G_rules ES module)
-//   dist/ordstudio/index.html         (G_ui importing /content/local:g-rules.js)
-//   dist/ordstudio/blocks/b1..b3.json (3 real BIP-340 signed PoW-valid demo blocks)
-//   dist/ordstudio/ordstudio.json     (OrdStudio manifest)
-//   dist/ordstudio/chain-overrides.json (simulated /r/* endpoints for Local mode)
+//   dist/ordstudio/g-rules.js           (single-file pinned G_rules ES module)
+//   dist/ordstudio/index.html           (G_ui importing /content/local:g-rules.js)
+//   dist/ordstudio/blocks/b1..b3.json   (3 real BIP-340 signed, dual-PoW demo blocks)
+//   dist/ordstudio/ordstudio.json       (OrdStudio manifest)
+//   dist/chain-overrides.json           (simulated /r/* endpoints for Local mode)
 
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   UNIT,
-  V1_TEST_PARAMS,
+  V1_DEMO_PARAMS,
   applyBlock,
-  bitsToTarget,
   buildCandidateBlock,
+  computeTokenId,
   createGenesisState,
   getPublicKeyHex,
   meetsTarget,
@@ -37,7 +37,6 @@ const parts = [
 
 for (const file of ORDER) {
   let src = readFileSync(join(ROOT, 'engine', 'src', file), 'utf8');
-  // Strip local relative imports between engine modules.
   src = src.replace(/^import\s+[\s\S]*?from\s+['"]\.\/[^'"]+['"];\s*$/gm, '');
   parts.push(`// --- ${file} ---`);
   parts.push(src.trim());
@@ -46,6 +45,8 @@ for (const file of ORDER) {
 
 const rulesBundle = parts.join('\n');
 writeFileSync(join(OUT, 'g-rules.js'), rulesBundle, 'utf8');
+// Verify the concatenated g-rules.js bundle parses and imports cleanly as an ES module!
+await import(`${join(OUT, 'g-rules.js')}?check=${Date.now()}`);
 
 // 2. Copy UI inscription, entmoot-lite.js, and Entmoot testnet config.
 copyFileSync(join(ROOT, 'ui', 'index.html'), join(OUT, 'index.html'));
@@ -61,10 +62,9 @@ writeFileSync(
   'utf8',
 );
 
-// 3. Generate 3 real BIP-340 signed, vanity-PoW demo blocks so G_ui syncs & verifies
-//    straight from /content/* and /r/* on load inside OrdStudio's sandbox!
+// 3. Generate 3 real BIP-340 signed, dual-PoW demo blocks using the shared V1_DEMO_PARAMS!
 const DEMO_GENESIS_ID = '0000000000000000000000000000000000000000000000000000000000000001i0';
-const DEMO_PARAMS = { ...V1_TEST_PARAMS, powMinBits: 8, checkpointInterval: 6 };
+const DEMO_GENESIS_BTC_HEIGHT = 924_100;
 
 const personas = {
   miner: { name: 'Miner', sk: '000000000000000000000000000000000000000000000000000000000000000a' },
@@ -83,23 +83,38 @@ const grindId = (label, target) => {
   throw new Error(`Could not grind ${label}`);
 };
 
-let state = createGenesisState(DEMO_GENESIS_ID, DEMO_PARAMS);
+let state = createGenesisState(DEMO_GENESIS_ID, V1_DEMO_PARAMS, DEMO_GENESIS_BTC_HEIGHT);
 const blocks = [];
-const overrides = [];
+const overrides = [
+  {
+    route: `/r/inscription/${DEMO_GENESIS_ID}`,
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      id: DEMO_GENESIS_ID,
+      number: 80_100_000,
+      height: DEMO_GENESIS_BTC_HEIGHT,
+      content_type: 'application/json',
+      value: 546,
+    }),
+    enabled: true,
+  },
+];
 
 function pushBlock(label, btcHeight, inscNum, minerPk, txs) {
   const refH = btcHeight - 1;
-  const target = nextTarget(state, DEMO_PARAMS);
+  const target = nextTarget(state, V1_DEMO_PARAMS);
   const id = grindId(label, target);
   const ctx = { btcHeight, inscriptionNumber: inscNum, getBlockHash: btcHash };
-  const { block } = buildCandidateBlock(
+  // Production block bodies omit `id` (the inscription ID is assigned by Bitcoin/ord).
+  const { block: bodyBlock } = buildCandidateBlock(
     state,
-    { id, miner: minerPk, btcRef: { h: refH, hash: btcHash(refH) }, txs, nonce: inscNum },
+    { miner: minerPk, btcRef: { h: refH, hash: btcHash(refH) }, txs, grindWork: true },
     ctx,
-    DEMO_PARAMS,
+    V1_DEMO_PARAMS,
   );
-  state = applyBlock(state, block, ctx, DEMO_PARAMS);
-  blocks.push({ label, btcHeight, inscNum, block });
+  state = applyBlock(state, { ...bodyBlock, id }, ctx, V1_DEMO_PARAMS);
+  blocks.push({ label, id, btcHeight, inscNum, block: bodyBlock });
   overrides.push({
     route: `/r/blockhash/${refH}`,
     status: 200,
@@ -125,20 +140,23 @@ function pushBlock(label, btcHeight, inscNum, minerPk, txs) {
 // Block 1: Miner mines genesis reward (1,000 I0)
 pushBlock('b1', 924_101, 80_100_001, personas.miner.pk, []);
 
-// Block 2: Miner funds Creator, Alice, Bob (200 I0 each)
+// Block 2: Miner funds Creator, Alice, Bob (250 I0 each)
 pushBlock('b2', 924_102, 80_100_002, personas.miner.pk, [
   signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.creator.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 1, fee: '0' }, personas.miner.sk),
   signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.alice.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 2, fee: '0' }, personas.miner.sk),
   signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.bob.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 3, fee: '0' }, personas.miner.sk),
 ]);
 
-// Block 3: Creator launches $EYE0 and $SATCAT; Alice & Bob buy in the same MEV-free batch!
+// Block 3: Creator launches $EYE0 and $SATCAT with deterministic launch-bound tokenIds;
+// Alice & Bob buy in the same MEV-free batch!
+const eye0Id = computeTokenId(state.chainId, personas.creator.pk, 1, 'EYE0');
+const satcatId = computeTokenId(state.chainId, personas.creator.pk, 2, 'SATCAT');
 pushBlock('b3', 924_103, 80_100_003, personas.miner.pk, [
   signTx(state.chainId, { type: 'LAUNCH', from: personas.creator.pk, ticker: 'EYE0', name: 'EyeZero', artId: DEMO_GENESIS_ID, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' }, personas.creator.sk),
   signTx(state.chainId, { type: 'LAUNCH', from: personas.creator.pk, ticker: 'SATCAT', name: 'Satoshi Cat', artId: DEMO_GENESIS_ID, initialBuy: (25n * UNIT).toString(), nonce: 2, fee: '0' }, personas.creator.sk),
-  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: 1, i0In: (80n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.alice.sk),
-  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: 1, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.bob.sk),
-  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: 2, i0In: (60n * UNIT).toString(), minTokOut: '1', nonce: 2, fee: '0' }, personas.bob.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: eye0Id, i0In: (80n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.alice.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: eye0Id, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.bob.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: satcatId, i0In: (60n * UNIT).toString(), minTokOut: '1', nonce: 2, fee: '0' }, personas.bob.sk),
 ]);
 
 overrides.unshift({
@@ -156,7 +174,6 @@ overrides.push({
   enabled: true,
 });
 
-// Write block JSON files and a tiny boot index (simulating initial Entmoot #i0-blk tip announcement).
 const filesManifest = {
   'g-rules.js': { id: null, role: 'library', compress: 'br' },
   'entmoot-lite.js': { id: null, role: 'library', compress: 'br' },
@@ -168,15 +185,16 @@ const filesManifest = {
 for (const b of blocks) {
   const rel = `blocks/${b.label}.json`;
   writeFileSync(join(OUT, rel), JSON.stringify(b.block, null, 2), 'utf8');
-  filesManifest[rel] = { id: b.block.id, role: 'asset', compress: 'br' };
+  filesManifest[rel] = { id: b.id, role: 'asset', compress: 'br' };
 }
 
 writeFileSync(
   join(OUT, 'blocks', 'tip.json'),
   JSON.stringify({
     genesisId: DEMO_GENESIS_ID,
-    tipId: blocks[blocks.length - 1].block.id,
+    tipId: blocks[blocks.length - 1].id,
     tipBtcHeight: blocks[blocks.length - 1].btcHeight,
+    simulated: true,
   }, null, 2),
   'utf8',
 );
@@ -189,4 +207,4 @@ writeFileSync(
 
 writeFileSync(join(ROOT, 'dist', 'chain-overrides.json'), JSON.stringify(overrides, null, 2), 'utf8');
 
-console.log(`Built dist/ordstudio: g-rules.js (${rulesBundle.length} B), ${blocks.length} signed PoW blocks, tip=${blocks[blocks.length - 1].block.id}`);
+console.log(`Built dist/ordstudio: g-rules.js (${rulesBundle.length} B), ${blocks.length} signed dual-PoW blocks, tip=${blocks[blocks.length - 1].id}`);

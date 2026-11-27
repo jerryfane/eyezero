@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>eyezero (i0) — Xverse Companion Wrapper</title>
+  <title>eyezero (i0) — Xverse Companion Wrapper (Signet Preview)</title>
   <style>
     :root {
       color-scheme: dark;
@@ -29,25 +29,35 @@
 <body>
   <div class="bar">
     <div class="bar-l">
-      <strong>eyezero <span class="mono">wrapper</span></strong>
-      <span class="status" id="status">Bridges Xverse + mempool.space to the immutable Genesis Inscription iframe</span>
+      <strong>eyezero <span class="mono">wrapper · signet preview</span></strong>
+      <span class="status" id="status">Pinned cross-origin Genesis Inscription iframe (Signet demo only; mainnet funding disabled)</span>
     </div>
     <div class="bar-r">
       <span class="mono" id="xverse-addr">Xverse: not connected</span>
       <button class="primary" id="connect-btn">Connect Xverse</button>
     </div>
   </div>
-  <iframe id="genesis-frame" sandbox="allow-scripts allow-same-origin" title="eyezero Genesis Inscription"></iframe>
+  <!-- Pinned immutable HTTPS document on a separate origin; no public URL query override. -->
+  <iframe
+    id="genesis-frame"
+    src="https://app.ordstudio.app/d/aB8H6Hen95be"
+    sandbox="allow-scripts allow-same-origin"
+    referrerpolicy="no-referrer"
+    title="eyezero Genesis Inscription"
+  ></iframe>
 
   <script>
-    const params = new URLSearchParams(location.search);
-    const defaultSrc = 'https://app.ordstudio.app/d/aB8H6Hen95be';
-    const frame = document.getElementById('genesis-frame');
-    frame.src = params.get('src') || defaultSrc;
+    const PINNED_SRC = 'https://app.ordstudio.app/d/aB8H6Hen95be';
+    const TRUSTED_ORIGIN = new URL(PINNED_SRC).origin;
+    const SIGNET_TAPROOT_RE = /^tb1p[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$/;
+    const HEX64_RE = /^[0-9a-f]{64}$/;
 
-    let btcAddress = null;
+    const frame = document.getElementById('genesis-frame');
     const statusEl = document.getElementById('status');
     const addrEl = document.getElementById('xverse-addr');
+
+    let connected = false;
+    let addrPreview = '';
 
     function xverseProvider() {
       return window.XverseProviders?.BitcoinProvider || window.BitcoinProvider || null;
@@ -62,15 +72,20 @@
       try {
         const res = await provider.request('getAccounts', {
           purposes: ['payment', 'ordinals'],
-          message: 'Connect Bitcoin wallet for eyezero HTLC swaps',
+          message: 'Connect Bitcoin wallet for eyezero Signet HTLC preview',
         });
         const list = res?.result || res?.addresses || [];
         const pay = list.find((a) => a.purpose === 'payment') || list[0];
         if (!pay?.address) throw new Error('No address returned');
-        btcAddress = pay.address;
-        addrEl.textContent = `${btcAddress.slice(0, 10)}…${btcAddress.slice(-6)}`;
-        statusEl.textContent = 'Xverse connected — 1-click BTC HTLC funding ready.';
-        frame.contentWindow?.postMessage({ type: 'eyezero:wrapper:ready', btcAddress }, '*');
+        connected = true;
+        addrPreview = `${pay.address.slice(0, 8)}…${pay.address.slice(-4)}`;
+        addrEl.textContent = addrPreview;
+        statusEl.textContent = 'Xverse connected (Signet preview — verified I0 escrow required before funding).';
+        // Send only status + masked preview to the pinned origin (never broadcast full address to "*").
+        frame.contentWindow?.postMessage(
+          { type: 'eyezero:wrapper:ready', connected: true, network: 'signet', addrPreview },
+          TRUSTED_ORIGIN,
+        );
       } catch (err) {
         statusEl.textContent = `Xverse error: ${err?.message || err}`;
       }
@@ -78,39 +93,39 @@
 
     document.getElementById('connect-btn').onclick = connectXverse;
 
+    // Strictly authenticate source window, origin, network, and payload schema.
     window.addEventListener('message', async (ev) => {
+      if (ev.source !== frame.contentWindow || ev.origin !== TRUSTED_ORIGIN) return;
       const msg = ev.data;
       if (!msg || typeof msg !== 'object') return;
 
       if (msg.type === 'eyezero:xverse:fundHtlc') {
+        if (msg.network !== 'signet') {
+          statusEl.textContent = 'Blocked funding request: only Bitcoin Signet is enabled in this preview wrapper.';
+          return;
+        }
+        if (typeof msg.address !== 'string' || !SIGNET_TAPROOT_RE.test(msg.address)) {
+          statusEl.textContent = 'Blocked funding request: invalid Signet Taproot (tb1p) address.';
+          return;
+        }
+        if (typeof msg.swapId !== 'string' || !HEX64_RE.test(msg.swapId) || !msg.i0EscrowConfirmed) {
+          statusEl.textContent = 'Blocked funding request: matching confirmed I0 escrow is required first.';
+          return;
+        }
         const provider = xverseProvider();
         if (!provider) {
-          statusEl.textContent = `Install Xverse or send BTC manually to ${msg.address}`;
+          statusEl.textContent = `Install Xverse or send Signet BTC manually to ${msg.address}`;
           return;
         }
         try {
-          const amountSats = Number(prompt(`Send how many sats to Taproot HTLC ${msg.address}?`, '50000'));
-          if (!amountSats || amountSats < 546) return;
+          const amountSats = Number(prompt(`Send how many Signet sats to verified Taproot HTLC ${msg.address}?`, '50000'));
+          if (!Number.isSafeInteger(amountSats) || amountSats < 546) return;
           const res = await provider.request('sendTransfer', {
             recipients: [{ address: msg.address, amount: amountSats }],
           });
-          statusEl.textContent = `Sent ${amountSats} sats to HTLC (${res?.result?.txid || 'submitted'})`;
+          statusEl.textContent = `Sent ${amountSats} Signet sats to HTLC (${res?.result?.txid || 'submitted'})`;
         } catch (err) {
           statusEl.textContent = `Transfer cancelled/failed: ${err?.message || err}`;
-        }
-      }
-
-      if (msg.type === 'eyezero:xverse:broadcastTx' && typeof msg.txHex === 'string') {
-        const apiBase = msg.network === 'signet'
-          ? 'https://mempool.space/signet/api/tx'
-          : 'https://mempool.space/api/tx';
-        try {
-          const r = await fetch(apiBase, { method: 'POST', body: msg.txHex });
-          const text = await r.text();
-          if (!r.ok) throw new Error(text);
-          statusEl.textContent = `Broadcasted Bitcoin HTLC tx: ${text}`;
-        } catch (err) {
-          statusEl.textContent = `Broadcast error: ${err?.message || err}`;
         }
       }
     });

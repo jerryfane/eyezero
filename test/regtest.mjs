@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // End-to-end Bitcoin regtest integration test for eyezero (i0):
 //   1. Spins up throwaway bitcoind 31.3 (-regtest) + ord 0.29.1 server.
-//   2. Mines 3 REAL vanity 0000...i0 eyezero blocks (16-bit PoW floor!) offline with miner/src/vanity.mjs.
+//   2. Mines 3 REAL dual-bound PoW vanity 0000...i0 eyezero blocks (16-bit PoW floor!) offline with miner/src/vanity.mjs.
 //   3. Broadcasts real Taproot commit+reveal transactions, confirms on regtest, and indexes in ord 0.29.1.
 //   4. Performs a FULL cold sync from ONLY { genesisId, tipId } over real ord HTTP endpoints
-//      (/content/<id>, /r/inscription/<id>, /r/blockhash/<h>) and verifies every block with applyBlock().
+//      (/content/<id>, /r/inscription/<id>, /r/blockhash/<h>) + real bitcoind P2TR prevout check.
 //
 // Regtest ONLY. Throwaway keys die with the temporary directory.
 
@@ -25,6 +25,7 @@ import {
   buildCandidateBlock,
   computeStateRoot,
   computeSwapId,
+  computeTokenId,
   createGenesisState,
   getBalance,
   getPublicKeyHex,
@@ -33,12 +34,11 @@ import {
   sha256Hex,
   signTx,
 } from '../engine/src/index.js';
-import { mineVanityInscription } from '../miner/src/vanity.mjs';
+import { syncChainFromOrd } from '../miner/src/cli.mjs';
+import { loadOrdInscribeDeps, mineVanityInscription } from '../miner/src/vanity.mjs';
 
-const ORD_INSCRIBE_ROOT =
-  process.env.ORD_INSCRIBE_ROOT ??
-  '/mnt/storagebox-workspaces/checkouts/ordinals-lab/ord-inscribe';
-const { BitcoindProvider, KeySigner, OrdClient, fundingUtxos } = await import(`${ORD_INSCRIBE_ROOT}/dist/index.js`);
+const { ordInscribe } = await loadOrdInscribeDeps();
+const { BitcoindProvider, KeySigner, OrdClient, fundingUtxos } = ordInscribe;
 
 const BITCOIND =
   process.env.BITCOIND ??
@@ -178,14 +178,12 @@ const provider = new BitcoindProvider({
   ord: new OrdClient(ordUrl),
 });
 
-// Send 6 separate UTXOs to our throwaway miner so every block has clean confirmed funds
 for (let i = 0; i < 6; i++) {
   await rpc('sendtoaddress', [addrs.payment.address, 0.05], 'faucet');
 }
 await rpc('generatetoaddress', [1, faucetAddr], 'faucet');
 let btcH = await waitOrdHeight(106);
 
-// Helper to mine & confirm one vanity inscription on real regtest bitcoind + ord
 async function inscribeAndConfirm(bodyBytes, contentType, target) {
   const funding = await fundingUtxos(provider, addrs.payment);
   const mined = await mineVanityInscription({
@@ -209,13 +207,13 @@ async function inscribeAndConfirm(bodyBytes, contentType, target) {
   return { mined, meta };
 }
 
-// 4. Inscribe Genesis G on real regtest Bitcoin (no PoW requirement on Genesis)
+// 4. Inscribe Genesis G on real regtest Bitcoin
 const genesisPayload = Buffer.from(JSON.stringify({ protocol: 'eyezero', v: 1, network: 'regtest' }));
-const { mined: gMined } = await inscribeAndConfirm(genesisPayload, 'application/json', (1n << 256n) - 1n);
+const { mined: gMined, meta: gMeta } = await inscribeAndConfirm(genesisPayload, 'application/json', (1n << 256n) - 1n);
 const genesisId = gMined.inscriptionId;
-console.log(`[regtest] Genesis G inscribed: ${genesisId} at BTC #${btcH}`);
+console.log(`[regtest] Genesis G inscribed: ${genesisId} at BTC #${gMeta.height}`);
 
-// 5. Run 3 REAL vanity 16-bit (0000...i0) eyezero blocks!
+// 5. Run 3 REAL dual-bound 16-bit (0000...i0) eyezero blocks!
 const REGTEST_PARAMS = { ...V1_TEST_PARAMS, powMinBits: 16, checkpointInterval: 3 };
 const keyFor = (n) => {
   const sk = n.toString(16).padStart(64, '0');
@@ -226,28 +224,25 @@ const creator = keyFor(102);
 const alice = keyFor(103);
 const bob = keyFor(104);
 
-let minerState = createGenesisState(genesisId, REGTEST_PARAMS);
+let minerState = createGenesisState(genesisId, REGTEST_PARAMS, gMeta.height);
 
 async function mineEyezeroBlock(txs) {
   const refH = btcH;
   const refHash = await ordJson(`/r/blockhash/${refH}`);
   const target = nextTarget(minerState, REGTEST_PARAMS);
 
-  // Build exact block payload BEFORE grinding reveal_txid!
   const { block: candidate } = buildCandidateBlock(
     minerState,
-    { miner: miner.pk, btcRef: { h: refH, hash: refHash }, txs },
+    { miner: miner.pk, btcRef: { h: refH, hash: refHash }, txs, grindWork: true },
     null,
     REGTEST_PARAMS,
   );
   const bodyBytes = Buffer.from(JSON.stringify(candidate), 'utf8');
   const { mined, meta } = await inscribeAndConfirm(bodyBytes, 'application/json', target);
 
-  // Confirm that the real on-chain inscription ID satisfies the 16-bit 0000...i0 PoW target!
   assert.ok(mined.inscriptionId.startsWith('0000') && mined.inscriptionId.endsWith('i0'),
     `Expected 0000...i0 vanity ID, got ${mined.inscriptionId}`);
 
-  // Update miner's local view via applyBlock using ord's real confirmation metadata
   const verifiedCtx = {
     btcHeight: meta.height,
     inscriptionNumber: meta.number,
@@ -263,10 +258,9 @@ async function mineEyezeroBlock(txs) {
   return mined.inscriptionId;
 }
 
-// Block 1: Miner mines 1,000 I0 fair-launch reward
 await mineEyezeroBlock([]);
 
-// Block 2: Miner funds Creator, Alice, Bob; Creator launches $EYE0
+const eye0Id = computeTokenId(minerState.chainId, creator.pk, 1, 'EYE0');
 await mineEyezeroBlock([
   signTx(minerState.chainId, { type: 'TRANSFER', from: miner.pk, to: creator.pk, tokenId: 0, amount: (200n * UNIT).toString(), nonce: 1, fee: '0' }, miner.sk),
   signTx(minerState.chainId, { type: 'TRANSFER', from: miner.pk, to: alice.pk, tokenId: 0, amount: (200n * UNIT).toString(), nonce: 2, fee: '0' }, miner.sk),
@@ -274,67 +268,46 @@ await mineEyezeroBlock([
   signTx(minerState.chainId, { type: 'LAUNCH', from: creator.pk, ticker: 'EYE0', name: 'EyeZero Regtest', artId: genesisId, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' }, creator.sk),
 ]);
 
-// Block 3 (MANDATORY CHECKPOINT HEIGHT, 1.5x reward!): Alice & Bob batch-buy $EYE0 + Alice opens HTLC for Bob
 const htlcSecret = '11223344'.repeat(8);
 const htlcHash = sha256Hex(Buffer.from(htlcSecret, 'hex'));
 const tipId = await mineEyezeroBlock([
-  signTx(minerState.chainId, { type: 'BUY', from: alice.pk, tokenId: 1, i0In: (80n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, alice.sk),
-  signTx(minerState.chainId, { type: 'BUY', from: bob.pk, tokenId: 1, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, bob.sk),
+  signTx(minerState.chainId, { type: 'BUY', from: alice.pk, tokenId: eye0Id, i0In: (80n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, alice.sk),
+  signTx(minerState.chainId, { type: 'BUY', from: bob.pk, tokenId: eye0Id, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, bob.sk),
   signTx(minerState.chainId, { type: 'HTLC_LOCK', from: alice.pk, recipient: bob.pk, amount: (25n * UNIT).toString(), hashlock: htlcHash, timeoutBtcHeight: btcH + 18, nonce: 2, fee: '0' }, alice.sk),
 ]);
 
-// 6. FULL COLD SYNC VERIFICATION FROM REAL `ord 0.29.1` RECURSIVE ENDPOINTS!
-// Pretend we are a brand-new browser opening Genesis with ONLY { genesisId, tipId }.
-console.log(`[regtest] Starting cold browser-style sync from ord ${ordUrl}...`);
-const fetched = [];
-const hashCache = new Map();
-let cursor = tipId;
-while (cursor !== genesisId) {
-  const [content, meta] = await Promise.all([
-    ordJson(`/content/${cursor}`),
-    ordJson(`/r/inscription/${cursor}`),
-  ]);
-  const refHash = await ordJson(`/r/blockhash/${content.btcRef.h}`);
-  hashCache.set(content.btcRef.h, refHash);
-  fetched.push({ block: { ...content, id: cursor }, meta });
-  cursor = content.prev;
-}
-fetched.reverse();
-assert.equal(fetched.length, 3, 'Expected 3 blocks walked back to Genesis');
-
-let coldState = createGenesisState(genesisId, REGTEST_PARAMS);
-for (const { block, meta } of fetched) {
-  coldState = applyBlock(
-    coldState,
-    block,
-    { btcHeight: meta.height, inscriptionNumber: meta.number, getBlockHash: (h) => hashCache.get(h) },
-    REGTEST_PARAMS,
-  );
-}
-
+// 6. FULL COLD SYNC VERIFICATION WITH GENESIS HEIGHT + P2TR PREVOUT CHECK!
+console.log(`[regtest] Starting cold sync with P2TR prevout verification from ord ${ordUrl}...`);
+const { state: coldState, blockCount, genesisBtcHeight } = await syncChainFromOrd({
+  ordUrl,
+  genesisId,
+  tipId,
+  params: REGTEST_PARAMS,
+  rpcUrl,
+  rpcAuth: `${rpcUser}:${rpcPass}`,
+});
+assert.equal(blockCount, 3);
+assert.equal(genesisBtcHeight, gMeta.height);
 assertStateConservation(coldState, REGTEST_PARAMS);
-assert.equal(computeStateRoot(coldState), computeStateRoot(minerState));
-// Verify total minted = 1000 + 1000 + 1500 (1.5x checkpoint reward!) = 3,500 I0
+assert.equal(computeStateRoot(coldState, REGTEST_PARAMS), computeStateRoot(minerState, REGTEST_PARAMS));
 assert.equal(coldState.totalI0Minted, 3_500n * UNIT);
-// Verify creator earned 0.5% I0 royalties from Block 3 buys (80 + 40 = 120 I0 * 0.5% = 0.6 I0!)
 assert.ok(getBalance(coldState, creator.pk, I0_TOKEN_ID) > 140n * UNIT);
-// Verify Alice & Bob received $EYE0 tokens at identical uniform price (Alice put 2x Bob -> 2x tokens!)
-const aliceTok = getBalance(coldState, alice.pk, 1);
-const bobTok = getBalance(coldState, bob.pk, 1);
+const aliceTok = getBalance(coldState, alice.pk, eye0Id);
+const bobTok = getBalance(coldState, bob.pk, eye0Id);
 assert.ok(aliceTok > 0n && bobTok > 0n);
 assert.ok(aliceTok >= bobTok * 2n - 1n && aliceTok <= bobTok * 2n + 1n, 'Uniform batch ratio 2:1 violated');
-// Verify open HTLC exists cleanly
 const swapId = computeSwapId(coldState.chainId, alice.pk, 2);
 assert.equal(coldState.htlcs.get(swapId)?.amount, 25n * UNIT);
-// Verify Block 3 mandatory checkpoint round-trips to exact same stateRoot
-const cp = fetched[2].block.checkpoint;
-assert.ok(cp !== null);
-assert.equal(computeStateRoot(importCheckpoint(cp)), fetched[2].block.stateRoot);
 
-console.log(`[regtest] PASS: All 3 real 0000...i0 Bitcoin inscriptions synced & verified via ord 0.29.1!`);
-console.log(`[regtest] Final stateRoot=${computeStateRoot(coldState)} minted=${coldState.totalI0Minted / UNIT} I0`);
+const tipBlock = await ordJson(`/content/${tipId}`);
+assert.ok(tipBlock.checkpoint !== null);
+assert.equal(
+  computeStateRoot(importCheckpoint(tipBlock.checkpoint, { expectedStateRoot: tipBlock.stateRoot }), REGTEST_PARAMS),
+  tipBlock.stateRoot,
+);
 
-// Clean graceful shutdown
+console.log(`[regtest] PASS: All 3 real dual-PoW 0000...i0 Taproot inscriptions synced & verified via ord 0.29.1 + bitcoind 31.3!`);
+
 for (const p of [...procs].reverse()) {
   if (p.exitCode === null) p.kill('SIGTERM');
 }

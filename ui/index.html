@@ -42,12 +42,12 @@
     .dot.err { background: var(--err); }
 
     header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 10; }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
+    .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; letter-spacing: -0.01em; flex-wrap: wrap; }
     .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line2); background: var(--bg); font-size: 11.5px; color: var(--ink2); }
     .hdr-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .hdr-right select { width: auto; padding: 4px 8px; font-size: 12px; }
 
-    .grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.95fr); gap: 14px; max-width: 1240px; margin: 0 auto; padding: 14px 16px 28px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.95fr); gap: 14px; max-width: 1260px; margin: 0 auto; padding: 14px 16px 28px; }
     @media (max-width: 880px) { .grid { grid-template-columns: 1fr; } }
 
     .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
@@ -70,7 +70,7 @@
     .m-k { font-size: 11px; color: var(--mut); }
     .m-v { font-size: 12.5px; font-weight: 600; margin-top: 2px; }
 
-    .tabs { display: flex; gap: 4px; margin-bottom: 11px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+    .tabs { display: flex; gap: 4px; margin-bottom: 11px; border-bottom: 1px solid var(--line); padding-bottom: 8px; flex-wrap: wrap; }
     .tabs button { background: transparent; border-color: transparent; color: var(--mut); padding: 5px 10px; }
     .tabs button.on { background: var(--raise); border-color: var(--line2); color: var(--ink); }
 
@@ -79,17 +79,18 @@
     .row { display: flex; gap: 8px; align-items: center; }
     .row > * { flex: 1; }
     .quote { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 12px; margin: 9px 0; }
-    .q-line { display: flex; justify-content: space-between; padding: 2px 0; }
+    .q-line { display: flex; justify-content: space-between; padding: 2px 0; gap: 8px; }
 
     .list { display: flex; flex-direction: column; gap: 6px; }
     .item { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; }
-    .item-l { min-width: 0; }
+    .item-l { min-width: 0; word-break: break-all; }
     .item-r { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
 
     .blk-row { cursor: pointer; }
     .blk-row.on { border-color: var(--ink); }
     pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 9px; overflow: auto; max-height: 220px; font-size: 11px; margin: 8px 0 0; }
-    .toast { font-size: 12px; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line2); background: var(--raise); margin-top: 8px; }
+    .toast { font-size: 12px; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line2); background: var(--raise); margin-top: 8px; word-break: break-word; }
+    .code-inline { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px; font-family: var(--mono); font-size: 11px; display: block; overflow-x: auto; margin-top: 4px; }
   </style>
 </head>
 <body>
@@ -97,6 +98,7 @@
     <div class="brand">
       <span>eyezero <span class="mono mut">i0</span></span>
       <span class="pill" id="sync-pill"><span class="dot warn"></span>Syncing chain…</span>
+      <span class="pill" id="net-pill"><span class="dot warn"></span>Entmoot connecting…</span>
       <span class="pill mono" id="tip-pill">Block #0</span>
     </div>
     <div class="hdr-right">
@@ -142,6 +144,7 @@
           <button data-tab="sell">Sell</button>
           <button data-tab="launch">Launch</button>
           <button data-tab="htlc">BTC HTLC</button>
+          <button data-tab="wallet">Wallet</button>
         </div>
 
         <div id="tab-buy">
@@ -195,12 +198,41 @@
               <input id="htlc-amount" type="number" min="1" step="1" value="20">
             </div>
             <div class="field">
-              <label><span>Recipient</span></label>
+              <label><span>Counterparty</span></label>
               <select id="htlc-recipient"></select>
             </div>
           </div>
-          <button class="primary" style="width:100%" id="submit-htlc">Sign HTLC_LOCK (Generates Secret S)</button>
+          <div class="field">
+            <label><span>Bitcoin HTLC Network</span><span class="mut">Derives real Taproot bc1p/tb1p</span></label>
+            <select id="htlc-net">
+              <option value="signet">Bitcoin Signet (tb1p…)</option>
+              <option value="regtest">Bitcoin Regtest (bcrt1p…)</option>
+              <option value="mainnet">Bitcoin Mainnet (bc1p…)</option>
+            </select>
+          </div>
+          <button class="primary" style="width:100%" id="submit-htlc">Sign HTLC_LOCK &amp; Derive BTC Taproot Address</button>
+          <div class="quote" id="htlc-btc-info" hidden></div>
           <div class="list" id="htlc-list" style="margin-top:10px"></div>
+        </div>
+
+        <div id="tab-wallet" hidden>
+          <div class="quote">
+            <div class="q-line"><span class="mut">Active Pubkey (BIP-340 x-only)</span></div>
+            <span class="code-inline" id="wallet-pk-box">—</span>
+            <div class="q-line" style="margin-top:6px"><span class="mut">My Local Key (saved in browser)</span></div>
+            <span class="code-inline" id="wallet-sk-box">—</span>
+          </div>
+          <div class="field">
+            <label><span>Import 32-byte hex private key</span></label>
+            <input id="wallet-import-sk" class="mono" placeholder="64 hex chars">
+          </div>
+          <div class="row">
+            <button id="wallet-import-btn">Import Key</button>
+            <button id="wallet-new-btn">Generate New</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button class="primary" id="wallet-faucet-btn">Demo Faucet (+100 I0 to My Key)</button>
+          </div>
         </div>
 
         <div class="toast" id="action-msg" hidden></div>
@@ -218,6 +250,7 @@
 
   <script type="module">
     import * as E from '/content/local:g-rules.js';
+    import { join as entmootJoin } from '/content/local:entmoot-lite.js';
 
     const PARAMS = { ...E.V1_TEST_PARAMS, powMinBits: 8, checkpointInterval: 6 };
     const UNIT = E.UNIT;
@@ -231,11 +264,24 @@
     const fmtTok = (v) => (v / UNIT).toLocaleString();
     const shortId = (id) => id ? `${id.slice(0, 10)}…${id.slice(-6)}` : '—';
 
+    function randomHex32() {
+      const b = new Uint8Array(32);
+      crypto.getRandomValues(b);
+      return E.bytesToHex(b);
+    }
+
+    function loadOrCreateLocalWallet() {
+      const sk = randomHex32();
+      return { id: 'local', name: 'My Local Wallet', sk, pk: E.getPublicKeyHex(sk) };
+    }
+
+    let localWallet = loadOrCreateLocalWallet();
     const PERSONAS = [
-      { id: 'alice', name: 'Alice (Trader)', sk: '000000000000000000000000000000000000000000000000000000000000000c' },
-      { id: 'bob', name: 'Bob (Trader)', sk: '000000000000000000000000000000000000000000000000000000000000000d' },
-      { id: 'creator', name: 'Creator (Launcher)', sk: '000000000000000000000000000000000000000000000000000000000000000b' },
-      { id: 'miner', name: 'Miner (PoW)', sk: '000000000000000000000000000000000000000000000000000000000000000a' },
+      { id: 'alice', name: 'Alice (Demo)', sk: '000000000000000000000000000000000000000000000000000000000000000c' },
+      { id: 'bob', name: 'Bob (Demo)', sk: '000000000000000000000000000000000000000000000000000000000000000d' },
+      { id: 'creator', name: 'Creator (Demo)', sk: '000000000000000000000000000000000000000000000000000000000000000b' },
+      { id: 'miner', name: 'Miner (Demo)', sk: '000000000000000000000000000000000000000000000000000000000000000a' },
+      localWallet,
     ];
     for (const p of PERSONAS) p.pk = E.getPublicKeyHex(p.sk);
 
@@ -243,11 +289,14 @@
     let chainState = null;
     let verifiedBlocks = [];
     let pendingTxs = [];
+    const seenTxSigs = new Set();
     let selectedTokenId = 1;
     let inspectedHeight = null;
     let localBtcHeight = 924_103;
     const blockHashCache = new Map();
     const htlcSecrets = new Map();
+    let entmootNet = null;
+    let entmootPeerCount = 0;
 
     const $ = (id) => document.getElementById(id);
 
@@ -265,10 +314,107 @@
       return max + 1;
     }
 
+    function ingestPendingTx(tx) {
+      if (!chainState || !tx || typeof tx.sig !== 'string') return false;
+      if (seenTxSigs.has(tx.sig)) return false;
+      if (!E.verifyTxSignature(chainState.chainId, tx)) return false;
+      seenTxSigs.add(tx.sig);
+      pendingTxs.push(tx);
+      return true;
+    }
+
+    async function broadcastTx(tx) {
+      ingestPendingTx(tx);
+      renderAll();
+      if (entmootNet && entmootNet.connected) {
+        try {
+          await entmootNet.publish('i0-tx', JSON.stringify(tx));
+          return true;
+        } catch (err) {
+          console.warn('Entmoot publish failed (kept locally):', err);
+        }
+      }
+      return false;
+    }
+
+    // Listen for optional outer Xverse web wrapper postMessage bridge
+    window.addEventListener('message', (ev) => {
+      if (!ev.data || typeof ev.data !== 'object') return;
+      if (ev.data.type === 'eyezero:wrapper:ready') {
+        showMsg('action-msg', `Connected to Xverse web wrapper (${ev.data.btcAddress || 'ready'})`);
+      }
+    });
+
     async function fetchJson(url) {
       const res = await fetch(url);
       if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
       return res.json();
+    }
+
+    async function connectEntmoot() {
+      try {
+        const cfg = await fetchJson('/content/local:entmoot-config.json');
+        // Fresh ephemeral Ed25519 key per tab so two tabs of the same browser don't collide on BroadcastChannel!
+        const keyBytes = new Uint8Array(32);
+        crypto.getRandomValues(keyBytes);
+
+        const net = await entmootJoin({
+          addr: cfg.addr,
+          groupId: cfg.groupId,
+          key: keyBytes,
+          invite: cfg.invite,
+          timeout: 12_000,
+          onerror: (err) => console.warn('entmoot-lite:', err?.message || err),
+        });
+        entmootNet = net;
+        $('net-pill').innerHTML = `<span class="dot ok"></span>Entmoot P2P live`;
+
+        net.on('i0-tx', (msg) => {
+          try {
+            const tx = JSON.parse(msg.text);
+            if (ingestPendingTx(tx)) {
+              entmootPeerCount++;
+              renderAll();
+            }
+          } catch {}
+        });
+
+        net.on('i0-blk', (msg) => {
+          try {
+            const ann = JSON.parse(msg.text);
+            if (ann && ann.block && chainState && ann.block.h === chainState.height + 1 && ann.meta) {
+              const ctx = {
+                btcHeight: ann.meta.height,
+                inscriptionNumber: ann.meta.number,
+                getBlockHash: (h) => blockHashCache.get(h) ?? ann.block.btcRef.hash,
+              };
+              chainState = E.applyBlock(chainState, ann.block, ctx, PARAMS);
+              localBtcHeight = Math.max(localBtcHeight, ann.meta.height);
+              verifiedBlocks.push({ block: ann.block, meta: ann.meta });
+              pendingTxs = pendingTxs.filter((t) => {
+                const cur = chainState.accounts.get(t.from)?.nonce ?? 0;
+                return t.nonce > cur;
+              });
+              renderAll();
+            }
+          } catch {}
+        });
+
+        // Replay recent pending orders from Entmoot history
+        try {
+          const hist = await net.history('i0-tx', 40);
+          let loaded = 0;
+          for (const msg of hist) {
+            try {
+              if (ingestPendingTx(JSON.parse(msg.text))) loaded++;
+            } catch {}
+          }
+          if (loaded > 0) renderAll();
+        } catch {}
+      } catch (err) {
+        $('net-pill').innerHTML = `<span class="dot warn"></span>Entmoot offline (local)`;
+        console.warn('Entmoot connect unavailable, running local mempool:', err?.message || err);
+      }
     }
 
     async function syncFromOrd() {
@@ -279,7 +425,6 @@
         ]);
         localBtcHeight = Number(btcH);
 
-        // Walk B.prev backwards from tip to Genesis using real /content/<id> + /r/inscription/<id>.
         const rawChain = [];
         let cursor = tipInfo.tipId;
         while (cursor && cursor !== tipInfo.genesisId) {
@@ -309,6 +454,7 @@
         inspectedHeight = s.height;
         $('sync-pill').innerHTML = `<span class="dot ok"></span>Verified ${verifiedBlocks.length} blocks on chain`;
         renderAll();
+        connectEntmoot();
       } catch (err) {
         $('sync-pill').innerHTML = `<span class="dot err"></span>Sync error: ${err.message}`;
       }
@@ -402,6 +548,8 @@
       $('bal-pill').textContent = myProjI0 !== myI0
         ? `${fmtI0(myI0)} I0 (pend: ${fmtI0(myProjI0)})`
         : `${fmtI0(myI0)} I0`;
+      $('wallet-pk-box').textContent = activePersona.pk;
+      $('wallet-sk-box').textContent = localWallet.sk;
 
       // Token grid
       const grid = $('token-grid');
@@ -421,7 +569,6 @@
         grid.appendChild(btn);
       }
 
-      // Active curve chart + metrics
       const tok = chainState.tokens.get(selectedTokenId) ?? [...chainState.tokens.values()][0];
       if (tok) {
         selectedTokenId = tok.id;
@@ -449,7 +596,7 @@
       const mList = $('mempool-list');
       mList.innerHTML = accepted.length ? '' : '<div class="mut" style="font-size:12px">No pending orders. Submit a Buy, Sell, Launch, or HTLC above.</div>';
       for (const tx of accepted) {
-        const who = PERSONAS.find((p) => p.pk === tx.from)?.name.split(' ')[0] ?? tx.from.slice(0, 6);
+        const who = PERSONAS.find((p) => p.pk === tx.from)?.name.split(' ')[0] ?? tx.from.slice(0, 8);
         const div = document.createElement('div');
         div.className = 'item';
         const desc = tx.type === 'BUY' ? `BUY #${tx.tokenId} · ${fmtI0(BigInt(tx.i0In))} I0`
@@ -465,12 +612,11 @@
           const cBtn = document.createElement('button');
           cBtn.className = 'sm';
           cBtn.textContent = 'Cancel (RBF)';
-          cBtn.onclick = () => {
+          cBtn.onclick = async () => {
             const nextFee = (BigInt(tx.fee || '0') + 1000n).toString();
             const cancelTx = E.signTx(chainState.chainId, { type: 'CANCEL', from: activePersona.pk, nonce: tx.nonce, fee: nextFee }, activePersona.sk);
-            pendingTxs.push(cancelTx);
-            showMsg('action-msg', `Replaced nonce ${tx.nonce} with CANCEL (fee=${nextFee})`);
-            renderAll();
+            const live = await broadcastTx(cancelTx);
+            showMsg('action-msg', `Replaced nonce ${tx.nonce} with CANCEL${live ? ' (gossiped over Entmoot)' : ''}`);
           };
           div.querySelector('.item-r').appendChild(cBtn);
         }
@@ -493,11 +639,10 @@
           const claimBtn = document.createElement('button');
           claimBtn.className = 'sm primary';
           claimBtn.textContent = 'Claim w/ Secret S';
-          claimBtn.onclick = () => {
+          claimBtn.onclick = async () => {
             const tx = E.signTx(chainState.chainId, { type: 'HTLC_CLAIM', from: activePersona.pk, swapId: h.id, preimage: secret, nonce: nextNonceFor(activePersona.pk), fee: '0' }, activePersona.sk);
-            pendingTxs.push(tx);
+            await broadcastTx(tx);
             showMsg('action-msg', `Signed HTLC_CLAIM for ${shortId(h.id)} — mine a block to finalize!`);
-            renderAll();
           };
           div.querySelector('.item-r').appendChild(claimBtn);
         }
@@ -535,30 +680,37 @@
       }
     }
 
-    // Wire UI controls
-    const wSel = $('wallet-select');
-    const rSel = $('htlc-recipient');
-    for (const p of PERSONAS) {
-      wSel.add(new Option(p.name, p.id));
-      rSel.add(new Option(p.name, p.pk));
+    function refreshWalletSelects() {
+      const wSel = $('wallet-select');
+      const rSel = $('htlc-recipient');
+      const curW = activePersona.id;
+      wSel.innerHTML = '';
+      rSel.innerHTML = '';
+      for (const p of PERSONAS) {
+        wSel.add(new Option(p.name, p.id));
+        rSel.add(new Option(p.name, p.pk));
+      }
+      wSel.value = curW;
+      rSel.value = PERSONAS[1].pk;
     }
-    rSel.value = PERSONAS[1].pk;
-    wSel.onchange = () => {
-      activePersona = PERSONAS.find((p) => p.id === wSel.value) ?? PERSONAS[0];
+    refreshWalletSelects();
+
+    $('wallet-select').onchange = () => {
+      activePersona = PERSONAS.find((p) => p.id === $('wallet-select').value) ?? PERSONAS[0];
       renderAll();
     };
 
     for (const btn of $('action-tabs').querySelectorAll('button')) {
       btn.onclick = () => {
         for (const b of $('action-tabs').querySelectorAll('button')) b.classList.toggle('on', b === btn);
-        for (const t of ['buy', 'sell', 'launch', 'htlc']) $(`tab-${t}`).hidden = btn.dataset.tab !== t;
+        for (const t of ['buy', 'sell', 'launch', 'htlc', 'wallet']) $(`tab-${t}`).hidden = btn.dataset.tab !== t;
       };
     }
     $('show-launch-btn').onclick = () => $('action-tabs').querySelector('[data-tab="launch"]').click();
     $('buy-amount').oninput = () => chainState && renderQuotes(getProjected().projectedState);
     $('sell-amount').oninput = () => chainState && renderQuotes(getProjected().projectedState);
 
-    $('submit-buy').onclick = () => {
+    $('submit-buy').onclick = async () => {
       try {
         const i0In = BigInt(Math.round(Number($('buy-amount').value) * 1e8));
         const slip = BigInt(Math.max(0, Math.min(99, Math.round(Number($('buy-slip').value || 15)))));
@@ -571,13 +723,12 @@
           i0In: i0In.toString(), minTokOut: minTokOut.toString(),
           nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
-        pendingTxs.push(tx);
-        showMsg('action-msg', `Signed BIP-340 BUY (${fmtI0(i0In)} I0) -> pending in Entmoot mempool`);
-        renderAll();
+        const live = await broadcastTx(tx);
+        showMsg('action-msg', `Signed BIP-340 BUY (${fmtI0(i0In)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
-    $('submit-sell').onclick = () => {
+    $('submit-sell').onclick = async () => {
       try {
         const tokIn = BigInt(Math.round(Number($('sell-amount').value))) * UNIT;
         const tx = E.signTx(chainState.chainId, {
@@ -585,13 +736,12 @@
           tokIn: tokIn.toString(), minI0Out: '1',
           nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
-        pendingTxs.push(tx);
-        showMsg('action-msg', `Signed BIP-340 SELL (${fmtTok(tokIn)} tok) -> pending in Entmoot mempool`);
-        renderAll();
+        const live = await broadcastTx(tx);
+        showMsg('action-msg', `Signed BIP-340 SELL (${fmtTok(tokIn)} tok) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
-    $('submit-launch').onclick = () => {
+    $('submit-launch').onclick = async () => {
       try {
         const ticker = $('launch-ticker').value.trim().toUpperCase();
         const name = $('launch-name').value.trim();
@@ -600,16 +750,16 @@
           type: 'LAUNCH', from: activePersona.pk, ticker, name, artId: chainState.genesisId,
           initialBuy: initialBuy.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
-        pendingTxs.push(tx);
-        showMsg('action-msg', `Signed BIP-340 LAUNCH $${ticker} -> mine next block to deploy`);
-        renderAll();
+        const live = await broadcastTx(tx);
+        showMsg('action-msg', `Signed LAUNCH $${ticker} ${live ? '-> gossiped live over Entmoot!' : '-> mine next block to deploy'}`);
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
-    $('submit-htlc').onclick = () => {
+    $('submit-htlc').onclick = async () => {
       try {
         const amount = BigInt(Math.round(Number($('htlc-amount').value) * 1e8));
         const recipient = $('htlc-recipient').value;
+        const netName = $('htlc-net').value;
         const secretBytes = new Uint8Array(32);
         crypto.getRandomValues(secretBytes);
         const secretHex = E.bytesToHex(secretBytes);
@@ -617,17 +767,84 @@
         const nonce = nextNonceFor(activePersona.pk);
         const swapId = E.computeSwapId(chainState.chainId, activePersona.pk, nonce);
         htlcSecrets.set(swapId, secretHex);
+
+        // Derive the REAL Bitcoin Taproot L1 HTLC address right inside G_ui!
+        const btcTimeout = localBtcHeight + 6;
+        const btcHtlc = E.deriveTaprootHtlc({
+          alicePubkey: activePersona.pk,
+          bobPubkey: recipient,
+          hashlock,
+          timeoutBtcHeight: btcTimeout,
+          network: netName,
+        });
+
         const tx = E.signTx(chainState.chainId, {
           type: 'HTLC_LOCK', from: activePersona.pk, recipient, amount: amount.toString(),
           hashlock, timeoutBtcHeight: localBtcHeight + 18, nonce, fee: '0',
         }, activePersona.sk);
-        pendingTxs.push(tx);
-        showMsg('action-msg', `Signed HTLC_LOCK (H=${hashlock.slice(0, 12)}…) — mine block, switch to recipient, and click Claim!`);
+        const live = await broadcastTx(tx);
+
+        const info = $('htlc-btc-info');
+        info.hidden = false;
+        info.innerHTML = `
+          <div class="q-line"><span class="mut">Bitcoin Taproot HTLC (${netName})</span><span class="mono">CLTV #${btcTimeout}</span></div>
+          <span class="code-inline">${btcHtlc.address}</span>
+          <div class="q-line" style="margin-top:6px"><span class="mut">Hashlock H = SHA256(S)</span></div>
+          <span class="code-inline">${hashlock}</span>
+          <button class="sm" style="margin-top:8px" id="xverse-fund-btn">Send BTC via Xverse Wrapper</button>
+        `;
+        $('xverse-fund-btn').onclick = () => {
+          window.parent?.postMessage({
+            type: 'eyezero:xverse:fundHtlc',
+            address: btcHtlc.address,
+            network: netName,
+            swapId,
+            hashlock,
+            timeoutBtcHeight: btcTimeout,
+          }, '*');
+          showMsg('action-msg', `Posted Xverse funding request for ${btcHtlc.address} (or send BTC from any wallet!)`);
+        };
+        showMsg('action-msg', `Signed HTLC_LOCK + derived real Taproot ${btcHtlc.address.slice(0, 14)}…${live ? ' (Entmoot live)' : ''}`);
+      } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
+    };
+
+    $('wallet-import-btn').onclick = () => {
+      try {
+        const sk = $('wallet-import-sk').value.trim().toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(sk)) throw new Error('Key must be 64 lowercase hex chars');
+        localWallet.sk = sk;
+        localWallet.pk = E.getPublicKeyHex(sk);
+        activePersona = localWallet;
+        refreshWalletSelects();
+        showMsg('action-msg', `Imported local BIP-340 key (${localWallet.pk.slice(0, 14)}…)`);
         renderAll();
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
-    $('mine-btn').onclick = () => {
+    $('wallet-new-btn').onclick = () => {
+      localWallet.sk = randomHex32();
+      localWallet.pk = E.getPublicKeyHex(localWallet.sk);
+      activePersona = localWallet;
+      refreshWalletSelects();
+      showMsg('action-msg', `Generated new BIP-340 key (${localWallet.pk.slice(0, 14)}…)`);
+      renderAll();
+    };
+
+    $('wallet-faucet-btn').onclick = async () => {
+      try {
+        const demoMiner = PERSONAS.find((p) => p.id === 'miner');
+        const tx = E.signTx(chainState.chainId, {
+          type: 'TRANSFER', from: demoMiner.pk, to: localWallet.pk, tokenId: 0,
+          amount: (100n * UNIT).toString(), nonce: nextNonceFor(demoMiner.pk), fee: '0',
+        }, demoMiner.sk);
+        await broadcastTx(tx);
+        activePersona = localWallet;
+        refreshWalletSelects();
+        showMsg('action-msg', 'Queued +100 I0 transfer to My Local Wallet — click Mine 00…i0 Block to confirm!');
+      } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
+    };
+
+    $('mine-btn').onclick = async () => {
       try {
         const t0 = performance.now();
         const { accepted } = getProjected();
@@ -659,8 +876,12 @@
         );
         chainState = E.applyBlock(chainState, block, ctx, PARAMS);
         localBtcHeight = nextBtcH;
-        verifiedBlocks.push({ block, meta: { height: nextBtcH, number: ctx.inscriptionNumber } });
+        const meta = { height: nextBtcH, number: ctx.inscriptionNumber };
+        verifiedBlocks.push({ block, meta });
         pendingTxs = [];
+        if (entmootNet && entmootNet.connected) {
+          entmootNet.publish('i0-blk', JSON.stringify({ block, meta })).catch(() => {});
+        }
         const ms = (performance.now() - t0).toFixed(1);
         showMsg('action-msg', `Mined Block #${block.h} (${shortId(block.id)}) in ${tries} hashes (${ms}ms) · ${block.txs.length} txs finalized`);
         renderAll();
@@ -671,7 +892,6 @@
       const targetBlk = verifiedBlocks.find((e) => e.block.h === 3) ?? verifiedBlocks[verifiedBlocks.length - 1];
       if (!targetBlk) return;
       const idx = verifiedBlocks.indexOf(targetBlk);
-      // Reconstruct pre-state by replaying 0..idx-1
       let pre = E.createGenesisState(chainState.genesisId, PARAMS);
       for (let i = 0; i < idx; i++) {
         const e = verifiedBlocks[i];

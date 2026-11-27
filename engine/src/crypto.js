@@ -277,6 +277,24 @@ export function getPublicKeyHex(privKey) {
   return bytesToHex(getPublicKey(privKey));
 }
 
+// Taproot (BIP-341) output key tweak: Q = lift_x(internalPubkey) + t*G.
+// Returns { xOnly: Uint8Array(32), parity: 0 | 1 }.
+export function taprootTweakPubkey(internalPubkeyBytes, merkleRootBytes) {
+  const pk = typeof internalPubkeyBytes === 'string' ? hexToBytes(internalPubkeyBytes) : internalPubkeyBytes;
+  if (pk.length !== 32) throw new Error('Internal pubkey must be 32 bytes');
+  const Ppt = liftX(bytesToBigInt(pk));
+  if (!Ppt) throw new Error('Internal pubkey not on secp256k1 curve');
+  const tweakInput = merkleRootBytes && merkleRootBytes.length > 0 ? concatBytes(pk, merkleRootBytes) : pk;
+  const t = bytesToBigInt(taggedHash('TapTweak', tweakInput));
+  if (t >= N) throw new Error('TapTweak >= N');
+  const Q = toAffine(jAdd([Ppt[0], Ppt[1], 1n], jMul(G_J, t)));
+  if (!Q) throw new Error('Tweaked pubkey at infinity');
+  return {
+    xOnly: bigIntToBytes32(Q[0]),
+    parity: Number(Q[1] & 1n),
+  };
+}
+
 export function schnorrSign(msgBytes, privKeyBytes, auxRandBytes = new Uint8Array(32)) {
   const msg = typeof msgBytes === 'string' ? hexToBytes(msgBytes) : msgBytes;
   const priv = typeof privKeyBytes === 'string' ? hexToBytes(privKeyBytes) : privKeyBytes;

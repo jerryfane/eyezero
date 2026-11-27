@@ -1,0 +1,32 @@
+[book]
+title = "eyezero Handbook"
+description = "Protocol documentation and v1 design specification for eyezero (i0), a PoW mini-chain and bonding-curve launchpad inside a Bitcoin inscription."
+authors = ["eyezero"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "coal"
+preferred-dark-theme = "coal"
+mathjax-support = true
+additional-css = ["theme/eyezero.css"]
+no-section-label = false
+site-url = "/"
+
+[output.html.fold]
+enable = false
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3

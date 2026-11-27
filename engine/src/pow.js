@@ -41,37 +41,45 @@ export function meetsTarget(inscriptionId, target) {
   return val <= target;
 }
 
-// Payload-bound work hash: cryptographically binds prev, height, btcRef, miner, workNonce,
-// stateRoot, diff, checkpoint, and txs to PoW even strictly inside ord's /r/* sandbox
-// (defends against ord extracting non-P2TR witness envelopes under a non-witness txid).
-export function computeBlockWorkHash(block) {
+// Explicit canonical payload preimage (invariant across work-nonce trials).
+// Pre-hashes all invariant block fields once so nonce grinding hashes a fixed 80-byte preimage.
+export function computeBlockBodyDigest(block) {
   const canonical = {
     v: block.v,
     h: block.h,
     prev: block.prev,
-    btcRef: block.btcRef,
+    btcRef: { h: block.btcRef?.h, hash: block.btcRef?.hash },
     miner: block.miner,
-    nonce: block.nonce ?? 0,
     stateRoot: block.stateRoot,
     diff: block.diff,
     checkpoint: block.checkpoint ?? null,
     txs: block.txs,
   };
-  return sha256Hex(`eyezero:v1:work:${JSON.stringify(canonical)}`);
+  return sha256Hex(`eyezero:v1:body:${JSON.stringify(canonical)}`);
 }
 
-export function meetsWorkTarget(block, target) {
-  const workHex = computeBlockWorkHash(block);
+// Payload-bound work hash: cryptographically binds prev, height, btcRef, miner, stateRoot,
+// diff, checkpoint, txs, and nonce to PoW even strictly inside ord's /r/* sandbox.
+export function computeBlockWorkHash(block, precomputedBodyDigest = null) {
+  const bodyDigest = precomputedBodyDigest ?? computeBlockBodyDigest(block);
+  const nonce = block.nonce ?? 0;
+  return sha256Hex(`eyezero:v1:work:${bodyDigest}:${nonce}`);
+}
+
+export function meetsWorkTarget(block, target, precomputedBodyDigest = null) {
+  const workHex = computeBlockWorkHash(block, precomputedBodyDigest);
   return BigInt('0x' + workHex) <= target;
 }
 
 export function grindBlockWorkNonce(block, target, maxTries = 10_000_000) {
-  const candidate = { ...block, nonce: Number.isInteger(block.nonce) && block.nonce >= 0 ? block.nonce : 0 };
+  const bodyDigest = computeBlockBodyDigest(block);
+  let nonce = Number.isInteger(block.nonce) && block.nonce >= 0 ? block.nonce : 0;
   for (let i = 0; i < maxTries; i++) {
-    if (meetsWorkTarget(candidate, target)) {
-      return candidate;
+    const workHex = sha256Hex(`eyezero:v1:work:${bodyDigest}:${nonce}`);
+    if (BigInt('0x' + workHex) <= target) {
+      return { ...block, nonce };
     }
-    candidate.nonce++;
+    nonce++;
   }
   throw new Error(`Exceeded maxTries (${maxTries}) grinding payload-bound workHash`);
 }
@@ -94,8 +102,6 @@ export function nextTarget(state, params = V1_MAINNET_PARAMS) {
   }
 
   const expectedBtcSpan = BigInt(params.retargetInterval) * params.targetBtcBlocksPerBlock;
-  // state.epochStartBtcHeight is the confirmation height of the closing block of the prior epoch
-  // (or genesisBtcHeight for epoch 1), so tipBtcHeight - epochStartBtcHeight spans exact N intervals.
   let actualBtcSpan = BigInt(state.tipBtcHeight - state.epochStartBtcHeight);
   if (actualBtcSpan < 1n) actualBtcSpan = 1n;
 
@@ -123,7 +129,6 @@ export function validateBtcAnchor(state, block, btcContext, params = V1_MAINNET_
   if (!Number.isInteger(inscriptionNumber) || inscriptionNumber < 0) {
     throw new Error('Invalid inscription number');
   }
-  // Enforce strict monotonic Bitcoin confirmation height from Genesis (when genesisBtcHeight > 0) and all children.
   if ((state.height > 0 || state.tipBtcHeight > 0) && btcHeight <= state.tipBtcHeight) {
     throw new Error(`Block btcHeight (${btcHeight}) must exceed parent btcHeight (${state.tipBtcHeight})`);
   }
@@ -157,9 +162,6 @@ export function validateBtcAnchor(state, block, btcContext, params = V1_MAINNET_
 }
 
 // Compare two canonical chain tips. Returns >0 if `a` wins, <0 if `b` wins, 0 if identical.
-// Primary: highest cumulative PoW work.
-// Tie-break 1: earliest Bitcoin confirmation height (lowest tipBtcHeight).
-// Tie-break 2: lowest inscription_number in that Bitcoin block.
 export function compareChainTips(a, b) {
   if (a.cumulativeWork !== b.cumulativeWork) {
     return a.cumulativeWork > b.cumulativeWork ? 1 : -1;

@@ -84,7 +84,7 @@ describe('PR #1 audit behavioral regressions', () => {
     assert.throws(() => deriveTaprootHtlc({ alicePubkey: offCurve, bobPubkey: bob.pk, hashlock, timeoutBtcHeight: 100, network: 'signet' }));
     const htlc = deriveTaprootHtlc({ alicePubkey: alice.pk, bobPubkey: bob.pk, hashlock, timeoutBtcHeight: 100, network: 'signet' });
     assert.throws(() => decodeSegwitAddress(htlc.address.slice(0, 4).toUpperCase() + htlc.address.slice(4)));
-    assert.throws(() => buildAndSignHtlcClaimTx({ utxo: { txid: '22'.repeat(32), vout: 0, value: 50_000n }, htlc, secretHex: '00'.repeat(32), alicePrivKey: alice.sk, destinationAddress: htlc.address }));
+    assert.throws(() => buildAndSignHtlcClaimTx({ utxo: { txid: '22'.repeat(32), vout: 0, value: 50_000n, scriptPubKeyHex: htlc.outputScriptHex, confirmations: 1 }, htlc, secretHex: '00'.repeat(32), alicePrivKey: alice.sk, destinationAddress: htlc.address }));
   });
 
   it('previewPending drops conflicting tight-slippage buy so batch builds cleanly', () => {

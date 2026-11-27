@@ -147,13 +147,15 @@ pushBlock('b2', 924_102, 80_100_002, personas.miner.pk, [
   signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.bob.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 3, fee: '0' }, personas.miner.sk),
 ]);
 
-// Block 3: Creator launches $EYE0 and $SATCAT with deterministic launch-bound tokenIds;
+// Block 3: Creator launches $EYE0 and $SATCAT with full 256-bit launch-bound tokenIds;
 // Alice & Bob buy in the same MEV-free batch!
-const eye0Id = computeTokenId(state.chainId, personas.creator.pk, 1, 'EYE0');
-const satcatId = computeTokenId(state.chainId, personas.creator.pk, 2, 'SATCAT');
+const launchEye0 = { type: 'LAUNCH', from: personas.creator.pk, ticker: 'EYE0', name: 'EyeZero', artId: DEMO_GENESIS_ID, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' };
+const launchSatcat = { type: 'LAUNCH', from: personas.creator.pk, ticker: 'SATCAT', name: 'Satoshi Cat', artId: DEMO_GENESIS_ID, initialBuy: (25n * UNIT).toString(), nonce: 2, fee: '0' };
+const eye0Id = computeTokenId(state.chainId, launchEye0);
+const satcatId = computeTokenId(state.chainId, launchSatcat);
 pushBlock('b3', 924_103, 80_100_003, personas.miner.pk, [
-  signTx(state.chainId, { type: 'LAUNCH', from: personas.creator.pk, ticker: 'EYE0', name: 'EyeZero', artId: DEMO_GENESIS_ID, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' }, personas.creator.sk),
-  signTx(state.chainId, { type: 'LAUNCH', from: personas.creator.pk, ticker: 'SATCAT', name: 'Satoshi Cat', artId: DEMO_GENESIS_ID, initialBuy: (25n * UNIT).toString(), nonce: 2, fee: '0' }, personas.creator.sk),
+  signTx(state.chainId, launchEye0, personas.creator.sk),
+  signTx(state.chainId, launchSatcat, personas.creator.sk),
   signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: eye0Id, i0In: (80n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.alice.sk),
   signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: eye0Id, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.bob.sk),
   signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: satcatId, i0In: (60n * UNIT).toString(), minTokOut: '1', nonce: 2, fee: '0' }, personas.bob.sk),

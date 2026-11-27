@@ -260,12 +260,13 @@ async function mineEyezeroBlock(txs) {
 
 await mineEyezeroBlock([]);
 
-const eye0Id = computeTokenId(minerState.chainId, creator.pk, 1, 'EYE0');
+const launchRegtest = { type: 'LAUNCH', from: creator.pk, ticker: 'EYE0', name: 'EyeZero Regtest', artId: genesisId, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' };
+const eye0Id = computeTokenId(minerState.chainId, launchRegtest);
 await mineEyezeroBlock([
   signTx(minerState.chainId, { type: 'TRANSFER', from: miner.pk, to: creator.pk, tokenId: 0, amount: (200n * UNIT).toString(), nonce: 1, fee: '0' }, miner.sk),
   signTx(minerState.chainId, { type: 'TRANSFER', from: miner.pk, to: alice.pk, tokenId: 0, amount: (200n * UNIT).toString(), nonce: 2, fee: '0' }, miner.sk),
   signTx(minerState.chainId, { type: 'TRANSFER', from: miner.pk, to: bob.pk, tokenId: 0, amount: (200n * UNIT).toString(), nonce: 3, fee: '0' }, miner.sk),
-  signTx(minerState.chainId, { type: 'LAUNCH', from: creator.pk, ticker: 'EYE0', name: 'EyeZero Regtest', artId: genesisId, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' }, creator.sk),
+  signTx(minerState.chainId, launchRegtest, creator.sk),
 ]);
 
 const htlcSecret = '11223344'.repeat(8);

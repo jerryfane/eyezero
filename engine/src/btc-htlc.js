@@ -382,8 +382,12 @@ function validateSpendInputs({ utxo, htlc, feeSats }) {
   if (verifiedHtlc.outputScriptHex !== htlc.outputScriptHex || verifiedHtlc.address !== htlc.address) {
     throw new Error('HTLC descriptor failed deterministic contract rederivation');
   }
-  if (utxo.scriptPubKeyHex && utxo.scriptPubKeyHex.toLowerCase() !== verifiedHtlc.outputScriptHex) {
-    throw new Error('UTXO scriptPubKey does not match Taproot HTLC outputScript');
+  // Require the caller to supply the verified funding output's scriptPubKeyHex (and refuse 0-conf UTXOs).
+  if (typeof utxo.scriptPubKeyHex !== 'string' || utxo.scriptPubKeyHex.toLowerCase() !== verifiedHtlc.outputScriptHex) {
+    throw new Error('Confirmed UTXO scriptPubKeyHex is required and must match Taproot HTLC outputScript');
+  }
+  if (utxo.confirmations !== undefined && (!Number.isInteger(utxo.confirmations) || utxo.confirmations < 1)) {
+    throw new Error(`HTLC funding UTXO must have >= 1 confirmation before signing spend (got ${utxo.confirmations})`);
   }
 
   return { prevAmount, fee, outAmount, verifiedHtlc };

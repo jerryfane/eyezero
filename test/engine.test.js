@@ -22,6 +22,7 @@ import {
   getBalance,
   getBip341NumsXOnly,
   getPublicKeyHex,
+  grindBlockWorkNonce,
   importCheckpoint,
   importCheckpointPages,
   meetsTarget,
@@ -97,17 +98,20 @@ describe('Dual-bound PoW, exact retargeting, Genesis anchor, and fork choice', (
       btcCtx,
       V1_TEST_PARAMS,
     );
-    // Find a nonce that fails workHash
+    // Find a nonce that fails workHash and assert rejection actually occurred
     let badNonce = validBlk.nonce + 1;
+    let rejectedWork = false;
     while (badNonce < validBlk.nonce + 10_000) {
       try {
         applyBlock(g, { ...validBlk, nonce: badNonce }, btcCtx, V1_TEST_PARAMS);
         badNonce++;
       } catch (err) {
         assert.match(err.message, /workHash fails PoW target/);
+        rejectedWork = true;
         break;
       }
     }
+    assert.ok(rejectedWork, 'Expected tampered nonce to fail payload workHash PoW check');
   });
 
   it('rejects first child at or before genesisBtcHeight and rejects stale/mismatched btcRef anchors', () => {
@@ -226,8 +230,9 @@ describe('Mandatory bounded paged checkpoints & emission', () => {
     );
     assert.ok(blk3.checkpoint !== null && blk3.checkpoint.mode === 'inline');
 
-    // Missing checkpoint must be rejected (even if workHash re-ground)
-    assert.throws(() => applyBlock(s, { ...blk3, checkpoint: null }, btcCtx3, params), /workHash|checkpoint/i);
+    // Missing checkpoint must be rejected specifically by checkpoint rule (even after re-grinding workHash!)
+    const noCpReground = grindBlockWorkNonce({ ...blk3, checkpoint: null }, nextTarget(s, params));
+    assert.throws(() => applyBlock(s, noCpReground, btcCtx3, params), /Mandatory checkpoint missing/);
 
     const s3 = applyBlock(s, blk3, btcCtx3, params);
     assert.equal(getBalance(s3, miner.pk, I0_TOKEN_ID), 3_500n * UNIT);
@@ -279,9 +284,14 @@ describe('Uniform batch clearing, zero MEV, immutable tokenIds, metadata safety 
     ];
     ({ next: s } = mineBlock(s, { miner: miner.pk, txs: fundTxs, btcHeight: 900_002 }));
 
-    // Launch two tokens in different orders -> immutable tokenId for EYE0 is identical regardless of order!
-    const eye0Id = computeTokenId(s.chainId, creator.pk, 1, 'EYE0');
-    const launchCreator = signTx(s.chainId, { type: 'LAUNCH', from: creator.pk, ticker: 'EYE0', name: 'EyeZero Coin', artId: GENESIS_ID, initialBuy: (100n * UNIT).toString(), nonce: 1, fee: '0' }, creator.sk);
+    // Launch two tokens in different orders -> full 256-bit launch-bound tokenId for EYE0 is identical regardless of order!
+    const launchCreatorSpec = { type: 'LAUNCH', from: creator.pk, ticker: 'EYE0', name: 'EyeZero Coin', artId: GENESIS_ID, initialBuy: (100n * UNIT).toString(), nonce: 1, fee: '0' };
+    const eye0Id = computeTokenId(s.chainId, launchCreatorSpec);
+    // Competing same-ticker launch with different metadata MUST yield a distinct 256-bit tokenId!
+    const competingId = computeTokenId(s.chainId, { ...launchCreatorSpec, name: 'Different Coin' });
+    assert.notEqual(eye0Id, competingId);
+    assert.equal(eye0Id.length, 66); // "t_" + 64 hex chars
+    const launchCreator = signTx(s.chainId, launchCreatorSpec, creator.sk);
     const launchOther = signTx(s.chainId, { type: 'LAUNCH', from: carol.pk, ticker: 'OTHER', name: 'Other Coin', artId: '', initialBuy: '0', nonce: 1, fee: '0' }, carol.sk);
     const buyEye0 = signTx(s.chainId, { type: 'BUY', from: alice.pk, tokenId: eye0Id, i0In: (100n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, alice.sk);
 
@@ -341,9 +351,10 @@ describe('Uniform batch clearing, zero MEV, immutable tokenIds, metadata safety 
 
     const ctx = { btcHeight: 900_003, inscriptionNumber: 5, getBlockHash: fakeBlockHash };
     const { block } = buildCandidateBlock(s, { id: makeBlockId('bloat', 8), miner: miner.pk, btcRef: { h: 900_002, hash: fakeBlockHash(900_002) }, txs: [cleanTx] }, ctx, V1_TEST_PARAMS);
+    const bloatedBlock = grindBlockWorkNonce({ ...block, txs: [bloatedTx] }, nextTarget(s, V1_TEST_PARAMS));
     assert.throws(
-      () => applyBlock(s, { ...block, txs: [bloatedTx] }, ctx, V1_TEST_PARAMS),
-      /workHash|extra unsigned fields/i,
+      () => applyBlock(s, bloatedBlock, ctx, V1_TEST_PARAMS),
+      /extra unsigned fields/,
     );
 
     // Unfunded zero-fee CANCEL rejected
@@ -366,10 +377,11 @@ describe('Uniform batch clearing, zero MEV, immutable tokenIds, metadata safety 
       ],
       btcHeight: 900_003,
     }));
-    const tokenId = computeTokenId(s.chainId, alice.pk, 1, 'SLIP');
+    const launchSlip = { type: 'LAUNCH', from: alice.pk, ticker: 'SLIP', name: 'Slippage Test', artId: '', initialBuy: '0', nonce: 1, fee: '0' };
+    const tokenId = computeTokenId(s.chainId, launchSlip);
     ({ next: s } = mineBlock(s, {
       miner: miner.pk,
-      txs: [signTx(s.chainId, { type: 'LAUNCH', from: alice.pk, ticker: 'SLIP', name: 'Slippage Test', artId: '', initialBuy: '0', nonce: 1, fee: '0' }, alice.sk)],
+      txs: [signTx(s.chainId, launchSlip, alice.sk)],
       btcHeight: 900_004,
     }));
 
@@ -402,10 +414,11 @@ describe('Uniform batch clearing, zero MEV, immutable tokenIds, metadata safety 
       txs: [signTx(s.chainId, { type: 'TRANSFER', from: miner.pk, to: creator.pk, tokenId: 0, amount: (500n * UNIT).toString(), nonce: 1, fee: '0' }, miner.sk)],
       btcHeight: 900_002,
     }));
-    const washId = computeTokenId(s.chainId, creator.pk, 1, 'WASH');
+    const launchWash = { type: 'LAUNCH', from: creator.pk, ticker: 'WASH', name: 'WashCoin', artId: '', initialBuy: '0', nonce: 1, fee: '0' };
+    const washId = computeTokenId(s.chainId, launchWash);
     ({ next: s } = mineBlock(s, {
       miner: miner.pk,
-      txs: [signTx(s.chainId, { type: 'LAUNCH', from: creator.pk, ticker: 'WASH', name: 'WashCoin', artId: '', initialBuy: '0', nonce: 1, fee: '0' }, creator.sk)],
+      txs: [signTx(s.chainId, launchWash, creator.sk)],
       btcHeight: 900_003,
     }));
 
@@ -497,7 +510,16 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
 
     // Cross-network destination rejected (mainnet bc1p address on signet HTLC)
     const mainnetHtlc = deriveTaprootHtlc({ alicePubkey: alice.pk, bobPubkey: bob.pk, hashlock, timeoutBtcHeight: 100, network: 'mainnet' });
-    const fakeUtxo = { txid: '11'.repeat(32), vout: 0, value: 50_000n };
+    const fakeUtxo = { txid: '11'.repeat(32), vout: 0, value: 50_000n, scriptPubKeyHex: htlc.outputScriptHex, confirmations: 1 };
+    // Missing scriptPubKeyHex or 0-conf UTXO must be rejected before emitting witness hex
+    assert.throws(
+      () => buildAndSignHtlcClaimTx({ utxo: { txid: '11'.repeat(32), vout: 0, value: 50_000n }, htlc, secretHex: secret, alicePrivKey: alice.sk, destinationAddress: htlc.address }),
+      /scriptPubKeyHex is required/,
+    );
+    assert.throws(
+      () => buildAndSignHtlcClaimTx({ utxo: { ...fakeUtxo, confirmations: 0 }, htlc, secretHex: secret, alicePrivKey: alice.sk, destinationAddress: htlc.address }),
+      />= 1 confirmation/,
+    );
     assert.throws(
       () => buildAndSignHtlcClaimTx({ utxo: fakeUtxo, htlc, secretHex: secret, alicePrivKey: alice.sk, destinationAddress: mainnetHtlc.address }),
       /network mismatch/,

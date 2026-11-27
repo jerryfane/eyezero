@@ -1,4 +1,5 @@
-// Deterministic state representation, bounded paged checkpoints, Merkle state root, and state diffs.
+// Deterministic state representation, strictly-bounded per-entry paged checkpoints,
+// single-source Merkle state root, and state diffs.
 
 import { I0_TOKEN_ID, V1_MAINNET_PARAMS } from './constants.js';
 import { sha256Hex } from './crypto.js';
@@ -33,7 +34,7 @@ export function createGenesisState(genesisId, params = V1_MAINNET_PARAMS, genesi
     totalI0Minted: 0n,
     // pubkeyHex -> { nonce: number, balances: Map<0 | string, bigint> }
     accounts: new Map(),
-    // tokenId ("t_<16-hex>") -> { id, ticker, name, artId, creator, virtualI0, realI0, realTok }
+    // tokenId ("t_<64-hex>") -> { id, ticker, name, artId, creator, virtualI0, realI0, realTok }
     tokens: new Map(),
     // swapId (64-hex) -> { id, sender, recipient, amount, hashlock, timeoutBtcHeight }
     htlcs: new Map(),
@@ -102,7 +103,6 @@ export function subBalance(state, pubkey, tokenId, delta) {
   setBalance(state, pubkey, tokenId, cur - delta);
 }
 
-// Compute a deterministic binary SHA-256 Merkle root over an ordered list of 64-hex hashes.
 export function merkleRootHex(hashes) {
   if (!Array.isArray(hashes) || hashes.length === 0) {
     return sha256Hex('eyezero:v1:merkle:empty');
@@ -120,21 +120,40 @@ export function merkleRootHex(hashes) {
   return level[0];
 }
 
-// Deterministic canonical ledger entries sorted canonically for hashing and bounded paging.
-// Deliberately excludes post-confirmation Bitcoin header fields (tipId, tipBtcHeight,
-// tipInscriptionNumber) so miners compute stateRoot deterministically BEFORE grinding reveal_txid.
+// Single source of truth for the state-root commitment preimage.
+function computeStateRootFromSummary({ genesisId, height, totalI0Minted, totalPages, pagesMerkleRoot }) {
+  return sha256Hex(
+    `eyezero:v1:state:${JSON.stringify({
+      v: 1,
+      genesisId,
+      height,
+      totalI0Minted: String(totalI0Minted),
+      totalPages,
+      pagesMerkleRoot,
+    })}`,
+  );
+}
+
+// Split canonical state into individually bounded O(1)-size atomic entries so NO single account
+// holding thousands of tokens can ever produce an indivisible oversized checkpoint page!
+//   ['n', pk, nonce]                                      (~85 B)
+//   ['b', pk, tokenId, amount]                            (~160 B)
+//   ['t', id, ticker, name, artId, creator, vI0, rI0, rT] (~320 B)
+//   ['h', id, sender, recipient, amount, hashlock, exp]   (~240 B)
 function collectCanonicalEntries(state) {
   const entries = [];
 
   const sortedAccounts = [...state.accounts.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   for (const [pk, acc] of sortedAccounts) {
+    if (acc.nonce > 0) {
+      entries.push(['n', pk, acc.nonce]);
+    }
     const bals = [...acc.balances.entries()]
       .filter(([, v]) => v > 0n)
-      .sort(([a], [b]) => compareTokenIds(a, b))
-      .map(([tid, v]) => [tid, v.toString()]);
-    if (acc.nonce > 0 || bals.length > 0) {
-      entries.push(['a', pk, acc.nonce, bals]);
+      .sort(([a], [b]) => compareTokenIds(a, b));
+    for (const [tid, v] of bals) {
+      entries.push(['b', pk, tid, v.toString()]);
     }
   }
 
@@ -171,20 +190,23 @@ function collectCanonicalEntries(state) {
   return entries;
 }
 
-// Split canonical state deterministically into bounded pages so mandatory checkpoints
-// can NEVER outgrow a standard Bitcoin inscription regardless of total account count.
-export function exportCheckpointPages(state, maxPageBytes = V1_MAINNET_PARAMS.maxCheckpointPageBytes) {
+// Single encoder returning BOTH checkpoint pages, bounded embedded checkpoint object, and stateRoot.
+export function encodeStateCommitment(state, params = V1_MAINNET_PARAMS) {
+  const maxPageBytes = params?.maxCheckpointPageBytes ?? V1_MAINNET_PARAMS.maxCheckpointPageBytes;
   const entries = collectCanonicalEntries(state);
   const rawPages = [];
   let curEntries = [];
-  let curBytes = 160; // base JSON envelope overhead
+  let curBytes = 180; // base JSON envelope overhead
 
   for (const entry of entries) {
     const entryLen = JSON.stringify(entry).length + 1;
+    if (entryLen + 180 > maxPageBytes) {
+      throw new Error(`Single state entry (${entryLen} B) exceeds maxCheckpointPageBytes (${maxPageBytes})`);
+    }
     if (curEntries.length > 0 && curBytes + entryLen > maxPageBytes) {
       rawPages.push(curEntries);
       curEntries = [];
-      curBytes = 160;
+      curBytes = 180;
     }
     curEntries.push(entry);
     curBytes += entryLen;
@@ -205,34 +227,35 @@ export function exportCheckpointPages(state, maxPageBytes = V1_MAINNET_PARAMS.ma
   }));
   const pageHashes = pages.map((p) => sha256Hex(`eyezero:v1:cp:page:${JSON.stringify(p)}`));
   const pagesMerkleRoot = merkleRootHex(pageHashes);
-  const stateRoot = sha256Hex(
-    `eyezero:v1:state:${JSON.stringify({
-      v: 1,
-      genesisId: state.genesisId,
-      height: state.height,
-      totalI0Minted: state.totalI0Minted.toString(),
-      totalPages,
-      pagesMerkleRoot,
-    })}`,
-  );
+  const stateRoot = computeStateRootFromSummary({
+    genesisId: state.genesisId,
+    height: state.height,
+    totalI0Minted: state.totalI0Minted.toString(),
+    totalPages,
+    pagesMerkleRoot,
+  });
 
-  return { pages, pageHashes, pagesMerkleRoot, stateRoot };
-}
-
-// Produce the bounded checkpoint object embedded in a mandatory checkpoint block.
-// When state fits in 1 page, mode='inline' embeds the full state.
-// When state spans multiple pages, mode='paged' embeds page 0 + pagesMerkleRoot (bounded <= maxPageBytes),
-// while companion page inscriptions 1..N-1 are verified individually against pagesMerkleRoot.
-export function exportCheckpoint(state, params = V1_MAINNET_PARAMS) {
-  const maxPageBytes = params?.maxCheckpointPageBytes ?? V1_MAINNET_PARAMS.maxCheckpointPageBytes;
-  const { pages, pagesMerkleRoot } = exportCheckpointPages(state, maxPageBytes);
-  return {
+  const checkpoint = {
     v: 1,
-    mode: pages.length === 1 ? 'inline' : 'paged',
-    totalPages: pages.length,
+    mode: totalPages === 1 ? 'inline' : 'paged',
+    totalPages,
     pagesMerkleRoot,
     page0: pages[0],
   };
+
+  return { pages, pageHashes, pagesMerkleRoot, stateRoot, checkpoint };
+}
+
+export function exportCheckpointPages(state, maxPageBytes = V1_MAINNET_PARAMS.maxCheckpointPageBytes) {
+  return encodeStateCommitment(state, { maxCheckpointPageBytes: maxPageBytes });
+}
+
+export function exportCheckpoint(state, params = V1_MAINNET_PARAMS) {
+  return encodeStateCommitment(state, params).checkpoint;
+}
+
+export function computeStateRoot(state, params = V1_MAINNET_PARAMS) {
+  return encodeStateCommitment(state, params).stateRoot;
 }
 
 export function importCheckpointPages(pages, header = {}) {
@@ -249,6 +272,14 @@ export function importCheckpointPages(pages, header = {}) {
   }
 
   const accounts = new Map();
+  const ensureAcc = (pk) => {
+    let acc = accounts.get(pk);
+    if (!acc) {
+      acc = { nonce: 0, balances: new Map() };
+      accounts.set(pk, acc);
+    }
+    return acc;
+  };
   const tokens = new Map();
   const htlcs = new Map();
   const pageHashes = [];
@@ -272,11 +303,12 @@ export function importCheckpointPages(pages, header = {}) {
     for (const entry of p.entries) {
       if (!Array.isArray(entry) || entry.length < 2) throw new Error('Invalid checkpoint entry');
       const kind = entry[0];
-      if (kind === 'a') {
-        const [, pk, nonce, bals] = entry;
-        const m = new Map();
-        for (const [tid, v] of bals) m.set(tid, BigInt(v));
-        accounts.set(pk, { nonce, balances: m });
+      if (kind === 'n') {
+        const [, pk, nonce] = entry;
+        ensureAcc(pk).nonce = nonce;
+      } else if (kind === 'b') {
+        const [, pk, tid, v] = entry;
+        ensureAcc(pk).balances.set(tid, BigInt(v));
       } else if (kind === 't') {
         const [, id, ticker, name, artId, creator, virtualI0, realI0, realTok] = entry;
         tokens.set(id, {
@@ -323,16 +355,13 @@ export function importCheckpointPages(pages, header = {}) {
   };
 
   if (header.expectedStateRoot) {
-    const computed = sha256Hex(
-      `eyezero:v1:state:${JSON.stringify({
-        v: 1,
-        genesisId: restored.genesisId,
-        height: restored.height,
-        totalI0Minted: restored.totalI0Minted.toString(),
-        totalPages,
-        pagesMerkleRoot,
-      })}`,
-    );
+    const computed = computeStateRootFromSummary({
+      genesisId: restored.genesisId,
+      height: restored.height,
+      totalI0Minted: restored.totalI0Minted.toString(),
+      totalPages,
+      pagesMerkleRoot,
+    });
     if (computed !== header.expectedStateRoot) {
       throw new Error(`Checkpoint stateRoot mismatch: got ${computed}, expected ${header.expectedStateRoot}`);
     }
@@ -349,11 +378,6 @@ export function importCheckpoint(cp, header = {}) {
     throw new Error('Paged checkpoint has multiple pages; pass all pages to importCheckpointPages()');
   }
   return importCheckpointPages([cp.page0], header);
-}
-
-export function computeStateRoot(state, params = V1_MAINNET_PARAMS) {
-  const maxPageBytes = params?.maxCheckpointPageBytes ?? V1_MAINNET_PARAMS.maxCheckpointPageBytes;
-  return exportCheckpointPages(state, maxPageBytes).stateRoot;
 }
 
 // Compute compact sorted State Diff: every (pubkey, tokenId, newBalance) that changed between before and after.

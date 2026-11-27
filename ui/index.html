@@ -129,7 +129,7 @@
 
       <div class="card">
         <div class="card-h">
-          <span class="card-t">Verified eyezero Chain <span class="mut" style="font-weight:400">(Confirmed Bitcoin Inscriptions)</span></span>
+          <span class="card-t">Verified eyezero Chain <span class="mut" id="chain-mode-sub" style="font-weight:400">(Ord Inscriptions)</span></span>
           <button class="sm" id="mev-test-btn">Verify Zero-MEV Shuffle</button>
         </div>
         <div class="list" id="block-list"></div>
@@ -198,7 +198,7 @@
 
         <div id="tab-htlc" hidden>
           <div class="warn-box" id="htlc-safety-banner">
-            Demo / sandbox safety lock: Mainnet BTC funding is disabled for built-in demo keys and simulated chains. BTC HTLC funding is only unlocked AFTER a matching I0 HTLC_LOCK confirms in a verified block.
+            Safety lock: Mainnet BTC funding is disabled. Simulated demo escrows are never fundable. Before locking I0, generate and back up Secret S (session-only — lost on reload!).
           </div>
           <div class="row">
             <div class="field">
@@ -217,7 +217,9 @@
               <option value="regtest">Bitcoin Regtest (bcrt1p…)</option>
             </select>
           </div>
-          <button class="primary" style="width:100%" id="submit-htlc">Step 1: Sign &amp; Queue I0 HTLC_LOCK</button>
+          <button style="width:100%;margin-bottom:6px" id="htlc-prep-secret-btn">Step 1: Generate &amp; Back Up Swap Secret S</button>
+          <div class="quote" id="htlc-secret-backup" hidden></div>
+          <button class="primary" style="width:100%" id="submit-htlc" disabled>Step 2: Sign &amp; Queue I0 HTLC_LOCK</button>
           <div class="list" id="htlc-list" style="margin-top:10px"></div>
         </div>
 
@@ -266,10 +268,21 @@
 
     const PARAMS = E.V1_DEMO_PARAMS;
     const UNIT = E.UNIT;
-    const MAX_MEMPOOL_TXS = 200;
+    const EXPECTED_WRAPPER_HOST = 'eyezero.themartian.app';
+    function isTrustedWrapperOrigin(origin) {
+      try {
+        const u = new URL(origin);
+        return u.protocol === 'https:' && u.hostname === EXPECTED_WRAPPER_HOST && u.port === '';
+      } catch {
+        return false;
+      }
+    }
+    const MAX_MEMPOOL_SLOTS = 200;
     const MAX_SEEN_SIGS = 1000;
     const MAX_SYNC_DEPTH = 2000;
     const MAX_ORD_BODY_BYTES = 512 * 1024;
+    const FETCH_TIMEOUT_MS = 12_000;
+    const MAX_PENDING_HINTS = 8;
     const HEX64_RE = /^[0-9a-f]{64}$/;
 
     const fmtI0 = (v) => {
@@ -282,7 +295,6 @@
     const fmtTok = (v) => (v / UNIT).toLocaleString();
     const shortId = (id) => id ? `${id.slice(0, 10)}…${id.slice(-6)}` : '—';
 
-    // Safe DOM builder — all dynamic strings flow through textContent (zero innerHTML sinks!).
     function el(tag, props = null, ...children) {
       const node = document.createElement(tag);
       if (props) {
@@ -327,25 +339,49 @@
     for (const p of PERSONAS) p.pk = E.getPublicKeyHex(p.sk);
 
     let activePersona = PERSONAS[0];
-    let chainState = null;
+    // Strictly separate Ord-verified chain state/cache from local demo simulator state/cache!
+    let ordState = null;
+    let ordVerifiedBlocks = [];
+    let ordGenesisBtcHeight = 0;
+    let ordTipId = null;
+    const validatedBlockCache = new Map(); // inscriptionId -> { blk, meta }
+
+    let simActive = false;
+    let simState = null;
+    let simBlocks = [];
+    const simBlockHashCache = new Map();
+
     let genesisIdPinned = null;
-    let isSimulatedChain = true;
-    let verifiedBlocks = [];
-    let pendingTxs = [];
-    const seenTxSigs = new Set();
+    let isSimulatedSeed = true;
+    let localBtcHeight = 924_103;
     let selectedTokenId = null;
     let inspectedHeight = null;
-    let localBtcHeight = 924_103;
     let revealSecretVisible = false;
-    const blockHashCache = new Map();
     let entmootNet = null;
-    let trustedParentOrigin = null;
+    let wrapperAuthenticated = false;
 
-    // Memoized projection so renderAll never re-verifies immutable mempool signatures on every click.
+    // Pending HTLC secret backup state (forces explicit backup before Alice can submit HTLC_LOCK).
+    let stagedSwapSecret = null; // { secretHex, hashlock, backedUp: boolean }
+    const sessionHtlcSecrets = new Map(); // swapId -> secretHex (session-only backup for Alice)
+
+    // Mempool deduplicated by (from:nonce) keeping only highest-fee valid tx + verified sig cache!
+    const pendingBySlot = new Map(); // `${from}:${nonce}` -> { tx, fee }
+    const seenTxSigs = new Set();
+    const verifiedSigs = new Set();
+
     let cachedProjection = null;
     let projectionDirty = true;
+    let renderScheduled = false;
+
+    // Coalesced hint queue so rapid #i0-blk messages never stampede ord fetches.
+    let hintReplayInFlight = false;
+    const queuedHintIds = new Set();
+    const retryHints = new Map(); // tipId -> { retries, nextAt }
 
     const $ = (id) => document.getElementById(id);
+    const activeState = () => (simActive ? simState : ordState);
+    const activeBlocks = () => (simActive ? simBlocks : ordVerifiedBlocks);
+    const isSimulatedView = () => simActive || isSimulatedSeed;
 
     function showMsg(elId, text) {
       const node = $(elId);
@@ -357,24 +393,37 @@
       projectionDirty = true;
     }
 
+    function scheduleRender() {
+      if (renderScheduled) return;
+      renderScheduled = true;
+      setTimeout(() => {
+        renderScheduled = false;
+        renderAll();
+      }, 60);
+    }
+
     function getProjected() {
+      const s = activeState();
       if (!projectionDirty && cachedProjection) return cachedProjection;
-      cachedProjection = E.previewPending(chainState, pendingTxs, localBtcHeight + 1, PARAMS);
+      const list = [...pendingBySlot.values()].map((entry) => entry.tx);
+      cachedProjection = E.previewPending(s, list, localBtcHeight + 1, PARAMS, { verifiedSigs });
       projectionDirty = false;
       return cachedProjection;
     }
 
     function nextNonceFor(pk) {
-      const base = chainState.accounts.get(pk)?.nonce ?? 0;
+      const s = activeState();
+      const base = s.accounts.get(pk)?.nonce ?? 0;
       const { accepted } = getProjected();
       let max = base;
       for (const tx of accepted) if (tx.from === pk && tx.nonce > max) max = tx.nonce;
       return max + 1;
     }
 
-    // Verify once on admission, strip unsigned fields, enforce nonce window & bounded pool size.
+    // Verify once on admission, strip unsigned fields, keep only best tx per (from, nonce).
     function ingestPendingTx(rawTx) {
-      if (!chainState || !rawTx || typeof rawTx.sig !== 'string') return false;
+      const s = activeState();
+      if (!s || !rawTx || typeof rawTx.sig !== 'string') return false;
       if (seenTxSigs.has(rawTx.sig)) return false;
 
       let tx;
@@ -384,23 +433,51 @@
         return false;
       }
       if (!Number.isInteger(tx.nonce) || tx.nonce < 1) return false;
-      const curNonce = chainState.accounts.get(tx.from)?.nonce ?? 0;
+      if ((tx.type === 'BUY' || tx.type === 'SELL') && (typeof tx.tokenId !== 'string' || !E.isValidTokenId(tx.tokenId))) {
+        return false;
+      }
+      if (tx.type === 'TRANSFER' && !E.isValidTokenId(tx.tokenId)) return false;
+      const curNonce = s.accounts.get(tx.from)?.nonce ?? 0;
       if (tx.nonce <= curNonce || tx.nonce > curNonce + 8) return false;
-      // Reject spam from completely unknown accounts unless they have an incoming/existing state or are claiming HTLC.
-      if (!chainState.accounts.has(tx.from) && tx.type !== 'HTLC_CLAIM') return false;
-      if (!E.verifyTxSignature(chainState.chainId, tx)) return false;
+      if (!s.accounts.has(tx.from) && tx.type !== 'HTLC_CLAIM') return false;
+
+      let fee;
+      try {
+        fee = BigInt(tx.fee ?? '0');
+        if (fee < 0n) return false;
+      } catch {
+        return false;
+      }
+
+      const slot = `${tx.from}:${tx.nonce}`;
+      const existing = pendingBySlot.get(slot);
+      if (existing && (fee < existing.fee || (fee === existing.fee && tx.sig >= existing.tx.sig))) {
+        return false;
+      }
+
+      if (!E.verifyTxSignature(s.chainId, tx)) return false;
 
       seenTxSigs.add(tx.sig);
+      verifiedSigs.add(tx.sig);
       if (seenTxSigs.size > MAX_SEEN_SIGS) {
         const oldest = seenTxSigs.values().next().value;
         seenTxSigs.delete(oldest);
+        verifiedSigs.delete(oldest);
       }
-      pendingTxs.push(tx);
-      if (pendingTxs.length > MAX_MEMPOOL_TXS) {
-        pendingTxs.shift();
+      pendingBySlot.set(slot, { tx, fee });
+      if (pendingBySlot.size > MAX_MEMPOOL_SLOTS) {
+        const oldestSlot = pendingBySlot.keys().next().value;
+        pendingBySlot.delete(oldestSlot);
       }
       invalidateProjection();
       return true;
+    }
+
+    function pruneConfirmedMempool(state) {
+      for (const [slot, entry] of pendingBySlot.entries()) {
+        const cur = state.accounts.get(entry.tx.from)?.nonce ?? 0;
+        if (entry.tx.nonce <= cur) pendingBySlot.delete(slot);
+      }
     }
 
     async function broadcastTx(tx) {
@@ -417,30 +494,55 @@
       return false;
     }
 
-    // Strictly authenticate messages from the immediate outer HTTPS wrapper parent.
+    // Strictly authenticate messages ONLY from the pinned wrapper origin on immediate parent!
+    let verifiedWrapperOrigin = null;
     window.addEventListener('message', (ev) => {
       if (ev.source !== window.parent || window.parent === window) return;
-      if (typeof ev.origin !== 'string' || !ev.origin.startsWith('https://')) {
-        return;
-      }
+      if (!isTrustedWrapperOrigin(ev.origin)) return;
       const msg = ev.data;
       if (!msg || typeof msg !== 'object') return;
-      if (msg.type === 'eyezero:wrapper:ready' && msg.connected === true) {
-        trustedParentOrigin = ev.origin;
+      if (msg.type === 'eyezero:wrapper:ready' && msg.connected === true && msg.network === 'signet') {
+        wrapperAuthenticated = true;
+        verifiedWrapperOrigin = ev.origin;
         const preview = typeof msg.addrPreview === 'string' ? msg.addrPreview.slice(0, 24) : 'ready';
-        showMsg('action-msg', `Connected to Xverse wrapper (${preview})`);
+        showMsg('action-msg', `Connected to Xverse Signet wrapper (${preview})`);
+        renderAll();
       }
     });
 
+    // Streamed byte-capped + timeout-bounded JSON fetch (never buffers unbounded payloads).
     async function fetchJson(url, maxBytes = MAX_ORD_BODY_BYTES) {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
-      const text = await res.text();
-      if (text.length > maxBytes) throw new Error(`${url} exceeded byte limit`);
-      return JSON.parse(text);
+      const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (!res.ok) {
+        const err = new Error(`${url} -> HTTP ${res.status}`);
+        err.status = res.status;
+        throw err;
+      }
+      if (!res.body) {
+        const text = await res.text();
+        if (text.length > maxBytes) throw new Error(`${url} exceeded byte limit`);
+        return JSON.parse(text);
+      }
+      const reader = res.body.getReader();
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error(`${url} exceeded byte limit`);
+        }
+        chunks.push(value);
+      }
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
+      return JSON.parse(new TextDecoder().decode(merged));
     }
 
-    // Single validated ID-based replay path tied strictly to ord + compareChainTips fork choice.
+    // Single validated ID-based replay path tied strictly to live ord (fresh active-chain blockhashes per replay!).
     async function replayVerifiedChainFromOrd(genesisId, tipId) {
       if (!E.isValidInscriptionId(genesisId)) throw new Error('Invalid genesis ID');
       if (!E.isValidInscriptionId(tipId)) throw new Error('Invalid tip ID');
@@ -450,6 +552,8 @@
         throw new Error('Genesis inscription unconfirmed on ord');
       }
 
+      // Fresh active-chain blockhash lookup table per replay so Bitcoin reorgs invalidate orphaned anchors!
+      const freshHashes = new Map();
       const rawChain = [];
       const visited = new Set([genesisId]);
       let cursor = tipId;
@@ -461,26 +565,30 @@
         if (rawChain.length >= MAX_SYNC_DEPTH) throw new Error('Max sync depth exceeded');
         visited.add(cursor);
 
-        const [blk, meta] = await Promise.all([
-          fetchJson(`/content/${cursor}`),
-          fetchJson(`/r/inscription/${cursor}`),
-        ]);
-        if (!Number.isInteger(blk?.btcRef?.h) || blk.btcRef.h < 0) {
-          throw new Error(`Invalid btcRef.h in ${cursor}`);
-        }
-        if (typeof blk?.prev !== 'string' || !E.isValidInscriptionId(blk.prev)) {
-          throw new Error(`Invalid prev in ${cursor}`);
-        }
-        if (!blockHashCache.has(blk.btcRef.h)) {
-          const refHash = await fetchJson(`/r/blockhash/${blk.btcRef.h}`);
-          if (typeof refHash !== 'string' || !HEX64_RE.test(refHash.toLowerCase())) {
-            throw new Error(`Invalid blockhash at height ${blk.btcRef.h}`);
+        let entry = validatedBlockCache.get(cursor);
+        if (!entry) {
+          const [blk, meta] = await Promise.all([
+            fetchJson(`/content/${cursor}`),
+            fetchJson(`/r/inscription/${cursor}`),
+          ]);
+          if (!Number.isInteger(blk?.btcRef?.h) || blk.btcRef.h < 0) {
+            throw new Error(`Invalid btcRef.h in ${cursor}`);
           }
-          blockHashCache.set(blk.btcRef.h, refHash.toLowerCase());
+          if (typeof blk?.prev !== 'string' || !E.isValidInscriptionId(blk.prev)) {
+            throw new Error(`Invalid prev in ${cursor}`);
+          }
+          entry = { blk: { ...blk, id: cursor }, meta };
         }
-        // Always bind the block's ID from the verified ord inscription ID (never trust body-supplied id).
-        rawChain.push({ blk: { ...blk, id: cursor }, meta });
-        cursor = blk.prev;
+        const refH = entry.blk.btcRef.h;
+        if (!freshHashes.has(refH)) {
+          const refHash = await fetchJson(`/r/blockhash/${refH}`);
+          if (typeof refHash !== 'string' || !HEX64_RE.test(refHash.toLowerCase())) {
+            throw new Error(`Invalid blockhash at height ${refH}`);
+          }
+          freshHashes.set(refH, refHash.toLowerCase());
+        }
+        rawChain.push(entry);
+        cursor = entry.blk.prev;
       }
       if (cursor !== genesisId) throw new Error('Ancestry did not reach pinned genesis');
       rawChain.reverse();
@@ -491,36 +599,85 @@
         const ctx = {
           btcHeight: meta.height,
           inscriptionNumber: meta.number,
-          getBlockHash: (h) => blockHashCache.get(h) ?? null,
+          getBlockHash: (h) => freshHashes.get(h) ?? null,
         };
         s = E.applyBlock(s, blk, ctx, PARAMS);
+        validatedBlockCache.set(blk.id, { blk, meta });
         blocks.push({ block: blk, meta });
       }
-      return { state: s, blocks };
+      return { state: s, blocks, genesisBtcHeight: genesisMeta.height, hashes: freshHashes };
     }
 
-    async function adoptTipHintFromOrd(tipId) {
+    function enqueueTipHint(tipId) {
       if (!genesisIdPinned || !E.isValidBlockInscriptionId(tipId)) return;
+      if (queuedHintIds.size >= MAX_PENDING_HINTS) return;
+      queuedHintIds.add(tipId);
+      drainHintQueue();
+    }
+
+    async function drainHintQueue() {
+      if (hintReplayInFlight) return;
+      hintReplayInFlight = true;
       try {
-        const candidate = await replayVerifiedChainFromOrd(genesisIdPinned, tipId);
-        if (!chainState || E.compareChainTips(candidate.state, chainState) > 0) {
-          chainState = candidate.state;
-          verifiedBlocks = candidate.blocks;
-          localBtcHeight = Math.max(localBtcHeight, chainState.tipBtcHeight);
-          pendingTxs = pendingTxs.filter((t) => t.nonce > (chainState.accounts.get(t.from)?.nonce ?? 0));
-          invalidateProjection();
-          setPill('sync-pill', 'ok', `Verified ${verifiedBlocks.length} blocks on chain`);
-          renderAll();
+        while (queuedHintIds.size > 0) {
+          const tipId = queuedHintIds.values().next().value;
+          queuedHintIds.delete(tipId);
+          try {
+            const candidate = await replayVerifiedChainFromOrd(genesisIdPinned, tipId);
+            // Revalidate incumbent Ord tip on the active Bitcoin chain before fork comparison
+            // so a reorged incumbent can never beat a valid lower-work replacement!
+            let incumbentValid = false;
+            if (ordTipId) {
+              try {
+                const rechecked = await replayVerifiedChainFromOrd(genesisIdPinned, ordTipId);
+                ordState = rechecked.state;
+                ordVerifiedBlocks = rechecked.blocks;
+                incumbentValid = true;
+              } catch {
+                incumbentValid = false;
+              }
+            }
+            if (!incumbentValid || !ordState || E.compareChainTips(candidate.state, ordState) > 0) {
+              ordState = candidate.state;
+              ordVerifiedBlocks = candidate.blocks;
+              ordGenesisBtcHeight = candidate.genesisBtcHeight;
+              ordTipId = tipId;
+              // Adopting a newly verified Ord tip exits local simulation so real confirmed state takes precedence!
+              simActive = false;
+              localBtcHeight = Math.max(localBtcHeight, ordState.tipBtcHeight);
+              pruneConfirmedMempool(ordState);
+              invalidateProjection();
+              setPill('sync-pill', 'ok', `Verified ${ordVerifiedBlocks.length} blocks on chain`);
+              renderAll();
+            }
+            retryHints.delete(tipId);
+          } catch (err) {
+            // If ord hasn't indexed the newly broadcast block yet (404), keep in bounded retry queue.
+            if (err?.status === 404 && retryHints.size < MAX_PENDING_HINTS) {
+              const prev = retryHints.get(tipId) ?? { retries: 0 };
+              if (prev.retries < 3) {
+                retryHints.set(tipId, { retries: prev.retries + 1, nextAt: Date.now() + 30_000 });
+              } else {
+                retryHints.delete(tipId);
+              }
+            }
+          }
         }
-      } catch (err) {
-        console.warn('Rejected unverified #i0-blk hint:', err?.message || err);
+      } finally {
+        hintReplayInFlight = false;
       }
     }
+
+    setInterval(() => {
+      const now = Date.now();
+      for (const [tipId, info] of retryHints.entries()) {
+        if (now >= info.nextAt) enqueueTipHint(tipId);
+      }
+    }, 15_000);
 
     async function connectEntmoot() {
       try {
         const cfg = await fetchJson('/content/local:entmoot-config.json');
-        // Fresh ephemeral Ed25519 key per tab avoids BroadcastChannel collisions across tabs.
         const keyBytes = new Uint8Array(32);
         crypto.getRandomValues(keyBytes);
 
@@ -538,25 +695,39 @@
         net.on('i0-tx', (msg) => {
           try {
             if (typeof msg.text !== 'string' || msg.text.length > 8192) return;
-            if (ingestPendingTx(JSON.parse(msg.text))) renderAll();
+            if (ingestPendingTx(JSON.parse(msg.text))) scheduleRender();
           } catch {}
         });
 
-        // Treat #i0-blk strictly as an untrusted ID hint — NEVER trust peer-supplied blocks or confirmation metadata!
         net.on('i0-blk', (msg) => {
           try {
             if (typeof msg.text !== 'string' || msg.text.length > 1024) return;
             const hint = JSON.parse(msg.text);
             if (hint && typeof hint.id === 'string' && E.isValidBlockInscriptionId(hint.id)) {
-              adoptTipHintFromOrd(hint.id);
+              enqueueTipHint(hint.id);
             }
           } catch {}
         });
 
+        // Cold discovery: replay bounded recent #i0-blk hints + #i0-tx mempool from Entmoot history.
         try {
-          const hist = await net.history('i0-tx', 40);
+          const blkHist = await net.history('i0-blk', 16);
+          for (const msg of blkHist) {
+            try {
+              if (typeof msg.text === 'string' && msg.text.length <= 1024) {
+                const hint = JSON.parse(msg.text);
+                if (hint && typeof hint.id === 'string' && E.isValidBlockInscriptionId(hint.id)) {
+                  enqueueTipHint(hint.id);
+                }
+              }
+            } catch {}
+          }
+        } catch {}
+
+        try {
+          const txHist = await net.history('i0-tx', 40);
           let loaded = 0;
-          for (const msg of hist) {
+          for (const msg of txHist) {
             try {
               if (typeof msg.text === 'string' && msg.text.length <= 8192 && ingestPendingTx(JSON.parse(msg.text))) {
                 loaded++;
@@ -579,19 +750,33 @@
         ]);
         localBtcHeight = Number(btcH);
         genesisIdPinned = tipInfo.genesisId;
-        isSimulatedChain = Boolean(tipInfo.simulated);
+        isSimulatedSeed = Boolean(tipInfo.simulated);
 
-        const { state, blocks } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
-        chainState = state;
-        verifiedBlocks = blocks;
+        const { state, blocks, genesisBtcHeight } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
+        ordState = state;
+        ordVerifiedBlocks = blocks;
+        ordGenesisBtcHeight = genesisBtcHeight;
+        ordTipId = tipInfo.tipId;
         inspectedHeight = state.height;
         invalidateProjection();
-        setPill('sync-pill', 'ok', `Verified ${verifiedBlocks.length} blocks on chain`);
+        setPill('sync-pill', 'ok', isSimulatedSeed ? `Demo seed: ${blocks.length} blocks` : `Verified ${blocks.length} blocks on chain`);
         renderAll();
         connectEntmoot();
       } catch (err) {
         setPill('sync-pill', 'err', `Sync error: ${err?.message || err}`);
       }
+    }
+
+    // Single quote helper used for BOTH displaying and signing sells (no formula duplication).
+    function computeSellQuote(tok, tokIn, slipPct) {
+      const X = tok.virtualI0 + tok.realI0;
+      const Y = tok.realTok;
+      const grossI0 = (tokIn * X) / (Y + tokIn);
+      const fee = (grossI0 * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
+      const netI0 = grossI0 - fee;
+      const slip = BigInt(Math.max(0, Math.min(99, Math.round(Number(slipPct || 0)))));
+      const minI0Out = (netI0 * (100n - slip)) / 100n;
+      return { grossI0, fee, netI0, minI0Out };
     }
 
     function renderCurveSvg(tok, projTok) {
@@ -661,9 +846,7 @@
         const i0In = BigInt(Math.round(buyVal * 1e8));
         const fee = (i0In * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
         const netB = i0In - fee;
-        const X = tok.virtualI0 + tok.realI0;
-        const Y = tok.realTok;
-        const estOut = (netB * Y) / (X + netB);
+        const estOut = (netB * tok.realTok) / (tok.virtualI0 + tok.realI0 + netB);
         $('buy-quote').replaceChildren(
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. output (projected batch)'), el('span', { class: 'mono' }, `${fmtTok(estOut)} ${tok.ticker}`)),
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% fee (0.5% miner / 0.5% creator)'), el('span', { class: 'mono' }, `${fmtI0(fee)} I0`)),
@@ -672,27 +855,23 @@
       const sellVal = Number($('sell-amount').value || 0);
       if (sellVal > 0) {
         const tokIn = BigInt(Math.round(sellVal)) * UNIT;
-        const slip = BigInt(Math.max(0, Math.min(99, Math.round(Number($('sell-slip').value || 15)))));
-        const X = tok.virtualI0 + tok.realI0;
-        const Y = tok.realTok;
-        const grossI0 = (tokIn * X) / (Y + tokIn);
-        const fee = (grossI0 * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
-        const netI0 = grossI0 - fee;
-        const minOut = (netI0 * (100n - slip)) / 100n;
+        const q = computeSellQuote(tok, tokIn, $('sell-slip').value);
         $('sell-quote').replaceChildren(
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. net payout'), el('span', { class: 'mono' }, `${fmtI0(netI0)} I0`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minI0Out protection'), el('span', { class: 'mono' }, `${fmtI0(minOut)} I0`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% I0 fee (0.5% miner / 0.5% creator)'), el('span', { class: 'mono' }, `${fmtI0(fee)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. net payout'), el('span', { class: 'mono' }, `${fmtI0(q.netI0)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minI0Out protection'), el('span', { class: 'mono' }, `${fmtI0(q.minI0Out)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% I0 fee (0.5% miner / 0.5% creator)'), el('span', { class: 'mono' }, `${fmtI0(q.fee)} I0`)),
         );
       }
     }
 
     function renderAll() {
-      if (!chainState) return;
+      const s = activeState();
+      if (!s) return;
       const { projectedState, accepted } = getProjected();
 
-      $('tip-pill').textContent = `Block #${chainState.height} · ${shortId(chainState.tipId)}`;
-      const myI0 = E.getBalance(chainState, activePersona.pk, 0);
+      $('chain-mode-sub').textContent = isSimulatedView() ? '(Simulated Local Demo — Not Bitcoin Mainnet)' : '(Confirmed Bitcoin Inscriptions)';
+      $('tip-pill').textContent = `${simActive ? 'Sim ' : ''}Block #${s.height} · ${shortId(s.tipId)}`;
+      const myI0 = E.getBalance(s, activePersona.pk, 0);
       const myProjI0 = E.getBalance(projectedState, activePersona.pk, 0);
       $('bal-pill').textContent = myProjI0 !== myI0
         ? `${fmtI0(myI0)} I0 (pend: ${fmtI0(myProjI0)})`
@@ -702,14 +881,13 @@
       $('wallet-sk-box').textContent = revealSecretVisible ? localWallet.sk : '';
       $('wallet-reveal-btn').textContent = revealSecretVisible ? 'Hide Hex' : 'Reveal Hex';
 
-      // Token grid (100% textContent — immune to XSS)
-      const grid = $('token-grid');
+      // Token grid
       const gridNodes = [];
-      for (const tok of chainState.tokens.values()) {
+      for (const tok of s.tokens.values()) {
         if (!selectedTokenId) selectedTokenId = tok.id;
         const pTok = projectedState.tokens.get(tok.id) ?? tok;
         const myBal = E.getBalance(projectedState, activePersona.pk, tok.id);
-        const btn = el(
+        gridNodes.push(el(
           'button',
           {
             class: `tok ${tok.id === selectedTokenId ? 'on' : ''}`,
@@ -719,12 +897,11 @@
           el('div', { class: 'tok-sub' }, tok.name),
           el('div', { class: 'tok-stat' }, el('span', { class: 'mut' }, 'Reserve'), el('span', { class: 'mono' }, `${fmtI0(pTok.realI0)} I0`)),
           el('div', { class: 'tok-stat' }, el('span', { class: 'mut' }, 'You hold'), el('span', { class: 'mono' }, fmtTok(myBal))),
-        );
-        gridNodes.push(btn);
+        ));
       }
-      grid.replaceChildren(...gridNodes);
+      $('token-grid').replaceChildren(...gridNodes);
 
-      const tok = chainState.tokens.get(selectedTokenId) ?? [...chainState.tokens.values()][0];
+      const tok = s.tokens.get(selectedTokenId) ?? [...s.tokens.values()][0];
       if (tok) {
         selectedTokenId = tok.id;
         const pTok = projectedState.tokens.get(tok.id) ?? tok;
@@ -746,15 +923,14 @@
 
       renderQuotes(projectedState);
 
-      // Pending mempool (100% textContent — immune to XSS from untrusted Entmoot launches)
+      // Pending mempool
       $('mempool-count').textContent = `${accepted.length} active`;
-      const mList = $('mempool-list');
       if (!accepted.length) {
-        mList.replaceChildren(el('div', { class: 'mut', style: 'font-size:12px' }, 'No pending orders. Submit a Buy, Sell, Launch, or HTLC above.'));
+        $('mempool-list').replaceChildren(el('div', { class: 'mut', style: 'font-size:12px' }, 'No pending orders. Submit a Buy, Sell, Launch, or HTLC above.'));
       } else {
         const items = accepted.map((tx) => {
           const who = PERSONAS.find((p) => p.pk === tx.from)?.name.split(' ')[0] ?? tx.from.slice(0, 8);
-          const tokRef = tx.tokenId && chainState.tokens.get(tx.tokenId);
+          const tokRef = tx.tokenId && s.tokens.get(tx.tokenId);
           const tokLabel = tokRef ? `$${tokRef.ticker}` : String(tx.tokenId ?? '');
           const desc = tx.type === 'BUY' ? `BUY ${tokLabel} · ${fmtI0(BigInt(tx.i0In))} I0`
             : tx.type === 'SELL' ? `SELL ${tokLabel} · ${fmtTok(BigInt(tx.tokIn))} tok`
@@ -767,7 +943,7 @@
               class: 'sm',
               onclick: async () => {
                 const nextFee = (BigInt(tx.fee || '0') + 1000n).toString();
-                const cancelTx = E.signTx(chainState.chainId, { type: 'CANCEL', from: activePersona.pk, nonce: tx.nonce, fee: nextFee }, activePersona.sk);
+                const cancelTx = E.signTx(s.chainId, { type: 'CANCEL', from: activePersona.pk, nonce: tx.nonce, fee: nextFee }, activePersona.sk);
                 const live = await broadcastTx(cancelTx);
                 showMsg('action-msg', `Replaced nonce ${tx.nonce} with CANCEL${live ? ' (gossiped over Entmoot)' : ''}`);
               },
@@ -780,77 +956,87 @@
             right,
           );
         });
-        mList.replaceChildren(...items);
+        $('mempool-list').replaceChildren(...items);
       }
 
-      // Confirmed I0 HTLCs ONLY — BTC Taproot funding is unlocked strictly after I0 escrow confirms!
-      const hList = $('htlc-list');
+      // HTLCs — clearly distinguish simulated demo escrows from real Ord-confirmed escrows!
       const netName = $('htlc-net').value;
       const hNodes = [];
-      for (const h of chainState.htlcs.values()) {
+      for (const h of s.htlcs.values()) {
         const recName = PERSONAS.find((p) => p.pk === h.recipient)?.name.split(' ')[0] ?? h.recipient.slice(0, 6);
         const btcTimeout = h.timeoutBtcHeight - PARAMS.htlcSafeMarginBtcBlocks;
-        let btcHtlc = null;
-        if (btcTimeout >= 1 && (netName === 'signet' || netName === 'regtest')) {
+        const timeRemainingOk = btcTimeout > localBtcHeight + 2 && h.timeoutBtcHeight >= btcTimeout + PARAMS.htlcSafeMarginBtcBlocks;
+        const senderIsDemo = PERSONAS.some((p) => p.demo && (p.pk === h.sender || p.pk === h.recipient));
+        const realFundingEligible = !isSimulatedView() && !senderIsDemo && timeRemainingOk && netName === 'signet' && wrapperAuthenticated;
+
+        const card = el('div', { class: 'quote' });
+        const statusLabel = isSimulatedView() ? 'Simulated Demo Escrow (NOT on Bitcoin)' : 'Ord-Confirmed I0 Escrow';
+        card.appendChild(
+          el('div', { class: 'q-line' },
+            el('span', null, el('span', { class: `dot ${isSimulatedView() ? 'warn' : 'ok'}` }), `${statusLabel}: ${fmtI0(h.amount)} I0 → ${recName}`),
+            el('span', { class: 'mono mut' }, `I0 exp #${h.timeoutBtcHeight}`),
+          ),
+        );
+        card.appendChild(el('span', { class: 'code-inline' }, `H=${h.hashlock}`));
+
+        // If Alice created this lock in this session, allow her to inspect/export her Secret S backup!
+        const mySecret = activePersona.pk === h.sender ? sessionHtlcSecrets.get(h.id) : null;
+        if (mySecret) {
+          card.appendChild(el('div', { class: 'mut', style: 'font-size:11px;margin-top:5px' }, 'Your saved claim secret S (back up before reload):'));
+          card.appendChild(el('span', { class: 'code-inline' }, mySecret));
+        }
+
+        // Only derive & show a fundable BTC Taproot address when NOT simulated and timeout margin is valid!
+        if (!isSimulatedView() && timeRemainingOk && (netName === 'signet' || netName === 'regtest')) {
           try {
-            btcHtlc = E.deriveTaprootHtlc({
+            const btcHtlc = E.deriveTaprootHtlc({
               alicePubkey: h.sender,
               bobPubkey: h.recipient,
               hashlock: h.hashlock,
               timeoutBtcHeight: btcTimeout,
               network: netName,
             });
+            card.appendChild(el('div', { class: 'q-line', style: 'margin-top:6px' }, el('span', { class: 'mut' }, `Derived BTC Taproot (${netName}, CLTV #${btcTimeout})`)));
+            card.appendChild(el('span', { class: 'code-inline' }, btcHtlc.address));
+            if (realFundingEligible) {
+              card.appendChild(el('button', {
+                class: 'sm',
+                style: 'margin-top:6px',
+                onclick: () => {
+                  window.parent.postMessage({
+                    type: 'eyezero:xverse:fundHtlc',
+                    address: btcHtlc.address,
+                    network: 'signet',
+                    swapId: h.id,
+                    hashlock: h.hashlock,
+                    timeoutBtcHeight: btcTimeout,
+                    i0EscrowConfirmed: true,
+                  }, verifiedWrapperOrigin);
+                  showMsg('action-msg', `Sent verified Signet funding request for ${shortId(h.id)}`);
+                },
+              }, 'Fund Signet BTC via Xverse'));
+            }
           } catch {}
-        }
-
-        const card = el('div', { class: 'quote' });
-        card.appendChild(
-          el('div', { class: 'q-line' },
-            el('span', null, el('span', { class: 'dot ok' }), `Confirmed I0 Escrow: ${fmtI0(h.amount)} I0 → ${recName}`),
-            el('span', { class: 'mono mut' }, `I0 exp #${h.timeoutBtcHeight}`),
-          ),
-        );
-        card.appendChild(el('span', { class: 'code-inline' }, `H=${h.hashlock}`));
-        if (btcHtlc) {
-          card.appendChild(
-            el('div', { class: 'q-line', style: 'margin-top:6px' },
-              el('span', { class: 'mut' }, `Derived BTC Taproot (${netName}, CLTV #${btcTimeout})`),
-            ),
-          );
-          card.appendChild(el('span', { class: 'code-inline' }, btcHtlc.address));
-          const senderIsDemo = PERSONAS.some((p) => p.demo && (p.pk === h.sender || p.pk === h.recipient));
-          if (!isSimulatedChain && !senderIsDemo && netName === 'signet' && trustedParentOrigin) {
-            card.appendChild(el('button', {
-              class: 'sm',
-              style: 'margin-top:6px',
-              onclick: () => {
-                window.parent.postMessage({
-                  type: 'eyezero:xverse:fundHtlc',
-                  address: btcHtlc.address,
-                  network: 'signet',
-                  swapId: h.id,
-                  hashlock: h.hashlock,
-                  timeoutBtcHeight: btcTimeout,
-                  i0EscrowConfirmed: true,
-                }, trustedParentOrigin);
-                showMsg('action-msg', `Sent verified Signet funding request for ${shortId(h.id)}`);
-              },
-            }, 'Fund Signet BTC via Xverse'));
-          } else {
-            card.appendChild(el('div', { class: 'mut', style: 'font-size:11px;margin-top:5px' }, 'Real BTC funding disabled in demo/simulated mode (address derived for verification only).'));
-          }
+        } else {
+          const reason = isSimulatedView()
+            ? 'BTC funding address hidden in simulated demo mode.'
+            : !timeRemainingOk
+              ? `Escrow deadline too close to BTC tip #${localBtcHeight} — funding locked.`
+              : 'Real BTC funding locked for demo keys.';
+          card.appendChild(el('div', { class: 'mut', style: 'font-size:11px;margin-top:5px' }, reason));
         }
 
         if (activePersona.pk === h.recipient) {
           const preInput = el('input', { class: 'mono', placeholder: 'Paste 64-hex preimage S from confirmed BTC claim witness', style: 'margin-top:6px' });
-          const claimBtn = el('button', {
+          card.appendChild(preInput);
+          card.appendChild(el('button', {
             class: 'sm primary',
             style: 'margin-top:6px',
             onclick: async () => {
               try {
                 const preimage = preInput.value.trim().toLowerCase();
                 if (!HEX64_RE.test(preimage)) throw new Error('Preimage S must be 64 lowercase hex chars');
-                const tx = E.signTx(chainState.chainId, {
+                const tx = E.signTx(s.chainId, {
                   type: 'HTLC_CLAIM', from: activePersona.pk, swapId: h.id, preimage,
                   nonce: nextNonceFor(activePersona.pk), fee: '0',
                 }, activePersona.sk);
@@ -860,23 +1046,21 @@
                 showMsg('action-msg', `Claim error: ${err.message}`);
               }
             },
-          }, 'Claim I0 with Witness Preimage S');
-          card.appendChild(preInput);
-          card.appendChild(claimBtn);
+          }, 'Claim I0 with Witness Preimage S'));
         }
         hNodes.push(card);
       }
-      hList.replaceChildren(...hNodes);
+      $('htlc-list').replaceChildren(...hNodes);
 
-      // Verified blocks explorer (100% textContent)
-      const bList = $('block-list');
-      const bNodes = [...verifiedBlocks].reverse().map((entry) => {
+      // Blocks explorer
+      const bNodes = [...activeBlocks()].reverse().map((entry) => {
         const b = entry.block;
         const left = el('div', { class: 'item-l' },
-          el('span', { class: 'dot ok' }),
+          el('span', { class: `dot ${entry.simulated ? 'warn' : 'ok'}` }),
           el('strong', { class: 'mono' }, `#${b.h}`), ' ',
           el('span', { class: 'mono' }, shortId(b.id)),
         );
+        if (entry.simulated) left.appendChild(el('span', { class: 'pill', style: 'margin-left:6px' }, 'Simulated'));
         if (b.checkpoint) left.appendChild(el('span', { class: 'pill', style: 'margin-left:6px' }, 'Checkpoint 1.5×'));
         return el('div', {
           class: `item blk-row ${inspectedHeight === b.h ? 'on' : ''}`,
@@ -893,7 +1077,7 @@
           },
         }, left, el('div', { class: 'item-r mono mut' }, `${b.txs.length} txs · BTC #${entry.meta.height}`));
       });
-      bList.replaceChildren(...bNodes);
+      $('block-list').replaceChildren(...bNodes);
     }
 
     function refreshWalletSelects() {
@@ -915,7 +1099,7 @@
       activePersona = PERSONAS.find((p) => p.id === $('wallet-select').value) ?? PERSONAS[0];
       renderAll();
     };
-    $('htlc-net').onchange = () => chainState && renderAll();
+    $('htlc-net').onchange = () => activeState() && renderAll();
     $('wallet-reveal-btn').onclick = () => {
       revealSecretVisible = !revealSecretVisible;
       renderAll();
@@ -928,12 +1112,13 @@
       };
     }
     $('show-launch-btn').onclick = () => $('action-tabs').querySelector('[data-tab="launch"]').click();
-    $('buy-amount').oninput = () => chainState && renderQuotes(getProjected().projectedState);
-    $('sell-amount').oninput = () => chainState && renderQuotes(getProjected().projectedState);
-    $('sell-slip').oninput = () => chainState && renderQuotes(getProjected().projectedState);
+    $('buy-amount').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
+    $('sell-amount').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
+    $('sell-slip').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
 
     $('submit-buy').onclick = async () => {
       try {
+        const s = activeState();
         const i0In = BigInt(Math.round(Number($('buy-amount').value) * 1e8));
         const slip = BigInt(Math.max(0, Math.min(99, Math.round(Number($('buy-slip').value || 15)))));
         const tok = getProjected().projectedState.tokens.get(selectedTokenId);
@@ -941,7 +1126,7 @@
         const fee = (i0In * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
         const estOut = ((i0In - fee) * tok.realTok) / (tok.virtualI0 + tok.realI0 + (i0In - fee));
         const minTokOut = (estOut * (100n - slip)) / 100n;
-        const tx = E.signTx(chainState.chainId, {
+        const tx = E.signTx(s.chainId, {
           type: 'BUY', from: activePersona.pk, tokenId: selectedTokenId,
           i0In: i0In.toString(), minTokOut: minTokOut.toString(),
           nonce: nextNonceFor(activePersona.pk), fee: '0',
@@ -953,30 +1138,29 @@
 
     $('submit-sell').onclick = async () => {
       try {
+        const s = activeState();
         const tokIn = BigInt(Math.round(Number($('sell-amount').value))) * UNIT;
-        const slip = BigInt(Math.max(0, Math.min(99, Math.round(Number($('sell-slip').value || 15)))));
         const tok = getProjected().projectedState.tokens.get(selectedTokenId);
         if (!tok) throw new Error('Select a token first');
-        const grossI0 = (tokIn * (tok.virtualI0 + tok.realI0)) / (tok.realTok + tokIn);
-        const fee = (grossI0 * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
-        const minI0Out = ((grossI0 - fee) * (100n - slip)) / 100n;
-        const tx = E.signTx(chainState.chainId, {
+        const q = computeSellQuote(tok, tokIn, $('sell-slip').value);
+        const tx = E.signTx(s.chainId, {
           type: 'SELL', from: activePersona.pk, tokenId: selectedTokenId,
-          tokIn: tokIn.toString(), minI0Out: minI0Out.toString(),
+          tokIn: tokIn.toString(), minI0Out: q.minI0Out.toString(),
           nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
         const live = await broadcastTx(tx);
-        showMsg('action-msg', `Signed BIP-340 SELL (${fmtTok(tokIn)} tok, min ${fmtI0(minI0Out)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
+        showMsg('action-msg', `Signed BIP-340 SELL (${fmtTok(tokIn)} tok, min ${fmtI0(q.minI0Out)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
     $('submit-launch').onclick = async () => {
       try {
+        const s = activeState();
         const ticker = $('launch-ticker').value.trim().toUpperCase();
         const name = $('launch-name').value.trim();
         const initialBuy = BigInt(Math.round(Number($('launch-init').value || 0) * 1e8));
-        const tx = E.signTx(chainState.chainId, {
-          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId: chainState.genesisId,
+        const tx = E.signTx(s.chainId, {
+          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId: s.genesisId,
           initialBuy: initialBuy.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
         const live = await broadcastTx(tx);
@@ -984,22 +1168,56 @@
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
+    // Mandatory preimage backup flow before Alice can submit HTLC_LOCK!
+    $('htlc-prep-secret-btn').onclick = () => {
+      const secretBytes = new Uint8Array(32);
+      crypto.getRandomValues(secretBytes);
+      const secretHex = E.bytesToHex(secretBytes);
+      const hashlock = E.sha256Hex(secretBytes);
+      stagedSwapSecret = { secretHex, hashlock, backedUp: false };
+      $('submit-htlc').disabled = true;
+
+      const box = $('htlc-secret-backup');
+      box.hidden = false;
+      const chk = el('input', { type: 'checkbox', style: 'width:auto;margin-right:6px' });
+      chk.onchange = () => {
+        stagedSwapSecret.backedUp = chk.checked;
+        $('submit-htlc').disabled = !chk.checked;
+      };
+      box.replaceChildren(
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Secret S (save offline — required to claim BTC!)')),
+        el('span', { class: 'code-inline' }, secretHex),
+        el('div', { class: 'q-line', style: 'margin-top:6px' }, el('span', { class: 'mut' }, 'Hashlock H = SHA256(S)')),
+        el('span', { class: 'code-inline' }, hashlock),
+        el('label', { style: 'display:flex;align-items:center;margin-top:8px;font-size:11.5px;color:var(--ink2)' }, chk, 'I have backed up Secret S offline'),
+      );
+    };
+
     $('submit-htlc').onclick = async () => {
       try {
+        const s = activeState();
+        if (!stagedSwapSecret || !stagedSwapSecret.backedUp) {
+          throw new Error('Generate and confirm backup of Secret S first');
+        }
         const amount = BigInt(Math.round(Number($('htlc-amount').value) * 1e8));
         const recipient = $('htlc-recipient').value;
-        const secretBytes = new Uint8Array(32);
-        crypto.getRandomValues(secretBytes);
-        const hashlock = E.sha256Hex(secretBytes);
         const nonce = nextNonceFor(activePersona.pk);
-        const tx = E.signTx(chainState.chainId, {
+        const swapId = E.computeSwapId(s.chainId, activePersona.pk, nonce);
+        const { secretHex, hashlock } = stagedSwapSecret;
+
+        const tx = E.signTx(s.chainId, {
           type: 'HTLC_LOCK', from: activePersona.pk, recipient, amount: amount.toString(),
-          hashlock, timeoutBtcHeight: localBtcHeight + 18, nonce, fee: '0',
+          hashlock, timeoutBtcHeight: localBtcHeight + 24, nonce, fee: '0',
         }, activePersona.sk);
+        sessionHtlcSecrets.set(swapId, secretHex);
+        stagedSwapSecret = null;
+        $('htlc-secret-backup').hidden = true;
+        $('submit-htlc').disabled = true;
+
         const live = await broadcastTx(tx);
         showMsg(
           'action-msg',
-          `Queued HTLC_LOCK (H=${hashlock.slice(0, 14)}…). Confirm in a verified block before deriving/funding BTC HTLC!${live ? ' (Entmoot live)' : ''}`,
+          `Queued HTLC_LOCK (H=${hashlock.slice(0, 14)}…). Secret S retained in session memory; confirm in a real block before funding BTC.${live ? ' (Entmoot live)' : ''}`,
         );
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
@@ -1029,95 +1247,117 @@
 
     $('wallet-faucet-btn').onclick = async () => {
       try {
+        const s = activeState();
         const demoMiner = PERSONAS.find((p) => p.id === 'miner');
-        const tx = E.signTx(chainState.chainId, {
+        const tx = E.signTx(s.chainId, {
           type: 'TRANSFER', from: demoMiner.pk, to: localWallet.pk, tokenId: 0,
           amount: (100n * UNIT).toString(), nonce: nextNonceFor(demoMiner.pk), fee: '0',
         }, demoMiner.sk);
         await broadcastTx(tx);
         activePersona = localWallet;
         refreshWalletSelects();
-        showMsg('action-msg', 'Queued +100 I0 transfer to Session Wallet — click Simulate Local Block to confirm!');
+        showMsg('action-msg', 'Queued +100 I0 transfer to Session Wallet — click Simulate Local Block to test locally!');
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
-    // Local demo simulator: advances ONLY this local tab's simulated chain (never broadcasts unverified blocks to peers!).
+    // Local demo simulator: operates strictly in isolated simState/simBlockHashCache (NEVER mutates ordState!).
     $('mine-btn').onclick = async () => {
       try {
         const t0 = performance.now();
+        if (!simActive) {
+          simState = E.cloneState(ordState);
+          simBlocks = ordVerifiedBlocks.slice();
+          simActive = true;
+        }
         const { accepted } = getProjected();
-        const refH = localBtcHeight;
-        const refHash = blockHashCache.get(refH) ?? E.sha256Hex(`eyezero-demo-btc-${refH}`);
-        blockHashCache.set(refH, refHash);
-        const nextBtcH = localBtcHeight + 1;
-        const nextHash = E.sha256Hex(`eyezero-demo-btc-${nextBtcH}`);
-        blockHashCache.set(nextBtcH, nextHash);
+        const refH = Math.max(localBtcHeight, simState.tipBtcHeight);
+        const refHash = simBlockHashCache.get(refH) ?? E.sha256Hex(`eyezero-sim-btc-${refH}`);
+        simBlockHashCache.set(refH, refHash);
+        const nextBtcH = refH + 1;
+        simBlockHashCache.set(nextBtcH, E.sha256Hex(`eyezero-sim-btc-${nextBtcH}`));
 
-        const target = E.nextTarget(chainState, PARAMS);
+        const target = E.nextTarget(simState, PARAMS);
         let tries = 0;
         let winId = null;
         while (tries < 200_000) {
           tries++;
-          const cand = E.sha256Hex(`mine-${chainState.height + 1}-${nextBtcH}-${tries}`) + 'i0';
+          const cand = E.sha256Hex(`sim-${simState.height + 1}-${nextBtcH}-${tries}`) + 'i0';
           if (E.meetsTarget(cand, target)) { winId = cand; break; }
         }
         const ctx = {
           btcHeight: nextBtcH,
-          inscriptionNumber: 80_100_000 + chainState.height + 1,
-          getBlockHash: (h) => blockHashCache.get(h) ?? null,
+          inscriptionNumber: 80_100_000 + simState.height + 1,
+          getBlockHash: (h) => simBlockHashCache.get(h) ?? null,
         };
         const { block } = E.buildCandidateBlock(
-          chainState,
+          simState,
           { id: winId, miner: activePersona.pk, btcRef: { h: refH, hash: refHash }, txs: accepted, grindWork: true },
           ctx,
           PARAMS,
         );
-        chainState = E.applyBlock(chainState, block, ctx, PARAMS);
-        isSimulatedChain = true;
+        simState = E.applyBlock(simState, block, ctx, PARAMS);
         localBtcHeight = nextBtcH;
         const meta = { height: nextBtcH, number: ctx.inscriptionNumber };
-        verifiedBlocks.push({ block, meta });
-        pendingTxs = pendingTxs.filter((t) => t.nonce > (chainState.accounts.get(t.from)?.nonce ?? 0));
+        simBlocks.push({ block, meta, simulated: true });
+        pruneConfirmedMempool(simState);
         invalidateProjection();
         const ms = (performance.now() - t0).toFixed(1);
-        showMsg('action-msg', `Simulated local Block #${block.h} (${shortId(block.id)}) in ${tries} ID hashes (${ms}ms) · ${block.txs.length} txs`);
+        showMsg('action-msg', `Simulated local Block #${block.h} (${shortId(block.id)}) in ${tries} ID hashes (${ms}ms) · isolated from Ord state`);
         renderAll();
       } catch (e) { showMsg('action-msg', `Simulate error: ${e.message}`); }
     };
 
-    // Permute trades across senders while preserving per-sender ascending nonce order!
+    // Permute independent sender groups using actual verified parent state & genesisBtcHeight!
     $('mev-test-btn').onclick = () => {
-      const targetBlk = verifiedBlocks.find((e) => e.block.h === 3) ?? verifiedBlocks[verifiedBlocks.length - 1];
-      if (!targetBlk) return;
-      const idx = verifiedBlocks.indexOf(targetBlk);
-      let pre = E.createGenesisState(chainState.genesisId, PARAMS, 924_100);
-      for (let i = 0; i < idx; i++) {
-        const e = verifiedBlocks[i];
-        pre = E.applyBlock(pre, e.block, { btcHeight: e.meta.height, inscriptionNumber: e.meta.number, getBlockHash: (h) => blockHashCache.get(h) ?? null }, PARAMS);
+      try {
+        const blocks = activeBlocks();
+        const targetEntry = blocks.find((e) => e.block.h === 3) ?? blocks[blocks.length - 1];
+        if (!targetEntry) return;
+        const idx = blocks.indexOf(targetEntry);
+        let pre = E.createGenesisState(activeState().genesisId, PARAMS, ordGenesisBtcHeight);
+        for (let i = 0; i < idx; i++) {
+          const e = blocks[i];
+          pre = E.applyBlock(
+            pre,
+            e.block,
+            { btcHeight: e.meta.height, inscriptionNumber: e.meta.number, getBlockHash: (h) => (h === e.block.btcRef.h ? e.block.btcRef.hash : null) },
+            PARAMS,
+          );
+        }
+        const b = targetEntry.block;
+        // Group consecutive/same-sender transactions strictly preserving every sender's nonce sequence,
+        // keeping LAUNCH senders first so newly created tokens exist, then reversing pure-trade sender groups!
+        const bySender = new Map();
+        for (const t of b.txs) {
+          if (!bySender.has(t.from)) bySender.set(t.from, []);
+          bySender.get(t.from).push(t);
+        }
+        const launchGroups = [];
+        const tradeOnlyGroups = [];
+        for (const grp of bySender.values()) {
+          if (grp.every((t) => t.type === 'BUY' || t.type === 'SELL')) tradeOnlyGroups.push(grp);
+          else launchGroups.push(grp);
+        }
+        const permuted = [...launchGroups.flat(), ...tradeOnlyGroups.reverse().flat()];
+        const ctx = {
+          btcHeight: targetEntry.meta.height,
+          inscriptionNumber: targetEntry.meta.number,
+          getBlockHash: (h) => (h === b.btcRef.h ? b.btcRef.hash : null),
+        };
+        const { block: revBlk } = E.buildCandidateBlock(
+          pre,
+          { id: b.id, miner: b.miner, btcRef: b.btcRef, txs: permuted, grindWork: true },
+          ctx,
+          PARAMS,
+        );
+        E.applyBlock(pre, revBlk, ctx, PARAMS);
+        const match = revBlk.stateRoot === b.stateRoot;
+        showMsg('mev-result', match
+          ? `Zero-MEV proven on Block #${b.h}: permuted sender groups passed applyBlock() with identical stateRoot (${b.stateRoot.slice(0, 16)}…)`
+          : `Mismatch!`);
+      } catch (err) {
+        showMsg('mev-result', `Shuffle error: ${err.message}`);
       }
-      const b = targetBlk.block;
-      const nonTrades = b.txs.filter((t) => t.type !== 'BUY' && t.type !== 'SELL');
-      const trades = b.txs.filter((t) => t.type === 'BUY' || t.type === 'SELL');
-      // Group trades by sender to preserve each sender's nonce sequence, then reverse the sender order!
-      const bySender = new Map();
-      for (const t of trades) {
-        if (!bySender.has(t.from)) bySender.set(t.from, []);
-        bySender.get(t.from).push(t);
-      }
-      const tradesPermuted = [...bySender.values()].reverse().flat();
-      const ctx = { btcHeight: targetBlk.meta.height, inscriptionNumber: targetBlk.meta.number, getBlockHash: (h) => blockHashCache.get(h) ?? null };
-      const { block: revBlk } = E.buildCandidateBlock(
-        pre,
-        { id: b.id, miner: b.miner, btcRef: b.btcRef, txs: [...nonTrades, ...tradesPermuted], grindWork: true },
-        ctx,
-        PARAMS,
-      );
-      // Confirm the permuted block passes full consensus applyBlock and produces the identical stateRoot!
-      E.applyBlock(pre, revBlk, ctx, PARAMS);
-      const match = revBlk.stateRoot === b.stateRoot;
-      showMsg('mev-result', match
-        ? `Zero-MEV proven on Block #${b.h}: permuted sender order passed applyBlock() with identical stateRoot (${b.stateRoot.slice(0, 16)}…)`
-        : `Mismatch!`);
     };
 
     syncFromOrd();

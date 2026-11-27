@@ -29,9 +29,9 @@ Every browser running the Genesis Inscription `G` rejects a candidate block `B` 
 
 \\[ \text{uint256}(\text{workHash}(B)) \le \text{target}(B.\text{height}) \quad \text{and} \quad \text{uint256}(B.\text{id}) \le \text{target}(B.\text{height}) \\]
 
-- *Canonical signatures, immutable token IDs, and nonces*: Every transaction in `B.txs` contains only canonical schema fields, carries a valid BIP-340 Schnorr signature matching `chainId = G.slice(0, 16)`, uses the account's next sequential nonce, and references immutable launch-derived token IDs (`t_<16-hex>`).
+- *Canonical signatures, immutable token IDs, and nonces*: Every transaction in `B.txs` contains only canonical schema fields, carries a valid BIP-340 Schnorr signature matching `chainId = G.slice(0, 16)`, uses the account's next sequential nonce, and references full 256-bit launch-derived token IDs (`t_<64-hex>`).
 
-- *Deterministic state transition & bounded checkpoints*: Running `applyBlock(prevState, B)` in exact integer math produces exact matches for `B.stateRoot` and `B.diff`. On mandatory checkpoint heights (`B.height % 144 === 0`), `B.checkpoint` is required and uses a bounded paged format (`mode: "inline" | "paged"`, committing to all pages via `pagesMerkleRoot`) so a checkpoint block can never outgrow Bitcoin's standard inscription size limit.
+- *Deterministic state transition & bounded checkpoints*: Running `applyBlock(prevState, B)` in exact integer math produces exact matches for `B.stateRoot` and `B.diff`. On mandatory checkpoint heights (`B.height % 144 === 0`), `B.checkpoint` is required and packs individually bounded state entries (`n`, `b`, `t`, `h`) into pages (`mode: "inline" | "paged"`, committed via `pagesMerkleRoot`) so a checkpoint block can never outgrow Bitcoin's standard inscription size limit.
 
 ## Difficulty Retargeting
 
@@ -51,4 +51,4 @@ If two valid competing blocks carry equal cumulative work, ties break determinis
 
 ## Discovery and Recovery
 
-Once a winning block confirms on Bitcoin, miners announce its inscription ID on Entmoot under `#i0-blk` as an **untrusted discovery hint** (`{ id, h, prev }`). Receivers never trust peer-supplied block payloads or confirmation heights — they independently fetch `/content/<id>`, `/r/inscription/<id>`, and `/r/blockhash/<h>` from `ord`, replay the chain from Genesis, and apply fork choice before updating confirmed state.
+Once a winning block confirms on Bitcoin (for example when running the miner CLI with `--wait-confirm`), miners announce its inscription ID on Entmoot under `#i0-blk` as an **untrusted discovery hint** (`{ id, h, prev }`). Receivers never trust peer-supplied block payloads or confirmation heights — they independently fetch `/content/<id>`, `/r/inscription/<id>`, and `/r/blockhash/<h>` from `ord` (and full nodes with Bitcoin RPC additionally verify active-chain confirmation and the committed Taproot script-path envelope), replay the chain from Genesis, and apply fork choice before updating confirmed state.

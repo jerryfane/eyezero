@@ -78,16 +78,17 @@ describe('Production applyBlock() property, solvency & zero-MEV fuzz suite', () 
           }
         }
       } else if (b === 5) {
-        // Launch 4 distinct tokens with immutable launch-bound IDs
+        // Launch 4 distinct tokens with full 256-bit launch-bound IDs
         for (let k = 0; k < 4; k++) {
           const u = users[k];
           u.nonce++;
-          const tid = computeTokenId(state.chainId, u.pk, u.nonce, `FZ${k}`);
-          tokenIds.push(tid);
-          txs.push(signTx(state.chainId, {
+          const launchSpec = {
             type: 'LAUNCH', from: u.pk, ticker: `FZ${k}`, name: `Fuzz Token ${k}`,
             artId: genesisId, initialBuy: (20n * UNIT).toString(), nonce: u.nonce, fee: '0',
-          }, u.sk));
+          };
+          const tid = computeTokenId(state.chainId, launchSpec);
+          tokenIds.push(tid);
+          txs.push(signTx(state.chainId, launchSpec, u.sk));
           totalTrades++;
         }
       } else {

@@ -1,5 +1,5 @@
 // Core deterministic transaction canonicalization, BIP-340 signing, mempool cancel/replace,
-// joint-validated batch preview, uniform zero-MEV batch clearing, and applyBlock().
+// joint-validated batch selection/preview, uniform zero-MEV batch clearing, and applyBlock().
 
 import { I0_TOKEN_ID, V1_MAINNET_PARAMS, blockRewardForHeight } from './constants.js';
 import {
@@ -26,18 +26,19 @@ import {
   cloneState,
   compareTokenIds,
   computeStateDiff,
-  computeStateRoot,
-  exportCheckpoint,
+  encodeStateCommitment,
   getOrCreateAccount,
   subBalance,
 } from './state.js';
 
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const HEX128_RE = /^[0-9a-f]{128}$/;
-const TOKEN_ID_RE = /^t_[0-9a-f]{16}$/;
+// Full 256-bit launch-bound immutable token ID: "t_<64 lowercase hex>"
+const TOKEN_ID_RE = /^t_[0-9a-f]{64}$/;
 const TICKER_RE = /^[A-Za-z0-9._-]{1,12}$/;
 const NAME_SAFE_RE = /^[ -~]{1,32}$/;
 const HTML_UNSAFE_RE = /[<>&"'`]/;
+const PLACEHOLDER_BLOCK_ID = '0'.repeat(64) + 'i0';
 
 function parseAmount(val, field, allowZero = false) {
   let n;
@@ -64,14 +65,41 @@ export function isValidTokenId(tokenId) {
   return tokenId === I0_TOKEN_ID || (typeof tokenId === 'string' && TOKEN_ID_RE.test(tokenId));
 }
 
-// Deterministic, launch-bound immutable token ID: prevents launch-reordering or fork-reassignment
-// from redirecting signed BUY/SELL/TRANSFER orders to a different asset.
-export function computeTokenId(chainId, creator, nonce, ticker) {
-  return 't_' + sha256Hex(`eyezero:v1:token:${chainId}:${creator}:${nonce}:${ticker}`).slice(0, 16);
+// Full 256-bit launch-bound immutable token ID: binds every signed LAUNCH parameter
+// (chainId, creator, nonce, ticker, name, artId, initialBuy) so competing launches on
+// forks can never alias the same tokenId.
+export function computeTokenId(chainId, launchOrCreator, nonce, ticker, name = '', artId = '', initialBuy = '0') {
+  const payload = typeof launchOrCreator === 'object' && launchOrCreator !== null
+    ? {
+        chainId,
+        from: launchOrCreator.from,
+        nonce: launchOrCreator.nonce,
+        ticker: launchOrCreator.ticker,
+        name: launchOrCreator.name ?? '',
+        artId: launchOrCreator.artId ?? '',
+        initialBuy: String(launchOrCreator.initialBuy ?? '0'),
+      }
+    : {
+        chainId,
+        from: launchOrCreator,
+        nonce,
+        ticker,
+        name,
+        artId,
+        initialBuy: String(initialBuy ?? '0'),
+      };
+  return 't_' + sha256Hex(`eyezero:v1:token:${JSON.stringify(payload)}`);
 }
 
 export function computeSwapId(chainId, sender, nonce) {
   return sha256Hex(`eyezero:v1:htlc:${chainId}:${sender}:${nonce}`);
+}
+
+// Measure exact UTF-8 byte length of the full accepted block representation (including id, diff, checkpoint, txs).
+export function measureAcceptedBlockBytes(block) {
+  const withId = block.id ? block : { ...block, id: PLACEHOLDER_BLOCK_ID };
+  const s = JSON.stringify(withId);
+  return typeof Buffer !== 'undefined' ? Buffer.byteLength(s, 'utf8') : new TextEncoder().encode(s).length;
 }
 
 // Strip all unsigned/extraneous fields so unauthenticated bytes can never inflate block inscriptions.
@@ -141,7 +169,6 @@ function assertCanonicalTxShape(tx) {
   }
 }
 
-// Canonical domain-separated transaction digest (32 bytes) signed with BIP-340 Schnorr.
 export function txDigest(chainId, tx) {
   const canon = canonicalizeTx(tx);
   delete canon.sig;
@@ -168,9 +195,9 @@ export function verifyTxSignature(chainId, tx) {
 }
 
 // Cancel / replace-by-nonce selection for pending Entmoot orders.
-// Strips unsigned extra fields; for the same (from, nonce), highest priority fee wins
-// (tie-break: lexicographically lower sig for determinism).
-export function resolvePendingMempool(state, pendingTxs) {
+// Verifies each signature at most once (optionally caching verified sigs in `verifiedSigs`),
+// strips unsigned extra fields, and filters syntactically invalid tokenIds.
+export function resolvePendingMempool(state, pendingTxs, { verifiedSigs = null } = {}) {
   const bestBySenderNonce = new Map();
   for (const rawTx of pendingTxs) {
     let tx;
@@ -179,7 +206,6 @@ export function resolvePendingMempool(state, pendingTxs) {
     } catch {
       continue;
     }
-    if (!verifyTxSignature(state.chainId, tx)) continue;
     if (!Number.isInteger(tx.nonce) || tx.nonce < 1) continue;
     if ((tx.type === 'BUY' || tx.type === 'SELL') && (typeof tx.tokenId !== 'string' || !TOKEN_ID_RE.test(tx.tokenId))) {
       continue;
@@ -197,6 +223,12 @@ export function resolvePendingMempool(state, pendingTxs) {
     const curNonce = acc ? acc.nonce : 0;
     if (tx.nonce <= curNonce) continue;
 
+    const sigOk = verifiedSigs && verifiedSigs.has(tx.sig)
+      ? true
+      : verifyTxSignature(state.chainId, tx);
+    if (!sigOk) continue;
+    if (verifiedSigs) verifiedSigs.add(tx.sig);
+
     const key = `${tx.from}:${tx.nonce}`;
     const prev = bestBySenderNonce.get(key);
     if (!prev || fee > prev.fee || (fee === prev.fee && tx.sig < prev.tx.sig)) {
@@ -204,7 +236,6 @@ export function resolvePendingMempool(state, pendingTxs) {
     }
   }
 
-  // Keep only contiguous nonce sequences starting at account.nonce + 1 per sender.
   const bySender = new Map();
   for (const { tx } of bestBySenderNonce.values()) {
     if (!bySender.has(tx.from)) bySender.set(tx.from, []);
@@ -224,13 +255,13 @@ export function resolvePendingMempool(state, pendingTxs) {
 }
 
 // Execute deterministic state transition for a list of transactions inside a block.
-// Used by both applyBlock (consensus verification) and buildCandidateBlock / previewPending.
-function executeBlockTxs(next, miner, txs, btcHeight, params) {
+// `skipSigVerify` is strictly internal for pre-verified batches inside previewPending/selectCandidateTxs;
+// consensus applyBlock() ALWAYS passes skipSigVerify=false.
+function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = false } = {}) {
   if (txs.length > params.maxTxsPerBlock) {
     throw new Error(`Block exceeds maxTxsPerBlock (${txs.length} > ${params.maxTxsPerBlock})`);
   }
 
-  // 1. Verify canonical tx shape, signatures, nonces, and basic syntax first.
   const expectedNonce = new Map();
   let zeroFeeCancels = 0;
   for (const tx of txs) {
@@ -239,7 +270,7 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     if (!Number.isInteger(tx.nonce) || tx.nonce < 1) {
       throw new Error(`Invalid nonce ${tx.nonce}`);
     }
-    if (!verifyTxSignature(next.chainId, tx)) {
+    if (!skipSigVerify && !verifyTxSignature(next.chainId, tx)) {
       throw new Error(`Invalid BIP-340 signature for ${tx.from} nonce ${tx.nonce}`);
     }
     const cur = expectedNonce.has(tx.from)
@@ -251,7 +282,6 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     expectedNonce.set(tx.from, cur + 1);
   }
 
-  // Advance account nonces and collect priority tips.
   for (const tx of txs) {
     const fee = parseAmount(tx.fee ?? '0', 'fee', true);
     if (tx.type === 'CANCEL' && fee === 0n) {
@@ -270,7 +300,6 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     getOrCreateAccount(next, tx.from).nonce = tx.nonce;
   }
 
-  // Collect batch buy/sell orders grouped by immutable tokenId.
   const batches = new Map();
   function getBatch(tokenId) {
     let b = batches.get(tokenId);
@@ -281,8 +310,6 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     return b;
   }
 
-  // 2. Non-trade primitives (deterministic in tx order for transfers/launches/HTLCs;
-  //    trades are queued into order-independent batches below).
   for (const tx of txs) {
     switch (tx.type) {
       case 'CANCEL':
@@ -331,7 +358,15 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
         subBalance(next, tx.from, I0_TOKEN_ID, params.launchFee);
         addBalance(next, miner, I0_TOKEN_ID, params.launchFee);
 
-        const tokenId = computeTokenId(next.chainId, tx.from, tx.nonce, tx.ticker);
+        const initialBuy = parseAmount(tx.initialBuy ?? '0', 'initialBuy', true);
+        const tokenId = computeTokenId(next.chainId, {
+          from: tx.from,
+          nonce: tx.nonce,
+          ticker: tx.ticker,
+          name: tx.name,
+          artId,
+          initialBuy: initialBuy.toString(),
+        });
         if (next.tokens.has(tokenId)) {
           throw new Error(`Duplicate tokenId ${tokenId}`);
         }
@@ -346,7 +381,6 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
           realTok: params.initialTokSupply,
         });
 
-        const initialBuy = parseAmount(tx.initialBuy ?? '0', 'initialBuy', true);
         if (initialBuy > 0n) {
           subBalance(next, tx.from, I0_TOKEN_ID, initialBuy);
           const totalFee = (initialBuy * params.tradeFeeBps) / params.bpsDenom;
@@ -444,7 +478,6 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     }
   }
 
-  // 3. Order-independent Uniform Batch Clearing per token (sorted canonically by tokenId).
   const tokenIds = [...batches.keys()].sort(compareTokenIds);
   for (const tokenId of tokenIds) {
     const tok = next.tokens.get(tokenId);
@@ -504,8 +537,7 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
 }
 
 // Helper for miners / tests: construct a complete candidate block payload with exact stateRoot,
-// diff, bounded checkpoint, and payload-bound PoW nonce (when grindWork=true, default).
-// Notice: id and btcContext are optional so a real miner builds the exact inscription payload BEFORE grinding reveal_txid!
+// diff, bounded checkpoint, exact accepted-representation size check (BEFORE grinding), and payload-bound PoW.
 export function buildCandidateBlock(
   state,
   { id = null, miner, btcRef, txs = [], nonce = 0, grindWork = true },
@@ -534,12 +566,11 @@ export function buildCandidateBlock(
   next.totalI0Minted += reward;
   addBalance(next, miner, I0_TOKEN_ID, reward);
 
-  // HTLC timeouts evaluate deterministically against block.btcRef.h (known before confirmation!).
   executeBlockTxs(next, miner, canonicalTxs, btcRef.h, params);
 
-  const stateRoot = computeStateRoot(next, params);
+  const { stateRoot, checkpoint: encodedCp } = encodeStateCommitment(next, params);
   const diff = computeStateDiff(state, next);
-  const checkpoint = h % params.checkpointInterval === 0 ? exportCheckpoint(next, params) : null;
+  const checkpoint = h % params.checkpointInterval === 0 ? encodedCp : null;
 
   let block = {
     v: params.version,
@@ -555,13 +586,15 @@ export function buildCandidateBlock(
     txs: canonicalTxs,
   };
 
-  if (grindWork) {
-    block = grindBlockWorkNonce(block, target);
+  // Budget the EXACT accepted representation (including placeholder id + diff + checkpoint + txs + max nonce digits)
+  // BEFORE spending CPU grinding payload workHash or reveal_txid!
+  const acceptedBytes = measureAcceptedBlockBytes({ ...block, nonce: 9_999_999_999 });
+  if (acceptedBytes > params.maxBlockBytes) {
+    throw new Error(`Candidate block exceeds maxBlockBytes (${acceptedBytes} > ${params.maxBlockBytes})`);
   }
 
-  const serializedLen = JSON.stringify(block).length;
-  if (serializedLen > params.maxBlockBytes) {
-    throw new Error(`Candidate block exceeds maxBlockBytes (${serializedLen} > ${params.maxBlockBytes})`);
+  if (grindWork) {
+    block = grindBlockWorkNonce(block, target);
   }
 
   return {
@@ -575,7 +608,7 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   if (!block || block.v !== params.version) {
     throw new Error(`Unsupported block version: ${block?.v}`);
   }
-  const serializedLen = JSON.stringify(block).length;
+  const serializedLen = measureAcceptedBlockBytes(block);
   if (serializedLen > params.maxBlockBytes) {
     throw new Error(`Block exceeds maxBlockBytes (${serializedLen} > ${params.maxBlockBytes})`);
   }
@@ -594,12 +627,8 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
     throw new Error('block.nonce must be a non-negative integer');
   }
 
-  // 1. Validate Bitcoin confirmation + anti-premine anchor.
   validateBtcAnchor(state, block, btcContext, params);
 
-  // 2. Validate Dual-Bound PoW target:
-  //    (a) Payload-bound workHash <= target (cryptographically binds every payload byte + btcRef.hash)
-  //    (b) Display-order vanity reveal_txid <= target (Bitcoin inscription commitment)
   const target = nextTarget(state, params);
   if (!meetsWorkTarget(block, target)) {
     throw new Error(`Block payload workHash fails PoW target ${target.toString(16)}`);
@@ -608,15 +637,11 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
     throw new Error(`Block ID ${block.id} fails PoW target ${target.toString(16)}`);
   }
 
-  // 3. Apply reward + transactions deterministically.
   const next = cloneState(state);
   next.height = expectedHeight;
   next.tipId = block.id;
   next.tipBtcHeight = btcContext.btcHeight;
   next.tipInscriptionNumber = btcContext.inscriptionNumber;
-  // At the first block of a new retarget epoch (e.g. h=73), anchor epochStartBtcHeight to
-  // the closing block of the previous epoch (state.tipBtcHeight at h=72) so every epoch
-  // spans exact `retargetInterval` block-to-block intervals.
   if (expectedHeight > 1 && (expectedHeight - 1) % params.retargetInterval === 0) {
     next.epochStartBtcHeight = state.tipBtcHeight;
   }
@@ -627,14 +652,12 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   next.totalI0Minted += reward;
   addBalance(next, block.miner, I0_TOKEN_ID, reward);
 
-  // HTLC timeouts evaluate deterministically against block.btcRef.h.
-  executeBlockTxs(next, block.miner, block.txs, block.btcRef.h, params);
+  // Consensus path ALWAYS verifies every BIP-340 signature (skipSigVerify=false).
+  executeBlockTxs(next, block.miner, block.txs, block.btcRef.h, params, { skipSigVerify: false });
 
-  // 4. Verify strict supply conservation.
   assertStateConservation(next, params);
 
-  // 5. Verify stateRoot, stateDiff, and mandatory bounded checkpoint.
-  const expectedRoot = computeStateRoot(next, params);
+  const { stateRoot: expectedRoot, checkpoint: expectedCp } = encodeStateCommitment(next, params);
   if (block.stateRoot !== expectedRoot) {
     throw new Error(`stateRoot mismatch: got ${block.stateRoot}, expected ${expectedRoot}`);
   }
@@ -649,7 +672,6 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
     if (!block.checkpoint) {
       throw new Error(`Mandatory checkpoint missing at height ${expectedHeight}`);
     }
-    const expectedCp = exportCheckpoint(next, params);
     if (JSON.stringify(block.checkpoint) !== JSON.stringify(expectedCp)) {
       throw new Error(`Checkpoint content does not match canonical checkpoint at height ${expectedHeight}`);
     }
@@ -660,42 +682,80 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   return next;
 }
 
-// Joint-validated preview & candidate tx selection for pending Entmoot mempool orders.
-// Guarantees the returned `accepted` list passes joint uniform-batch execution together
-// (never returns two orders that pass individually but fail joint slippage in buildCandidateBlock).
+// Joint-validated candidate selection & UI projection with O(n) signature verification
+// (verifies each signature ONCE in resolvePendingMempool, then reuses verification for prefix trials).
+// When `minerPubkey` and `btcRef` are supplied (e.g. by the miner CLI), executes under the EXACT
+// candidate block context (real miner + block reward + full accepted block byte budget including diff & checkpoint!).
 export function previewPending(
   state,
   pendingTxs,
   previewBtcHeight,
   params = V1_MAINNET_PARAMS,
-  { maxBytes = Math.floor(params.maxBlockBytes * 0.7) } = {},
+  { minerPubkey = null, btcRef = null, verifiedSigs = null } = {},
 ) {
-  const selected = resolvePendingMempool(state, pendingTxs);
-  const validDummyMiner = '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
-  let committedState = cloneState(state);
+  const sigCache = verifiedSigs ?? new Set();
+  const selected = resolvePendingMempool(state, pendingTxs, { verifiedSigs: sigCache });
+  const miner = minerPubkey ?? '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
+  const nextHeight = state.height + 1;
+  const includeBlockReward = Boolean(minerPubkey);
+
+  const baseTrialState = () => {
+    const t = cloneState(state);
+    if (includeBlockReward) {
+      const reward = blockRewardForHeight(nextHeight, params);
+      t.totalI0Minted += reward;
+      addBalance(t, miner, I0_TOKEN_ID, reward);
+    }
+    return t;
+  };
+
+  let committedState = baseTrialState();
   const accepted = [];
   const dropped = [];
   const brokenSenders = new Set();
-  let approxBytes = 0;
 
   for (const tx of selected) {
     if (brokenSenders.has(tx.from)) {
       dropped.push({ tx, reason: 'Prior nonce from sender was dropped' });
       continue;
     }
-    const txBytes = JSON.stringify(tx).length + 2;
-    if (accepted.length >= params.maxTxsPerBlock || approxBytes + txBytes > maxBytes) {
+    if (accepted.length >= params.maxTxsPerBlock) {
       brokenSenders.add(tx.from);
-      dropped.push({ tx, reason: 'Candidate block byte/tx budget exceeded' });
+      dropped.push({ tx, reason: 'maxTxsPerBlock reached' });
       continue;
     }
     try {
       const candidateList = [...accepted, tx];
-      const trial = cloneState(state);
-      executeBlockTxs(trial, validDummyMiner, candidateList, previewBtcHeight, params);
+      const trial = baseTrialState();
+      executeBlockTxs(trial, miner, candidateList, previewBtcHeight, params, { skipSigVerify: true });
+
+      // When building a real miner candidate, enforce the EXACT full accepted block byte budget
+      // (including id placeholder, diff, checkpoint, and txs) BEFORE admitting the tx!
+      if (btcRef) {
+        trial.height = nextHeight;
+        const { stateRoot, checkpoint: encodedCp } = encodeStateCommitment(trial, params);
+        const diff = computeStateDiff(state, trial);
+        const checkpoint = nextHeight % params.checkpointInterval === 0 ? encodedCp : null;
+        const estBytes = measureAcceptedBlockBytes({
+          v: params.version,
+          id: PLACEHOLDER_BLOCK_ID,
+          h: nextHeight,
+          prev: state.tipId,
+          btcRef,
+          miner,
+          nonce: 9_999_999_999,
+          stateRoot,
+          diff,
+          checkpoint,
+          txs: candidateList,
+        });
+        if (estBytes > params.maxBlockBytes) {
+          throw new Error(`Candidate block byte budget exceeded (${estBytes} > ${params.maxBlockBytes})`);
+        }
+      }
+
       committedState = trial;
       accepted.push(tx);
-      approxBytes += txBytes;
     } catch (err) {
       brokenSenders.add(tx.from);
       dropped.push({ tx, reason: err.message });

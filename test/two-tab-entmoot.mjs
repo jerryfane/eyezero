@@ -8,10 +8,10 @@ import assert from 'node:assert/strict';
 
 const DEMO_URL = process.env.DEMO_URL ?? 'https://app.ordstudio.app/d/aB8H6Hen95be';
 let chromium;
-try {
-  ({ chromium } = await import(process.env.PLAYWRIGHT_PATH ?? 'playwright'));
-} catch {
-  ({ chromium } = await import('/root/ordstudio/node_modules/.pnpm/playwright@1.65.1/node_modules/playwright/index.mjs'));
+if (process.env.PLAYWRIGHT_PATH) {
+  ({ chromium } = await import(process.env.PLAYWRIGHT_PATH));
+} else {
+  ({ chromium } = await import('playwright'));
 }
 
 const browser = await chromium.launch({ args: ['--no-sandbox'] });

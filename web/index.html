@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>eyezero (i0) — Xverse Companion Wrapper (Signet Preview)</title>
+  <title>eyezero (i0) — Preview Wrapper</title>
   <style>
     :root {
       color-scheme: dark;
@@ -13,7 +13,6 @@
       --line2: #31343c;
       --ink: #ededef;
       --mut: #8b8e96;
-      --ok: #30a46c;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; font-size: 13px; display: flex; flex-direction: column; }
@@ -29,12 +28,12 @@
 <body>
   <div class="bar">
     <div class="bar-l">
-      <strong>eyezero <span class="mono">wrapper · signet preview</span></strong>
-      <span class="status" id="status">Pinned cross-origin OrdStudio preview (read-only sandbox; mainnet funding disabled)</span>
+      <strong>eyezero <span class="mono">preview</span></strong>
+      <span class="status" id="status">Pinned cross-origin OrdStudio demo (read-only preview; no wallet funding bridge active)</span>
     </div>
     <div class="bar-r">
-      <span class="mono" id="xverse-addr">Xverse: not connected</span>
-      <button class="primary" id="connect-btn">Connect Xverse (Signet)</button>
+      <span class="mono" id="xverse-addr">Wallet: preview only</span>
+      <button class="primary" id="connect-btn">Check Xverse (Signet)</button>
     </div>
   </div>
   <!-- Pinned immutable HTTPS document on a separate origin; no public URL query override. -->
@@ -47,31 +46,17 @@
   ></iframe>
 
   <script>
-    const PINNED_SRC = 'https://app.ordstudio.app/d/aB8H6Hen95be';
-    const TRUSTED_ORIGIN = new URL(PINNED_SRC).origin;
-    const SIGNET_TAPROOT_RE = /^tb1p[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$/;
-    const HEX64_RE = /^[0-9a-f]{64}$/;
-    // OrdStudio's /d/<slug> page nests the inscription inside its own sandboxed iframe,
-    // so cross-frame wallet funding is only active when embedding a direct single-hop inscription origin.
-    const IS_DIRECT_INSCRIPTION_HOP = !PINNED_SRC.includes('app.ordstudio.app/d/');
-
-    const frame = document.getElementById('genesis-frame');
     const statusEl = document.getElementById('status');
     const addrEl = document.getElementById('xverse-addr');
-
-    let walletNetworkVerified = false;
-    let addrPreview = '';
 
     function xverseProvider() {
       return window.XverseProviders?.BitcoinProvider || window.BitcoinProvider || null;
     }
 
     async function verifySignetNetwork(provider, address) {
-      // Reject any mainnet address prefix immediately (bc1 / 1 / 3).
       if (/^(bc1|1|3)/i.test(address)) {
         throw new Error('Wallet returned a Bitcoin Mainnet address; switch Xverse to Signet.');
       }
-      // Query wallet_getNetwork when supported to distinguish Signet from Testnet3/Testnet4.
       try {
         const netRes = await provider.request('wallet_getNetwork', null);
         const netName = String(netRes?.result?.bitcoin?.name || netRes?.bitcoin?.name || '').toLowerCase();
@@ -85,7 +70,7 @@
       }
     }
 
-    async function connectXverse() {
+    document.getElementById('connect-btn').onclick = async () => {
       const provider = xverseProvider();
       if (!provider) {
         statusEl.textContent = 'Xverse extension not detected in this browser.';
@@ -94,84 +79,19 @@
       try {
         const res = await provider.request('getAccounts', {
           purposes: ['payment', 'ordinals'],
-          message: 'Connect Bitcoin Signet wallet for eyezero preview',
+          message: 'Verify Bitcoin Signet wallet for eyezero preview',
         });
         const list = res?.result || res?.addresses || [];
         const pay = list.find((a) => a.purpose === 'payment') || list[0];
         if (!pay?.address) throw new Error('No address returned');
-        walletNetworkVerified = await verifySignetNetwork(provider, pay.address);
-        addrPreview = `${pay.address.slice(0, 8)}…${pay.address.slice(-4)}`;
-        addrEl.textContent = walletNetworkVerified ? `${addrPreview} (signet)` : `${addrPreview} (unverified net)`;
-
-        if (!IS_DIRECT_INSCRIPTION_HOP) {
-          statusEl.textContent = 'Xverse connected, but OrdStudio /d/ preview nests the inscription frame (read-only preview; direct inscription origin required for 1-click bridge).';
-          return;
-        }
-        if (!walletNetworkVerified) {
-          statusEl.textContent = 'Connected, but Xverse did not confirm Signet via wallet_getNetwork — funding remains locked.';
-          return;
-        }
-        statusEl.textContent = 'Xverse Signet verified — ready for confirmed I0 escrow HTLC funding.';
-        frame.contentWindow?.postMessage(
-          { type: 'eyezero:wrapper:ready', connected: true, network: 'signet', addrPreview },
-          TRUSTED_ORIGIN,
-        );
+        const isSignet = await verifySignetNetwork(provider, pay.address);
+        const preview = `${pay.address.slice(0, 8)}…${pay.address.slice(-4)}`;
+        addrEl.textContent = isSignet ? `${preview} (signet)` : `${preview} (unverified net)`;
+        statusEl.textContent = 'Read-only preview: direct dedicated-origin inscription embed is required before enabling live HTLC funding.';
       } catch (err) {
-        walletNetworkVerified = false;
-        statusEl.textContent = `Xverse error: ${err?.message || err}`;
+        statusEl.textContent = `Xverse check: ${err?.message || err}`;
       }
-    }
-
-    document.getElementById('connect-btn').onclick = connectXverse;
-
-    // Strictly authenticate single-hop source window, pinned origin, verified Signet wallet, and live deadline.
-    window.addEventListener('message', async (ev) => {
-      if (!IS_DIRECT_INSCRIPTION_HOP) return;
-      if (ev.source !== frame.contentWindow || ev.origin !== TRUSTED_ORIGIN) return;
-      const msg = ev.data;
-      if (!msg || typeof msg !== 'object') return;
-
-      if (msg.type === 'eyezero:xverse:fundHtlc') {
-        if (!walletNetworkVerified) {
-          statusEl.textContent = 'Blocked funding request: connect Xverse on verified Bitcoin Signet first.';
-          return;
-        }
-        if (msg.network !== 'signet' || typeof msg.address !== 'string' || !SIGNET_TAPROOT_RE.test(msg.address)) {
-          statusEl.textContent = 'Blocked funding request: invalid Signet Taproot (tb1p) address.';
-          return;
-        }
-        if (
-          typeof msg.swapId !== 'string' ||
-          !HEX64_RE.test(msg.swapId) ||
-          !Number.isInteger(msg.timeoutBtcHeight) ||
-          !msg.i0EscrowConfirmed
-        ) {
-          statusEl.textContent = 'Blocked funding request: confirmed I0 escrow and integer timeout required.';
-          return;
-        }
-        const provider = xverseProvider();
-        if (!provider) return;
-
-        // Check live Signet tip height before funding so an expired or near-expired HTLC cannot be funded.
-        try {
-          const tipRes = await fetch('https://mempool.space/signet/api/blocks/tip/height');
-          if (!tipRes.ok) throw new Error(`HTTP ${tipRes.status}`);
-          const liveTip = Number(await tipRes.text());
-          if (!Number.isInteger(liveTip) || msg.timeoutBtcHeight <= liveTip + 2) {
-            statusEl.textContent = `Blocked funding request: HTLC timeout #${msg.timeoutBtcHeight} is too close to Signet tip #${liveTip}.`;
-            return;
-          }
-          const amountSats = Number(prompt(`Send how many Signet sats to verified Taproot HTLC ${msg.address}?`, '50000'));
-          if (!Number.isSafeInteger(amountSats) || amountSats < 546) return;
-          const res = await provider.request('sendTransfer', {
-            recipients: [{ address: msg.address, amount: amountSats }],
-          });
-          statusEl.textContent = `Sent ${amountSats} Signet sats to HTLC (${res?.result?.txid || 'submitted'})`;
-        } catch (err) {
-          statusEl.textContent = `Transfer cancelled/failed: ${err?.message || err}`;
-        }
-      }
-    });
+    };
   </script>
 </body>
 </html>

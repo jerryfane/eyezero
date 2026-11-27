@@ -194,19 +194,36 @@ function collectCanonicalEntries(state) {
 export function encodeStateCommitment(state, params = V1_MAINNET_PARAMS) {
   const maxPageBytes = params?.maxCheckpointPageBytes ?? V1_MAINNET_PARAMS.maxCheckpointPageBytes;
   const entries = collectCanonicalEntries(state);
+  const headerSnapshot = {
+    epochStartBtcHeight: state.epochStartBtcHeight,
+    target: state.target.toString(),
+    cumulativeWork: state.cumulativeWork.toString(),
+  };
+  // Compute exact worst-case JSON envelope overhead (with 6-digit page indices) so EVERY page is strictly <= maxPageBytes.
+  const baseEnvelopeBytes = JSON.stringify({
+    v: 1,
+    genesisId: state.genesisId,
+    height: state.height,
+    totalI0Minted: state.totalI0Minted.toString(),
+    header: headerSnapshot,
+    pageIndex: 999999,
+    totalPages: 999999,
+    entries: [],
+  }).length;
+
   const rawPages = [];
   let curEntries = [];
-  let curBytes = 180; // base JSON envelope overhead
+  let curBytes = baseEnvelopeBytes;
 
   for (const entry of entries) {
     const entryLen = JSON.stringify(entry).length + 1;
-    if (entryLen + 180 > maxPageBytes) {
+    if (entryLen + baseEnvelopeBytes > maxPageBytes) {
       throw new Error(`Single state entry (${entryLen} B) exceeds maxCheckpointPageBytes (${maxPageBytes})`);
     }
     if (curEntries.length > 0 && curBytes + entryLen > maxPageBytes) {
       rawPages.push(curEntries);
       curEntries = [];
-      curBytes = 180;
+      curBytes = baseEnvelopeBytes;
     }
     curEntries.push(entry);
     curBytes += entryLen;
@@ -221,6 +238,7 @@ export function encodeStateCommitment(state, params = V1_MAINNET_PARAMS) {
     genesisId: state.genesisId,
     height: state.height,
     totalI0Minted: state.totalI0Minted.toString(),
+    header: headerSnapshot,
     pageIndex,
     totalPages,
     entries: pageEntries,
@@ -338,6 +356,7 @@ export function importCheckpointPages(pages, header = {}) {
   }
 
   const pagesMerkleRoot = merkleRootHex(pageHashes);
+  const cpHeader = first.header ?? {};
   const restored = {
     genesisId: first.genesisId,
     chainId: first.genesisId.slice(0, 16),
@@ -345,9 +364,9 @@ export function importCheckpointPages(pages, header = {}) {
     tipId: header.tipId ?? first.genesisId,
     tipBtcHeight: header.tipBtcHeight ?? 0,
     tipInscriptionNumber: header.tipInscriptionNumber ?? 0,
-    epochStartBtcHeight: header.epochStartBtcHeight ?? 0,
-    target: header.target ?? 0n,
-    cumulativeWork: header.cumulativeWork ?? 0n,
+    epochStartBtcHeight: header.epochStartBtcHeight ?? cpHeader.epochStartBtcHeight ?? 0,
+    target: header.target ?? (cpHeader.target !== undefined ? BigInt(cpHeader.target) : 0n),
+    cumulativeWork: header.cumulativeWork ?? (cpHeader.cumulativeWork !== undefined ? BigInt(cpHeader.cumulativeWork) : 0n),
     totalI0Minted: BigInt(first.totalI0Minted),
     accounts,
     tokens,

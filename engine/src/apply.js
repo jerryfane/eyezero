@@ -66,28 +66,21 @@ export function isValidTokenId(tokenId) {
 }
 
 // Full 256-bit launch-bound immutable token ID: binds every signed LAUNCH parameter
-// (chainId, creator, nonce, ticker, name, artId, initialBuy) so competing launches on
+// (chainId, from, nonce, ticker, name, artId, initialBuy) so competing launches on
 // forks can never alias the same tokenId.
-export function computeTokenId(chainId, launchOrCreator, nonce, ticker, name = '', artId = '', initialBuy = '0') {
-  const payload = typeof launchOrCreator === 'object' && launchOrCreator !== null
-    ? {
-        chainId,
-        from: launchOrCreator.from,
-        nonce: launchOrCreator.nonce,
-        ticker: launchOrCreator.ticker,
-        name: launchOrCreator.name ?? '',
-        artId: launchOrCreator.artId ?? '',
-        initialBuy: String(launchOrCreator.initialBuy ?? '0'),
-      }
-    : {
-        chainId,
-        from: launchOrCreator,
-        nonce,
-        ticker,
-        name,
-        artId,
-        initialBuy: String(initialBuy ?? '0'),
-      };
+export function computeTokenId(chainId, launch) {
+  if (!launch || typeof launch !== 'object') {
+    throw new Error('computeTokenId requires a launch object');
+  }
+  const payload = {
+    chainId,
+    from: launch.from,
+    nonce: launch.nonce,
+    ticker: launch.ticker,
+    name: launch.name ?? '',
+    artId: launch.artId ?? '',
+    initialBuy: String(launch.initialBuy ?? '0'),
+  };
   return 't_' + sha256Hex(`eyezero:v1:token:${JSON.stringify(payload)}`);
 }
 
@@ -223,11 +216,20 @@ export function resolvePendingMempool(state, pendingTxs, { verifiedSigs = null }
     const curNonce = acc ? acc.nonce : 0;
     if (tx.nonce <= curNonce) continue;
 
-    const sigOk = verifiedSigs && verifiedSigs.has(tx.sig)
+    // Key verification cache by BOTH canonical tx digest AND signature so a forged copy
+    // reusing a valid tx's sig with modified body/fee can NEVER bypass BIP-340 verification!
+    let digestHex;
+    try {
+      digestHex = bytesToHex(txDigest(state.chainId, tx));
+    } catch {
+      continue;
+    }
+    const cacheKey = `${digestHex}:${tx.sig}`;
+    const sigOk = verifiedSigs && verifiedSigs.has(cacheKey)
       ? true
       : verifyTxSignature(state.chainId, tx);
     if (!sigOk) continue;
-    if (verifiedSigs) verifiedSigs.add(tx.sig);
+    if (verifiedSigs) verifiedSigs.add(cacheKey);
 
     const key = `${tx.from}:${tx.nonce}`;
     const prev = bestBySenderNonce.get(key);
@@ -552,12 +554,14 @@ export function buildCandidateBlock(
 
   next.height = h;
   if (id) next.tipId = id;
+  // epochStartBtcHeight depends only on the already-confirmed parent state.tipBtcHeight,
+  // so set it unconditionally (even when btcContext is null before Bitcoin confirmation!).
+  if (h > 1 && (h - 1) % params.retargetInterval === 0) {
+    next.epochStartBtcHeight = state.tipBtcHeight;
+  }
   if (btcContext) {
     next.tipBtcHeight = btcContext.btcHeight;
     next.tipInscriptionNumber = btcContext.inscriptionNumber;
-    if (h > 1 && (h - 1) % params.retargetInterval === 0) {
-      next.epochStartBtcHeight = state.tipBtcHeight;
-    }
   }
   next.target = target;
   next.cumulativeWork = state.cumulativeWork + targetToWork(target);

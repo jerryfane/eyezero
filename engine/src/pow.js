@@ -135,12 +135,16 @@ export function validateBtcAnchor(state, block, btcContext, params = V1_MAINNET_
 
   if (
     !block.btcRef ||
+    typeof block.btcRef !== 'object' ||
+    Object.keys(block.btcRef).length !== 2 ||
+    !Object.prototype.hasOwnProperty.call(block.btcRef, 'h') ||
+    !Object.prototype.hasOwnProperty.call(block.btcRef, 'hash') ||
     !Number.isInteger(block.btcRef.h) ||
     block.btcRef.h < 0 ||
     typeof block.btcRef.hash !== 'string' ||
     !POW_HEX64_RE.test(block.btcRef.hash.toLowerCase())
   ) {
-    throw new Error('Missing or malformed btcRef anchor');
+    throw new Error('Missing or malformed btcRef anchor (must have exact keys {h, hash})');
   }
   const refH = block.btcRef.h;
   if ((state.height > 0 || state.tipBtcHeight > 0) && refH < state.tipBtcHeight) {

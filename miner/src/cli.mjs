@@ -26,6 +26,7 @@ import { join } from 'node:path';
 import {
   V1_TEST_PARAMS,
   applyBlock,
+  assertStateConservation,
   buildCandidateBlock,
   bytesToHex,
   canonicalizeTx,
@@ -33,8 +34,11 @@ import {
   concatBytes,
   createGenesisState,
   hexToBytes,
+  importCheckpoint,
   isValidBlockInscriptionId,
   isValidInscriptionId,
+  meetsTarget,
+  meetsWorkTarget,
   nextTarget,
   previewPending,
   taggedHash,
@@ -54,6 +58,7 @@ const VALUE_OPTS = new Set([
   'network', 'genesis', 'tip', 'tip-hints', 'ord-url', 'rpc-url', 'rpc-auth',
   'esplora-url', 'key', 'key-file', 'miner-pubkey', 'entmoot-group', 'entmoot-bin',
   'entmoot-data', 'txs-file', 'recovery-dir', 'pow-bits', 'checkpoint-interval', 'fee-rate',
+  'announce',
 ]);
 const BOOL_OPTS = new Set(['help', 'h', 'sync-only', 'dry-run', 'wait-confirm']);
 
@@ -354,6 +359,9 @@ export async function syncChainFromOrd({
   rpcUrl = null,
   rpcAuth = null,
   maxDepth = MAX_SYNC_DEPTH,
+  useCheckpoints = true,
+  sharedBlockCache = null,
+  deadlineMs = 0,
 }) {
   if (!isValidInscriptionId(genesisId)) {
     throw new Error(`Invalid genesis inscription ID: ${genesisId}`);
@@ -380,8 +388,12 @@ export async function syncChainFromOrd({
   const hashCache = new Map();
   const visited = new Set([genesisId]);
   let cursor = tipId;
+  let checkpointBoot = null;
 
   while (cursor && cursor !== genesisId) {
+    if (deadlineMs > 0 && Date.now() > deadlineMs) {
+      throw new Error('Sync deadline exceeded');
+    }
     if (!isValidBlockInscriptionId(cursor)) {
       throw new Error(`Invalid block inscription ID in ancestry: ${cursor}`);
     }
@@ -393,11 +405,17 @@ export async function syncChainFromOrd({
     }
     visited.add(cursor);
 
-    const [rawBodyBytes, meta] = await Promise.all([
-      ordFetchBytes(ordUrl, `/content/${cursor}`),
-      ordJson(ordUrl, `/r/inscription/${cursor}`),
-    ]);
-    const content = JSON.parse(rawBodyBytes.toString('utf8'));
+    let cached = sharedBlockCache?.get(cursor) ?? null;
+    if (!cached) {
+      const [rawBodyBytes, meta] = await Promise.all([
+        ordFetchBytes(ordUrl, `/content/${cursor}`),
+        ordJson(ordUrl, `/r/inscription/${cursor}`),
+      ]);
+      const content = JSON.parse(rawBodyBytes.toString('utf8'));
+      cached = { rawBodyBytes, content, meta };
+    }
+    const { rawBodyBytes, content, meta } = cached;
+
     if (!Number.isInteger(content?.btcRef?.h) || content.btcRef.h < 0) {
       throw new Error(`Block ${cursor} has invalid btcRef.h`);
     }
@@ -422,18 +440,50 @@ export async function syncChainFromOrd({
         expectedRefHash: hashCache.get(content.btcRef.h),
       });
     }
+    if (sharedBlockCache) sharedBlockCache.set(cursor, cached);
 
-    fetched.push({ block: { ...content, id: cursor }, meta });
+    const blockWithId = { ...content, id: cursor };
+    // Fast verified checkpoint recovery: if this confirmed block carries an inline checkpoint
+    // on a checkpoint boundary and passes dual-PoW + anchor + stateRoot verification, boot straight from it!
+    if (
+      useCheckpoints &&
+      blockWithId.checkpoint &&
+      blockWithId.checkpoint.mode === 'inline' &&
+      blockWithId.h % params.checkpointInterval === 0 &&
+      blockWithId.checkpoint.page0?.genesisId === genesisId &&
+      blockWithId.checkpoint.page0?.header?.target
+    ) {
+      const cpTarget = BigInt(blockWithId.checkpoint.page0.header.target);
+      if (
+        meetsWorkTarget(blockWithId, cpTarget) &&
+        meetsTarget(blockWithId.id, cpTarget) &&
+        hashCache.get(blockWithId.btcRef.h) === blockWithId.btcRef.hash.toLowerCase() &&
+        blockWithId.btcRef.h < meta.height &&
+        meta.height - blockWithId.btcRef.h <= params.btcRefMaxLag
+      ) {
+        const restored = importCheckpoint(blockWithId.checkpoint, {
+          tipId: blockWithId.id,
+          tipBtcHeight: meta.height,
+          tipInscriptionNumber: meta.number,
+          expectedStateRoot: blockWithId.stateRoot,
+        });
+        assertStateConservation(restored, params);
+        checkpointBoot = restored;
+        break;
+      }
+    }
+
+    fetched.push({ block: blockWithId, meta });
     cursor = content.prev;
   }
 
-  if (cursor !== genesisId) {
+  if (!checkpointBoot && cursor !== genesisId) {
     throw new Error(`Ancestry did not terminate at pinned genesis ${genesisId}`);
   }
 
   fetched.reverse();
 
-  let state = createGenesisState(genesisId, params, genesisMeta.height);
+  let state = checkpointBoot ?? createGenesisState(genesisId, params, genesisMeta.height);
   for (const { block, meta } of fetched) {
     state = applyBlock(
       state,
@@ -444,19 +494,26 @@ export async function syncChainFromOrd({
   }
   return {
     state,
-    blockCount: fetched.length,
+    blockCount: state.height,
+    replayedBlocks: fetched.length,
+    bootedFromCheckpoint: Boolean(checkpointBoot),
     genesisBtcHeight: genesisMeta.height,
     trustModel: rpcUrl ? 'bitcoind-rpc-verified-p2tr-envelope' : 'ord-trusted-dual-pow',
   };
 }
 
-export async function syncBestTipFromOrd({ ordUrl, genesisId, candidateTipIds, params, rpcUrl = null, rpcAuth = null }) {
+export async function syncBestTipFromOrd({ ordUrl, genesisId, candidateTipIds, params, rpcUrl = null, rpcAuth = null, totalBudgetMs = 60_000 }) {
   const uniqueTips = [...new Set(candidateTipIds.filter((id) => isValidInscriptionId(id)))];
+  const sharedBlockCache = new Map();
+  const deadlineMs = Date.now() + totalBudgetMs;
   let best = null;
   let lastErr = null;
   for (const tipId of uniqueTips) {
+    if (Date.now() > deadlineMs) break;
     try {
-      const res = await syncChainFromOrd({ ordUrl, genesisId, tipId, params, rpcUrl, rpcAuth });
+      const res = await syncChainFromOrd({
+        ordUrl, genesisId, tipId, params, rpcUrl, rpcAuth, sharedBlockCache, deadlineMs,
+      });
       if (!best || compareChainTips(res.state, best.state) > 0) {
         best = res;
       }
@@ -522,6 +579,13 @@ function persistRecoveryBundle(recoveryDirOpt, revealTxid, payload) {
     fsyncSync(fd);
   } finally {
     closeSync(fd);
+  }
+  // Fsync the parent directory entry so the newly created recovery file survives crash before commit broadcast.
+  const dirFd = openSync(dir, fsConstants.O_RDONLY);
+  try {
+    fsyncSync(dirFd);
+  } finally {
+    closeSync(dirFd);
   }
   return recoveryPath;
 }
@@ -593,17 +657,68 @@ export async function runMinerOnce(opts) {
   const feeRate = Number(opts['fee-rate'] ?? 3);
   if (!Number.isFinite(feeRate) || feeRate <= 0) throw new Error(`Invalid fee-rate: ${feeRate}`);
 
-  // Use the broadcast node's fresh tip (bitcoind RPC when available) so a lagging ord index
-  // can never supply a stale anchor that expires before confirmation!
+  // Explicit post-confirmation announcement command: verifies confirmation on ord before publishing #i0-blk.
+  if (opts.announce) {
+    if (!opts['entmoot-group']) throw new Error('--announce requires --entmoot-group');
+    if (!isValidBlockInscriptionId(opts.announce)) throw new Error(`Invalid block ID for --announce: ${opts.announce}`);
+    const [blk, meta] = await Promise.all([
+      ordJson(ordUrl, `/content/${opts.announce}`),
+      ordJson(ordUrl, `/r/inscription/${opts.announce}`),
+    ]);
+    if (!Number.isInteger(meta?.height) || meta.height < 1) {
+      throw new Error(`Block ${opts.announce} is not yet confirmed on ord`);
+    }
+    const ann = { id: opts.announce, h: blk.h, prev: blk.prev };
+    publishEntmootBlock({
+      entmootBin: opts['entmoot-bin'] ?? '/root/.entmoot/bin/entmootd',
+      entmootData: opts['entmoot-data'],
+      groupId: opts['entmoot-group'],
+      announcement: ann,
+    });
+    return { announced: true, announcement: ann, btcHeight: meta.height };
+  }
+
+  // Use the broadcast node's fresh tip (bitcoind RPC or Esplora API) so a lagging ord index
+  // can NEVER supply a stale anchor that expires before confirmation!
+  const esploraBase = opts['esplora-url'] ? opts['esplora-url'].replace(/\/$/, '') : null;
+  if (!opts['dry-run'] && !opts['rpc-url'] && !esploraBase) {
+    throw new Error('Live broadcast requires --rpc-url (bitcoind) or --esplora-url');
+  }
+
+  const fetchEsploraText = async (path) => {
+    const r = await fetch(`${esploraBase}${path}`, { signal: AbortSignal.timeout(ORD_TIMEOUT_MS) });
+    if (!r.ok) throw new Error(`Esplora GET ${path} -> HTTP ${r.status}`);
+    return (await r.text()).trim();
+  };
+
   const fetchFreshBitcoinTip = async () => {
     if (opts['rpc-url']) {
       const h = Number(await rpcCall(opts['rpc-url'], opts['rpc-auth'], 'getblockcount'));
       const hash = String(await rpcCall(opts['rpc-url'], opts['rpc-auth'], 'getblockhash', [h])).toLowerCase();
       return { h, hash };
     }
+    if (esploraBase) {
+      const h = Number(await fetchEsploraText('/blocks/tip/height'));
+      if (!Number.isInteger(h) || h < 1) throw new Error(`Invalid Esplora tip height: ${h}`);
+      const hash = (await fetchEsploraText(`/block-height/${h}`)).toLowerCase();
+      if (!HEX64_RE.test(hash)) throw new Error(`Invalid Esplora block hash at #${h}`);
+      return { h, hash };
+    }
     const h = Number(await ordJson(ordUrl, '/r/blockheight'));
     const hash = String(await ordJson(ordUrl, `/r/blockhash/${h}`)).toLowerCase();
     return { h, hash };
+  };
+
+  const fetchFreshBlockHash = async (height) => {
+    if (opts['rpc-url']) {
+      return String(await rpcCall(opts['rpc-url'], opts['rpc-auth'], 'getblockhash', [height])).toLowerCase();
+    }
+    if (esploraBase) {
+      const hash = (await fetchEsploraText(`/block-height/${height}`)).toLowerCase();
+      if (!HEX64_RE.test(hash)) throw new Error(`Invalid Esplora block hash at #${height}`);
+      return hash;
+    }
+    return String(await ordJson(ordUrl, `/r/blockhash/${height}`)).toLowerCase();
   };
 
   const { h: btcHeight, hash: refHash } = await fetchFreshBitcoinTip();
@@ -727,9 +842,7 @@ export async function runMinerOnce(opts) {
   if (!opts['dry-run']) {
     // 7. Recheck anchor validity & remaining confirmation window against the fresh broadcast node!
     const liveTip = await fetchFreshBitcoinTip();
-    const liveRefHash = opts['rpc-url']
-      ? String(await rpcCall(opts['rpc-url'], opts['rpc-auth'], 'getblockhash', [candidate.btcRef.h])).toLowerCase()
-      : String(await ordJson(ordUrl, `/r/blockhash/${candidate.btcRef.h}`)).toLowerCase();
+    const liveRefHash = await fetchFreshBlockHash(candidate.btcRef.h);
     if (liveRefHash !== candidate.btcRef.hash) {
       throw new Error(`Anchor block #${candidate.btcRef.h} reorged before broadcast; aborting without spending fees`);
     }
@@ -809,7 +922,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     usage();
     process.exit(1);
   }
-  if (args.help || args.h || !args.genesis || !args['ord-url'] || (!args['sync-only'] && !args['miner-pubkey'])) {
+  if (args.help || args.h || !args.genesis || !args['ord-url'] || (!args['sync-only'] && !args.announce && !args['miner-pubkey'])) {
     usage();
     process.exit(args.help || args.h ? 0 : 1);
   }

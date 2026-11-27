@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import {
   I0_TOKEN_ID,
   UNIT,
@@ -32,6 +33,7 @@ import {
   sha256Hex,
   signTx,
 } from '../engine/src/index.js';
+import { syncChainFromOrd } from '../miner/src/cli.mjs';
 
 const GENESIS_ID = '0000000000000000000000000000000000000000000000000000000000000001i0';
 const GENESIS_BTC_H = 900_000;
@@ -155,6 +157,18 @@ describe('Dual-bound PoW, exact retargeting, Genesis anchor, and fork choice', (
       V1_TEST_PARAMS,
     );
     assert.throws(() => applyBlock(s1, wrongHash, btcCtx, V1_TEST_PARAMS), /hash mismatch/);
+
+    // Extra keys on btcRef must be rejected
+    const { block: baseOk } = buildCandidateBlock(
+      s1,
+      { id, miner: miner.pk, btcRef: { h: 900_014, hash: fakeBlockHash(900_014) }, txs: [] },
+      btcCtx,
+      V1_TEST_PARAMS,
+    );
+    assert.throws(
+      () => applyBlock(s1, { ...baseOk, btcRef: { h: 900_014, hash: fakeBlockHash(900_014), extra: 1 } }, btcCtx, V1_TEST_PARAMS),
+      /exact keys \{h, hash\}/,
+    );
   });
 
   it('keeps target exactly constant at 1:1 cadence and adjusts smoothly for faster/slower epochs', () => {
@@ -241,8 +255,8 @@ describe('Mandatory bounded paged checkpoints & emission', () => {
     assert.equal(computeStateRoot(restored, params), blk3.stateRoot);
     assertStateConservation(restored, params);
 
-    // Multi-page checkpoint test: tiny page budget forces deterministic paging without overflowing block size!
-    const pagedParams = { ...V1_TEST_PARAMS, checkpointInterval: 2, maxCheckpointPageBytes: 350 };
+    // Multi-page checkpoint test: small page budget forces deterministic paging without overflowing block size!
+    const pagedParams = { ...V1_TEST_PARAMS, checkpointInterval: 2, maxCheckpointPageBytes: 600 };
     let sp = createGenesisState(GENESIS_ID, pagedParams, GENESIS_BTC_H);
     ({ next: sp } = mineBlock(sp, { miner: miner.pk, btcHeight: 900_001, params: pagedParams }));
     const fundMany = [];
@@ -511,14 +525,18 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
     // Cross-network destination rejected (mainnet bc1p address on signet HTLC)
     const mainnetHtlc = deriveTaprootHtlc({ alicePubkey: alice.pk, bobPubkey: bob.pk, hashlock, timeoutBtcHeight: 100, network: 'mainnet' });
     const fakeUtxo = { txid: '11'.repeat(32), vout: 0, value: 50_000n, scriptPubKeyHex: htlc.outputScriptHex, confirmations: 1 };
-    // Missing scriptPubKeyHex or 0-conf UTXO must be rejected before emitting witness hex
+    // Missing scriptPubKeyHex, omitted confirmations, or 0-conf UTXO must be rejected before emitting witness hex
     assert.throws(
       () => buildAndSignHtlcClaimTx({ utxo: { txid: '11'.repeat(32), vout: 0, value: 50_000n }, htlc, secretHex: secret, alicePrivKey: alice.sk, destinationAddress: htlc.address }),
       /scriptPubKeyHex is required/,
     );
     assert.throws(
+      () => buildAndSignHtlcClaimTx({ utxo: { txid: '11'.repeat(32), vout: 0, value: 50_000n, scriptPubKeyHex: htlc.outputScriptHex }, htlc, secretHex: secret, alicePrivKey: alice.sk, destinationAddress: htlc.address }),
+      /confirmations >= 1/,
+    );
+    assert.throws(
       () => buildAndSignHtlcClaimTx({ utxo: { ...fakeUtxo, confirmations: 0 }, htlc, secretHex: secret, alicePrivKey: alice.sk, destinationAddress: htlc.address }),
-      />= 1 confirmation/,
+      /confirmations >= 1/,
     );
     assert.throws(
       () => buildAndSignHtlcClaimTx({ utxo: fakeUtxo, htlc, secretHex: secret, alicePrivKey: alice.sk, destinationAddress: mainnetHtlc.address }),
@@ -560,5 +578,61 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
 
     const { projectedState } = previewPending(s, [txLow, txCancel], 900_003, V1_TEST_PARAMS);
     assert.equal(getBalance(projectedState, alice.pk, 0), 100n * UNIT - 500n);
+
+    // Forged copy reusing a valid tx's sig with modified body & higher fee must NOT bypass signature cache!
+    const forgedCopy = { ...txLow, amount: (90n * UNIT).toString(), fee: '999999' };
+    const { accepted: safeAccepted } = previewPending(s, [txLow, forgedCopy], 900_003, V1_TEST_PARAMS);
+    assert.equal(safeAccepted.length, 1);
+    assert.equal(safeAccepted[0].amount, (50n * UNIT).toString());
+    assert.equal(safeAccepted[0].fee, '100');
+  });
+
+  it('syncs a chain longer than maxDepth directly from a verified inline checkpoint', async () => {
+    const params = { ...V1_TEST_PARAMS, checkpointInterval: 4, retargetInterval: 8, powMinBits: 8 };
+    const miner = keyFor(1);
+    let s = createGenesisState(GENESIS_ID, params, GENESIS_BTC_H);
+    const routes = new Map([
+      [`/r/inscription/${GENESIS_ID}`, { id: GENESIS_ID, number: 1, height: GENESIS_BTC_H }],
+    ]);
+
+    let tipId = GENESIS_ID;
+    for (let i = 1; i <= 6; i++) {
+      const btcH = GENESIS_BTC_H + i;
+      const { block, next } = mineBlock(s, { miner: miner.pk, btcHeight: btcH, inscriptionNumber: i + 1, params });
+      s = next;
+      tipId = block.id;
+      const bodyWithoutId = { ...block };
+      delete bodyWithoutId.id;
+      routes.set(`/content/${block.id}`, bodyWithoutId);
+      routes.set(`/r/inscription/${block.id}`, { id: block.id, number: i + 1, height: btcH });
+      routes.set(`/r/blockhash/${btcH - 1}`, fakeBlockHash(btcH - 1));
+    }
+
+    const server = createServer((req, res) => {
+      const val = routes.get(req.url);
+      if (val === undefined) {
+        res.writeHead(404).end('not found');
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(val));
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+      // maxDepth=3 cannot reach Genesis across 6 blocks, so sync MUST boot from Block #4's verified checkpoint!
+      const res = await syncChainFromOrd({
+        ordUrl: `http://127.0.0.1:${port}`,
+        genesisId: GENESIS_ID,
+        tipId,
+        params,
+        maxDepth: 3,
+      });
+      assert.equal(res.bootedFromCheckpoint, true);
+      assert.equal(res.replayedBlocks, 2);
+      assert.equal(res.blockCount, 6);
+      assert.equal(computeStateRoot(res.state, params), computeStateRoot(s, params));
+    } finally {
+      server.close();
+    }
   });
 });

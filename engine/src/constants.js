@@ -52,12 +52,8 @@ export const V1_TEST_PARAMS = Object.freeze({
   checkpointInterval: 6,
 });
 
-// Single shared preset for the interactive OrdStudio demo & build script.
-export const V1_DEMO_PARAMS = Object.freeze({
-  ...V1_TEST_PARAMS,
-  powMinBits: 8,
-  checkpointInterval: 6,
-});
+// Shared preset for the interactive OrdStudio demo & build script.
+export const V1_DEMO_PARAMS = V1_TEST_PARAMS;
 
 export function blockRewardForHeight(height, params = V1_MAINNET_PARAMS) {
   if (!Number.isInteger(height) || height < 1) {

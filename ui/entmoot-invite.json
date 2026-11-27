@@ -1,0 +1,54 @@
+{
+  "group_id": "CBCw5dx0xsf/qzqz8PB5Q8UgR4tD+RdfaddunXRlrgc=",
+  "target_member_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "founder": {
+    "entmoot_pubkey": "KBmbK9EWWGfi2U/mJMZq+lxTvETqawmIILap8/tfoNA=",
+    "member_id": "MparPSGHFv23IGeDtf3Ng8kq7AuzGQ3fYEHBkrFSDRA=",
+    "peer_id": "12D3KooWCWu85kXSt5ivWTeE4xLo1jvCwBs9g5DNhHZDsjXNaaR5"
+  },
+  "roster_head": "AgyjlAMprIWdO7v4Z6XKEC99TObqpFzDKz9oFJiAJrA=",
+  "allowed_peer_ids": [
+    "12D3KooWCWu85kXSt5ivWTeE4xLo1jvCwBs9g5DNhHZDsjXNaaR5"
+  ],
+  "allowed_multiaddrs": [
+    "/ip4/37.27.59.89/udp/47004/webrtc-direct/certhash/uEiBv9RXMG4IqYvd6V0VmzD0unlVj1kLGKK0o-arWW0LLJA/p2p/12D3KooWCWu85kXSt5ivWTeE4xLo1jvCwBs9g5DNhHZDsjXNaaR5"
+  ],
+  "max_uses": 64,
+  "nonce": [
+    137,
+    201,
+    143,
+    200,
+    104,
+    45,
+    143,
+    252,
+    177,
+    246,
+    56,
+    155,
+    230,
+    215,
+    224,
+    55,
+    187,
+    241,
+    8,
+    124,
+    108,
+    234,
+    60,
+    170,
+    53,
+    170,
+    230,
+    218,
+    99,
+    77,
+    169,
+    41
+  ],
+  "issued_at_ms": 1795816202342,
+  "expires_at_ms": 1827352502342,
+  "signature": "hwwgFZ/FdhCTiHuKTyRAyH296/EBlURaGJhTjP39by6ocRCLHm80SZ3KrJC8oSaEF6X4VSU4y2y45xrubqmNCw=="
+}

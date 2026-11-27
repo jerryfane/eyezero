@@ -1,0 +1,22 @@
+{
+  "name": "eyezero",
+  "version": "0.1.0",
+  "description": "eyezero (i0): zero-sequencer, zero-bridge PoW mini-chain and bonding-curve launchpad inside a Bitcoin inscription",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": "./engine/src/index.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "fuzz": "node --test test/fuzz.test.js",
+    "test:regtest": "node test/regtest.mjs",
+    "test:regtest:full": "node test/regtest-full.mjs",
+    "test:entmoot": "node test/two-tab-entmoot.mjs",
+    "build:inscriptions": "node scripts/build-inscriptions.mjs",
+    "docs:build": "mdbook build docs"
+  }
+}

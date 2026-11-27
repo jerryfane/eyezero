@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>eyezero (i0) — Genesis Inscription</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1012;
+      --panel: #141518;
+      --raise: #1b1d22;
+      --line: #23252a;
+      --line2: #31343c;
+      --ink: #ededef;
+      --ink2: #b8bbc4;
+      --mut: #838793;
+      --ok: #30a46c;
+      --warn: #e2a336;
+      --err: #e5484d;
+      --acc: #ededef;
+      --acc-ink: #111214;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 13px; line-height: 1.45; }
+    button, input, select { font: inherit; color: inherit; }
+    button { cursor: pointer; background: var(--raise); border: 1px solid var(--line2); border-radius: 6px; padding: 6px 11px; font-weight: 500; }
+    button:hover { background: #24272f; }
+    button.primary { background: var(--acc); color: var(--acc-ink); border-color: var(--acc); }
+    button.primary:hover { opacity: 0.92; }
+    button.sm { padding: 3px 8px; font-size: 12px; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    input, select { background: var(--bg); border: 1px solid var(--line2); border-radius: 6px; padding: 6px 9px; width: 100%; }
+    input:focus, select:focus { outline: none; border-color: #6b707d; }
+    .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .mut { color: var(--mut); }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .dot.ok { background: var(--ok); }
+    .dot.warn { background: var(--warn); }
+    .dot.err { background: var(--err); }
+
+    header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 10; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
+    .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line2); background: var(--bg); font-size: 11.5px; color: var(--ink2); }
+    .hdr-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .hdr-right select { width: auto; padding: 4px 8px; font-size: 12px; }
+
+    .grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.95fr); gap: 14px; max-width: 1240px; margin: 0 auto; padding: 14px 16px 28px; }
+    @media (max-width: 880px) { .grid { grid-template-columns: 1fr; } }
+
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+    .card + .card { margin-top: 14px; }
+    .card-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 11px; }
+    .card-t { font-weight: 600; font-size: 13.5px; }
+
+    .tokens { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
+    .tok { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 10px; cursor: pointer; text-align: left; }
+    .tok.on { border-color: var(--ink); background: var(--raise); }
+    .tok-sym { font-weight: 600; font-size: 13.5px; display: flex; justify-content: space-between; }
+    .tok-sub { font-size: 11.5px; color: var(--mut); margin-top: 2px; }
+    .tok-stat { margin-top: 8px; font-size: 11.5px; color: var(--ink2); display: flex; justify-content: space-between; }
+
+    .chart-box { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 10px; margin-top: 10px; }
+    .chart-box svg { width: 100%; height: 155px; display: block; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+    @media (max-width: 600px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .m-item { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 9px; }
+    .m-k { font-size: 11px; color: var(--mut); }
+    .m-v { font-size: 12.5px; font-weight: 600; margin-top: 2px; }
+
+    .tabs { display: flex; gap: 4px; margin-bottom: 11px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+    .tabs button { background: transparent; border-color: transparent; color: var(--mut); padding: 5px 10px; }
+    .tabs button.on { background: var(--raise); border-color: var(--line2); color: var(--ink); }
+
+    .field { margin-bottom: 9px; }
+    .field label { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--mut); margin-bottom: 4px; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row > * { flex: 1; }
+    .quote { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 12px; margin: 9px 0; }
+    .q-line { display: flex; justify-content: space-between; padding: 2px 0; }
+
+    .list { display: flex; flex-direction: column; gap: 6px; }
+    .item { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; }
+    .item-l { min-width: 0; }
+    .item-r { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+
+    .blk-row { cursor: pointer; }
+    .blk-row.on { border-color: var(--ink); }
+    pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 9px; overflow: auto; max-height: 220px; font-size: 11px; margin: 8px 0 0; }
+    .toast { font-size: 12px; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line2); background: var(--raise); margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>eyezero <span class="mono mut">i0</span></span>
+      <span class="pill" id="sync-pill"><span class="dot warn"></span>Syncing chain…</span>
+      <span class="pill mono" id="tip-pill">Block #0</span>
+    </div>
+    <div class="hdr-right">
+      <span class="pill mono" id="bal-pill">0 I0</span>
+      <select id="wallet-select" aria-label="Active wallet"></select>
+      <button class="primary sm" id="mine-btn">Mine 00…i0 Block</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section>
+      <div class="card">
+        <div class="card-h">
+          <span class="card-t">Launchpad Curves <span class="mut" style="font-weight:400">(Permanent x·y=k · 0.5% Miner / 0.5% Creator)</span></span>
+          <button class="sm" id="show-launch-btn">+ Launch Token</button>
+        </div>
+        <div class="tokens" id="token-grid"></div>
+        <div class="chart-box">
+          <div class="card-h" style="margin-bottom:4px">
+            <span class="mono" id="chart-title">—</span>
+            <span class="mut" style="font-size:11.5px" id="chart-sub">Select a token</span>
+          </div>
+          <svg id="curve-svg" viewBox="0 0 560 155"></svg>
+        </div>
+        <div class="metrics" id="token-metrics"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-h">
+          <span class="card-t">Verified eyezero Chain <span class="mut" style="font-weight:400">(Confirmed Bitcoin Inscriptions)</span></span>
+          <button class="sm" id="mev-test-btn">Verify Zero-MEV Shuffle</button>
+        </div>
+        <div class="list" id="block-list"></div>
+        <pre class="mono" id="block-json" hidden></pre>
+        <div class="toast" id="mev-result" hidden></div>
+      </div>
+    </section>
+
+    <aside>
+      <div class="card">
+        <div class="tabs" id="action-tabs">
+          <button class="on" data-tab="buy">Buy</button>
+          <button data-tab="sell">Sell</button>
+          <button data-tab="launch">Launch</button>
+          <button data-tab="htlc">BTC HTLC</button>
+        </div>
+
+        <div id="tab-buy">
+          <div class="field">
+            <label><span>Amount (I0)</span><span class="mono" id="buy-avail">Avail: 0</span></label>
+            <input id="buy-amount" type="number" min="0.01" step="1" value="25">
+          </div>
+          <div class="field">
+            <label><span>Max slippage (%)</span><span class="mut">Protects minTokOut</span></label>
+            <input id="buy-slip" type="number" min="0" max="99" step="1" value="15">
+          </div>
+          <div class="quote" id="buy-quote"></div>
+          <button class="primary" style="width:100%" id="submit-buy">Sign &amp; Broadcast Buy (#i0-tx)</button>
+        </div>
+
+        <div id="tab-sell" hidden>
+          <div class="field">
+            <label><span>Amount (Tokens)</span><span class="mono" id="sell-avail">Avail: 0</span></label>
+            <input id="sell-amount" type="number" min="1" step="1000" value="100000">
+          </div>
+          <div class="quote" id="sell-quote"></div>
+          <button class="primary" style="width:100%" id="submit-sell">Sign &amp; Broadcast Sell (#i0-tx)</button>
+        </div>
+
+        <div id="tab-launch" hidden>
+          <div class="row">
+            <div class="field">
+              <label><span>Ticker</span></label>
+              <input id="launch-ticker" maxlength="12" value="PEPE0">
+            </div>
+            <div class="field">
+              <label><span>Initial Buy (I0, optional)</span></label>
+              <input id="launch-init" type="number" min="0" step="1" value="10">
+            </div>
+          </div>
+          <div class="field">
+            <label><span>Token Name</span></label>
+            <input id="launch-name" maxlength="32" value="Pepe Zero">
+          </div>
+          <div class="quote">
+            <div class="q-line"><span class="mut">Launch fee (to miner)</span><span class="mono">10 I0</span></div>
+            <div class="q-line"><span class="mut">Creator royalty forever</span><span class="mono">0.5% in I0</span></div>
+          </div>
+          <button class="primary" style="width:100%" id="submit-launch">Sign &amp; Launch Token</button>
+        </div>
+
+        <div id="tab-htlc" hidden>
+          <div class="row">
+            <div class="field">
+              <label><span>Lock I0 for BTC Swap</span></label>
+              <input id="htlc-amount" type="number" min="1" step="1" value="20">
+            </div>
+            <div class="field">
+              <label><span>Recipient</span></label>
+              <select id="htlc-recipient"></select>
+            </div>
+          </div>
+          <button class="primary" style="width:100%" id="submit-htlc">Sign HTLC_LOCK (Generates Secret S)</button>
+          <div class="list" id="htlc-list" style="margin-top:10px"></div>
+        </div>
+
+        <div class="toast" id="action-msg" hidden></div>
+      </div>
+
+      <div class="card">
+        <div class="card-h">
+          <span class="card-t">Pending Mempool <span class="mono mut">#i0-tx</span></span>
+          <span class="mut" style="font-size:11.5px" id="mempool-count">0 pending</span>
+        </div>
+        <div class="list" id="mempool-list"></div>
+      </div>
+    </aside>
+  </main>
+
+  <script type="module">
+    import * as E from '/content/local:g-rules.js';
+
+    const PARAMS = { ...E.V1_TEST_PARAMS, powMinBits: 8, checkpointInterval: 6 };
+    const UNIT = E.UNIT;
+    const fmtI0 = (v) => {
+      const neg = v < 0n ? '-' : '';
+      const a = v < 0n ? -v : v;
+      const whole = a / UNIT;
+      const frac = ((a % UNIT) * 100n) / UNIT;
+      return `${neg}${whole.toLocaleString()}.${frac.toString().padStart(2, '0')}`;
+    };
+    const fmtTok = (v) => (v / UNIT).toLocaleString();
+    const shortId = (id) => id ? `${id.slice(0, 10)}…${id.slice(-6)}` : '—';
+
+    const PERSONAS = [
+      { id: 'alice', name: 'Alice (Trader)', sk: '000000000000000000000000000000000000000000000000000000000000000c' },
+      { id: 'bob', name: 'Bob (Trader)', sk: '000000000000000000000000000000000000000000000000000000000000000d' },
+      { id: 'creator', name: 'Creator (Launcher)', sk: '000000000000000000000000000000000000000000000000000000000000000b' },
+      { id: 'miner', name: 'Miner (PoW)', sk: '000000000000000000000000000000000000000000000000000000000000000a' },
+    ];
+    for (const p of PERSONAS) p.pk = E.getPublicKeyHex(p.sk);
+
+    let activePersona = PERSONAS[0];
+    let chainState = null;
+    let verifiedBlocks = [];
+    let pendingTxs = [];
+    let selectedTokenId = 1;
+    let inspectedHeight = null;
+    let localBtcHeight = 924_103;
+    const blockHashCache = new Map();
+    const htlcSecrets = new Map();
+
+    const $ = (id) => document.getElementById(id);
+
+    function showMsg(elId, text) {
+      const el = $(elId);
+      el.textContent = text;
+      el.hidden = false;
+    }
+
+    function nextNonceFor(pk) {
+      const base = chainState.accounts.get(pk)?.nonce ?? 0;
+      const resolved = E.resolvePendingMempool(chainState, pendingTxs);
+      let max = base;
+      for (const tx of resolved) if (tx.from === pk && tx.nonce > max) max = tx.nonce;
+      return max + 1;
+    }
+
+    async function fetchJson(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
+      return res.json();
+    }
+
+    async function syncFromOrd() {
+      try {
+        const [tipInfo, btcH] = await Promise.all([
+          fetchJson('/content/local:blocks/tip.json'),
+          fetchJson('/r/blockheight'),
+        ]);
+        localBtcHeight = Number(btcH);
+
+        // Walk B.prev backwards from tip to Genesis using real /content/<id> + /r/inscription/<id>.
+        const rawChain = [];
+        let cursor = tipInfo.tipId;
+        while (cursor && cursor !== tipInfo.genesisId) {
+          const [blk, meta] = await Promise.all([
+            fetchJson(`/content/${cursor}`),
+            fetchJson(`/r/inscription/${cursor}`),
+          ]);
+          const refHash = await fetchJson(`/r/blockhash/${blk.btcRef.h}`);
+          blockHashCache.set(blk.btcRef.h, refHash);
+          rawChain.push({ blk, meta });
+          cursor = blk.prev;
+        }
+        rawChain.reverse();
+
+        let s = E.createGenesisState(tipInfo.genesisId, PARAMS);
+        verifiedBlocks = [];
+        for (const { blk, meta } of rawChain) {
+          const ctx = {
+            btcHeight: meta.height,
+            inscriptionNumber: meta.number,
+            getBlockHash: (h) => blockHashCache.get(h) ?? E.sha256Hex(`eyezero-demo-btc-${h}`),
+          };
+          s = E.applyBlock(s, blk, ctx, PARAMS);
+          verifiedBlocks.push({ block: blk, meta });
+        }
+        chainState = s;
+        inspectedHeight = s.height;
+        $('sync-pill').innerHTML = `<span class="dot ok"></span>Verified ${verifiedBlocks.length} blocks on chain`;
+        renderAll();
+      } catch (err) {
+        $('sync-pill').innerHTML = `<span class="dot err"></span>Sync error: ${err.message}`;
+      }
+    }
+
+    function getProjected() {
+      return E.previewPending(chainState, pendingTxs, localBtcHeight + 1, PARAMS);
+    }
+
+    function renderCurveSvg(tok, projTok) {
+      const svg = $('curve-svg');
+      const vI0 = Number(tok.virtualI0 / UNIT);
+      const rI0 = Number(tok.realI0 / UNIT);
+      const pI0 = projTok ? Number(projTok.realI0 / UNIT) : rI0;
+      const maxX = Math.max(250, pI0 * 1.5, rI0 * 1.5);
+      const k = (vI0 + rI0) * Number(tok.realTok / UNIT);
+      const priceAt = (x) => ((vI0 + x) * (vI0 + x)) / k;
+      const pMin = priceAt(0);
+      const pMax = priceAt(maxX);
+      const span = Math.max(1e-12, pMax - pMin);
+      const yFor = (p) => 126 - (96 * (p - pMin)) / span;
+
+      let pathD = '';
+      for (let i = 0; i <= 40; i++) {
+        const xVal = (maxX * i) / 40;
+        const px = 36 + (504 * i) / 40;
+        const py = yFor(priceAt(xVal));
+        pathD += (i === 0 ? 'M' : 'L') + `${px.toFixed(1)},${py.toFixed(1)}`;
+      }
+      const areaD = `${pathD} L540.0,132 L36.0,132 Z`;
+      const curX = 36 + (504 * rI0) / maxX;
+      const curY = yFor(priceAt(rI0));
+      const prjX = 36 + (504 * pI0) / maxX;
+      const prjY = yFor(priceAt(pI0));
+
+      svg.innerHTML = `
+        <line x1="36" y1="132" x2="544" y2="132" stroke="#2a2d35" stroke-width="1"/>
+        <line x1="36" y1="22" x2="36" y2="132" stroke="#2a2d35" stroke-width="1"/>
+        <path d="${areaD}" fill="#30a46c" fill-opacity="0.09"/>
+        <path d="${pathD}" fill="none" stroke="#8b909e" stroke-width="1.8"/>
+        <circle cx="${curX.toFixed(1)}" cy="${curY.toFixed(1)}" r="4.5" fill="#30a46c"/>
+        ${pI0 !== rI0 ? `<line x1="${curX.toFixed(1)}" y1="${curY.toFixed(1)}" x2="${prjX.toFixed(1)}" y2="${prjY.toFixed(1)}" stroke="#e2a336" stroke-dasharray="3 2" stroke-width="1.5"/><circle cx="${prjX.toFixed(1)}" cy="${prjY.toFixed(1)}" r="4.5" fill="#e2a336"/>` : ''}
+        <text x="42" y="148" fill="#838793" font-size="10.5" font-family="ui-monospace,monospace">0 I0</text>
+        <text x="484" y="148" fill="#838793" font-size="10.5" font-family="ui-monospace,monospace">${Math.round(maxX)} I0</text>
+        <text x="42" y="14" fill="#838793" font-size="10.5" font-family="ui-monospace,monospace">Final: ${rI0.toFixed(2)} I0${pI0 !== rI0 ? ` · Pending: ${pI0.toFixed(2)} I0` : ''}</text>
+      `;
+    }
+
+    function renderQuotes(projectedState) {
+      const tok = projectedState.tokens.get(selectedTokenId);
+      const availI0 = E.getBalance(projectedState, activePersona.pk, 0);
+      const availTok = tok ? E.getBalance(projectedState, activePersona.pk, tok.id) : 0n;
+      $('buy-avail').textContent = `Avail: ${fmtI0(availI0)} I0`;
+      $('sell-avail').textContent = `Avail: ${fmtTok(availTok)} ${tok ? tok.ticker : ''}`;
+
+      if (!tok) return;
+      const buyVal = Number($('buy-amount').value || 0);
+      if (buyVal > 0) {
+        const i0In = BigInt(Math.round(buyVal * 1e8));
+        const fee = (i0In * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
+        const netB = i0In - fee;
+        const X = tok.virtualI0 + tok.realI0;
+        const Y = tok.realTok;
+        const estOut = (netB * Y) / (X + netB);
+        $('buy-quote').innerHTML = `
+          <div class="q-line"><span class="mut">Est. output (projected batch)</span><span class="mono">${fmtTok(estOut)} ${tok.ticker}</span></div>
+          <div class="q-line"><span class="mut">1% fee (0.5% miner / 0.5% creator)</span><span class="mono">${fmtI0(fee)} I0</span></div>
+        `;
+      }
+      const sellVal = Number($('sell-amount').value || 0);
+      if (sellVal > 0) {
+        const tokIn = BigInt(Math.round(sellVal)) * UNIT;
+        const X = tok.virtualI0 + tok.realI0;
+        const Y = tok.realTok;
+        const grossI0 = (tokIn * X) / (Y + tokIn);
+        const fee = (grossI0 * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
+        $('sell-quote').innerHTML = `
+          <div class="q-line"><span class="mut">Est. net payout</span><span class="mono">${fmtI0(grossI0 - fee)} I0</span></div>
+          <div class="q-line"><span class="mut">1% I0 fee (0.5% miner / 0.5% creator)</span><span class="mono">${fmtI0(fee)} I0</span></div>
+        `;
+      }
+    }
+
+    function renderAll() {
+      if (!chainState) return;
+      const { projectedState, accepted } = getProjected();
+
+      $('tip-pill').textContent = `Block #${chainState.height} · ${shortId(chainState.tipId)}`;
+      const myI0 = E.getBalance(chainState, activePersona.pk, 0);
+      const myProjI0 = E.getBalance(projectedState, activePersona.pk, 0);
+      $('bal-pill').textContent = myProjI0 !== myI0
+        ? `${fmtI0(myI0)} I0 (pend: ${fmtI0(myProjI0)})`
+        : `${fmtI0(myI0)} I0`;
+
+      // Token grid
+      const grid = $('token-grid');
+      grid.innerHTML = '';
+      for (const tok of chainState.tokens.values()) {
+        const pTok = projectedState.tokens.get(tok.id) ?? tok;
+        const myBal = E.getBalance(projectedState, activePersona.pk, tok.id);
+        const btn = document.createElement('button');
+        btn.className = `tok ${tok.id === selectedTokenId ? 'on' : ''}`;
+        btn.innerHTML = `
+          <div class="tok-sym"><span>$${tok.ticker}</span><span class="mono mut">#${tok.id}</span></div>
+          <div class="tok-sub">${tok.name}</div>
+          <div class="tok-stat"><span class="mut">Reserve</span><span class="mono">${fmtI0(pTok.realI0)} I0</span></div>
+          <div class="tok-stat"><span class="mut">You hold</span><span class="mono">${fmtTok(myBal)}</span></div>
+        `;
+        btn.onclick = () => { selectedTokenId = tok.id; renderAll(); };
+        grid.appendChild(btn);
+      }
+
+      // Active curve chart + metrics
+      const tok = chainState.tokens.get(selectedTokenId) ?? [...chainState.tokens.values()][0];
+      if (tok) {
+        selectedTokenId = tok.id;
+        const pTok = projectedState.tokens.get(tok.id) ?? tok;
+        const priceNow = Number(tok.virtualI0 + tok.realI0) / Number(tok.realTok);
+        const priceProj = Number(pTok.virtualI0 + pTok.realI0) / Number(pTok.realTok);
+        const pct = ((priceProj - priceNow) / priceNow) * 100;
+        $('chart-title').textContent = `$${tok.ticker} · ${tok.name}`;
+        $('chart-sub').textContent = pct !== 0
+          ? `Projected round move: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`
+          : `Final price: ${priceNow.toFixed(7)} I0`;
+        renderCurveSvg(tok, pTok);
+        $('token-metrics').innerHTML = `
+          <div class="m-item"><div class="m-k">Real I0 Reserve</div><div class="m-v mono">${fmtI0(pTok.realI0)} I0</div></div>
+          <div class="m-item"><div class="m-k">Virtual Cushion</div><div class="m-v mono">${fmtI0(tok.virtualI0)} I0</div></div>
+          <div class="m-item"><div class="m-k">Curve Tokens</div><div class="m-v mono">${fmtTok(pTok.realTok)}</div></div>
+          <div class="m-item"><div class="m-k">Creator Royalty</div><div class="m-v mono">0.5% in I0</div></div>
+        `;
+      }
+
+      renderQuotes(projectedState);
+
+      // Pending mempool
+      $('mempool-count').textContent = `${accepted.length} active`;
+      const mList = $('mempool-list');
+      mList.innerHTML = accepted.length ? '' : '<div class="mut" style="font-size:12px">No pending orders. Submit a Buy, Sell, Launch, or HTLC above.</div>';
+      for (const tx of accepted) {
+        const who = PERSONAS.find((p) => p.pk === tx.from)?.name.split(' ')[0] ?? tx.from.slice(0, 6);
+        const div = document.createElement('div');
+        div.className = 'item';
+        const desc = tx.type === 'BUY' ? `BUY #${tx.tokenId} · ${fmtI0(BigInt(tx.i0In))} I0`
+          : tx.type === 'SELL' ? `SELL #${tx.tokenId} · ${fmtTok(BigInt(tx.tokIn))} tok`
+          : tx.type === 'LAUNCH' ? `LAUNCH $${tx.ticker}`
+          : tx.type === 'HTLC_LOCK' ? `HTLC_LOCK ${fmtI0(BigInt(tx.amount))} I0`
+          : tx.type;
+        div.innerHTML = `
+          <div class="item-l"><span class="dot warn"></span><strong>${who}</strong> <span class="mono">${desc}</span> <span class="mut mono">n=${tx.nonce}</span></div>
+          <div class="item-r"></div>
+        `;
+        if (tx.from === activePersona.pk && tx.type !== 'CANCEL') {
+          const cBtn = document.createElement('button');
+          cBtn.className = 'sm';
+          cBtn.textContent = 'Cancel (RBF)';
+          cBtn.onclick = () => {
+            const nextFee = (BigInt(tx.fee || '0') + 1000n).toString();
+            const cancelTx = E.signTx(chainState.chainId, { type: 'CANCEL', from: activePersona.pk, nonce: tx.nonce, fee: nextFee }, activePersona.sk);
+            pendingTxs.push(cancelTx);
+            showMsg('action-msg', `Replaced nonce ${tx.nonce} with CANCEL (fee=${nextFee})`);
+            renderAll();
+          };
+          div.querySelector('.item-r').appendChild(cBtn);
+        }
+        mList.appendChild(div);
+      }
+
+      // Open HTLCs
+      const hList = $('htlc-list');
+      hList.innerHTML = '';
+      for (const h of chainState.htlcs.values()) {
+        const recName = PERSONAS.find((p) => p.pk === h.recipient)?.name.split(' ')[0] ?? h.recipient.slice(0, 6);
+        const div = document.createElement('div');
+        div.className = 'item';
+        div.innerHTML = `
+          <div class="item-l"><span class="dot ok"></span><span class="mono">${fmtI0(h.amount)} I0 → ${recName}</span><div class="mut mono">H=${h.hashlock.slice(0, 14)}… · exp #${h.timeoutBtcHeight}</div></div>
+          <div class="item-r"></div>
+        `;
+        const secret = htlcSecrets.get(h.id);
+        if (secret && activePersona.pk === h.recipient) {
+          const claimBtn = document.createElement('button');
+          claimBtn.className = 'sm primary';
+          claimBtn.textContent = 'Claim w/ Secret S';
+          claimBtn.onclick = () => {
+            const tx = E.signTx(chainState.chainId, { type: 'HTLC_CLAIM', from: activePersona.pk, swapId: h.id, preimage: secret, nonce: nextNonceFor(activePersona.pk), fee: '0' }, activePersona.sk);
+            pendingTxs.push(tx);
+            showMsg('action-msg', `Signed HTLC_CLAIM for ${shortId(h.id)} — mine a block to finalize!`);
+            renderAll();
+          };
+          div.querySelector('.item-r').appendChild(claimBtn);
+        }
+        hList.appendChild(div);
+      }
+
+      // Verified blocks explorer
+      const bList = $('block-list');
+      bList.innerHTML = '';
+      for (const entry of [...verifiedBlocks].reverse()) {
+        const b = entry.block;
+        const div = document.createElement('div');
+        div.className = `item blk-row ${inspectedHeight === b.h ? 'on' : ''}`;
+        div.innerHTML = `
+          <div class="item-l">
+            <span class="dot ok"></span>
+            <strong class="mono">#${b.h}</strong>
+            <span class="mono">${shortId(b.id)}</span>
+            ${b.checkpoint ? '<span class="pill">Checkpoint 1.5×</span>' : ''}
+          </div>
+          <div class="item-r mono mut">${b.txs.length} txs · BTC #${entry.meta.height}</div>
+        `;
+        div.onclick = () => {
+          inspectedHeight = b.h;
+          const pre = $('block-json');
+          pre.hidden = false;
+          pre.textContent = JSON.stringify({
+            id: b.id, h: b.h, prev: b.prev, btcRef: b.btcRef,
+            stateRoot: b.stateRoot, diffCount: b.diff.length,
+            hasCheckpoint: Boolean(b.checkpoint), txs: b.txs,
+          }, null, 2);
+          renderAll();
+        };
+        bList.appendChild(div);
+      }
+    }
+
+    // Wire UI controls
+    const wSel = $('wallet-select');
+    const rSel = $('htlc-recipient');
+    for (const p of PERSONAS) {
+      wSel.add(new Option(p.name, p.id));
+      rSel.add(new Option(p.name, p.pk));
+    }
+    rSel.value = PERSONAS[1].pk;
+    wSel.onchange = () => {
+      activePersona = PERSONAS.find((p) => p.id === wSel.value) ?? PERSONAS[0];
+      renderAll();
+    };
+
+    for (const btn of $('action-tabs').querySelectorAll('button')) {
+      btn.onclick = () => {
+        for (const b of $('action-tabs').querySelectorAll('button')) b.classList.toggle('on', b === btn);
+        for (const t of ['buy', 'sell', 'launch', 'htlc']) $(`tab-${t}`).hidden = btn.dataset.tab !== t;
+      };
+    }
+    $('show-launch-btn').onclick = () => $('action-tabs').querySelector('[data-tab="launch"]').click();
+    $('buy-amount').oninput = () => chainState && renderQuotes(getProjected().projectedState);
+    $('sell-amount').oninput = () => chainState && renderQuotes(getProjected().projectedState);
+
+    $('submit-buy').onclick = () => {
+      try {
+        const i0In = BigInt(Math.round(Number($('buy-amount').value) * 1e8));
+        const slip = BigInt(Math.max(0, Math.min(99, Math.round(Number($('buy-slip').value || 15)))));
+        const tok = getProjected().projectedState.tokens.get(selectedTokenId);
+        const fee = (i0In * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
+        const estOut = ((i0In - fee) * tok.realTok) / (tok.virtualI0 + tok.realI0 + (i0In - fee));
+        const minTokOut = (estOut * (100n - slip)) / 100n;
+        const tx = E.signTx(chainState.chainId, {
+          type: 'BUY', from: activePersona.pk, tokenId: selectedTokenId,
+          i0In: i0In.toString(), minTokOut: minTokOut.toString(),
+          nonce: nextNonceFor(activePersona.pk), fee: '0',
+        }, activePersona.sk);
+        pendingTxs.push(tx);
+        showMsg('action-msg', `Signed BIP-340 BUY (${fmtI0(i0In)} I0) -> pending in Entmoot mempool`);
+        renderAll();
+      } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
+    };
+
+    $('submit-sell').onclick = () => {
+      try {
+        const tokIn = BigInt(Math.round(Number($('sell-amount').value))) * UNIT;
+        const tx = E.signTx(chainState.chainId, {
+          type: 'SELL', from: activePersona.pk, tokenId: selectedTokenId,
+          tokIn: tokIn.toString(), minI0Out: '1',
+          nonce: nextNonceFor(activePersona.pk), fee: '0',
+        }, activePersona.sk);
+        pendingTxs.push(tx);
+        showMsg('action-msg', `Signed BIP-340 SELL (${fmtTok(tokIn)} tok) -> pending in Entmoot mempool`);
+        renderAll();
+      } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
+    };
+
+    $('submit-launch').onclick = () => {
+      try {
+        const ticker = $('launch-ticker').value.trim().toUpperCase();
+        const name = $('launch-name').value.trim();
+        const initialBuy = BigInt(Math.round(Number($('launch-init').value || 0) * 1e8));
+        const tx = E.signTx(chainState.chainId, {
+          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId: chainState.genesisId,
+          initialBuy: initialBuy.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
+        }, activePersona.sk);
+        pendingTxs.push(tx);
+        showMsg('action-msg', `Signed BIP-340 LAUNCH $${ticker} -> mine next block to deploy`);
+        renderAll();
+      } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
+    };
+
+    $('submit-htlc').onclick = () => {
+      try {
+        const amount = BigInt(Math.round(Number($('htlc-amount').value) * 1e8));
+        const recipient = $('htlc-recipient').value;
+        const secretBytes = new Uint8Array(32);
+        crypto.getRandomValues(secretBytes);
+        const secretHex = E.bytesToHex(secretBytes);
+        const hashlock = E.sha256Hex(secretBytes);
+        const nonce = nextNonceFor(activePersona.pk);
+        const swapId = E.computeSwapId(chainState.chainId, activePersona.pk, nonce);
+        htlcSecrets.set(swapId, secretHex);
+        const tx = E.signTx(chainState.chainId, {
+          type: 'HTLC_LOCK', from: activePersona.pk, recipient, amount: amount.toString(),
+          hashlock, timeoutBtcHeight: localBtcHeight + 18, nonce, fee: '0',
+        }, activePersona.sk);
+        pendingTxs.push(tx);
+        showMsg('action-msg', `Signed HTLC_LOCK (H=${hashlock.slice(0, 12)}…) — mine block, switch to recipient, and click Claim!`);
+        renderAll();
+      } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
+    };
+
+    $('mine-btn').onclick = () => {
+      try {
+        const t0 = performance.now();
+        const { accepted } = getProjected();
+        const refH = localBtcHeight;
+        const refHash = blockHashCache.get(refH) ?? E.sha256Hex(`eyezero-demo-btc-${refH}`);
+        blockHashCache.set(refH, refHash);
+        const nextBtcH = localBtcHeight + 1;
+        const nextHash = E.sha256Hex(`eyezero-demo-btc-${nextBtcH}`);
+        blockHashCache.set(nextBtcH, nextHash);
+
+        const target = E.nextTarget(chainState, PARAMS);
+        let tries = 0;
+        let winId = null;
+        while (tries < 200_000) {
+          tries++;
+          const cand = E.sha256Hex(`mine-${chainState.height + 1}-${nextBtcH}-${tries}`) + 'i0';
+          if (E.meetsTarget(cand, target)) { winId = cand; break; }
+        }
+        const ctx = {
+          btcHeight: nextBtcH,
+          inscriptionNumber: 80_100_000 + chainState.height + 1,
+          getBlockHash: (h) => blockHashCache.get(h),
+        };
+        const { block } = E.buildCandidateBlock(
+          chainState,
+          { id: winId, miner: activePersona.pk, btcRef: { h: refH, hash: refHash }, txs: accepted, nonce: tries },
+          ctx,
+          PARAMS,
+        );
+        chainState = E.applyBlock(chainState, block, ctx, PARAMS);
+        localBtcHeight = nextBtcH;
+        verifiedBlocks.push({ block, meta: { height: nextBtcH, number: ctx.inscriptionNumber } });
+        pendingTxs = [];
+        const ms = (performance.now() - t0).toFixed(1);
+        showMsg('action-msg', `Mined Block #${block.h} (${shortId(block.id)}) in ${tries} hashes (${ms}ms) · ${block.txs.length} txs finalized`);
+        renderAll();
+      } catch (e) { showMsg('action-msg', `Mine error: ${e.message}`); }
+    };
+
+    $('mev-test-btn').onclick = () => {
+      const targetBlk = verifiedBlocks.find((e) => e.block.h === 3) ?? verifiedBlocks[verifiedBlocks.length - 1];
+      if (!targetBlk) return;
+      const idx = verifiedBlocks.indexOf(targetBlk);
+      // Reconstruct pre-state by replaying 0..idx-1
+      let pre = E.createGenesisState(chainState.genesisId, PARAMS);
+      for (let i = 0; i < idx; i++) {
+        const e = verifiedBlocks[i];
+        pre = E.applyBlock(pre, e.block, { btcHeight: e.meta.height, inscriptionNumber: e.meta.number, getBlockHash: (h) => blockHashCache.get(h) }, PARAMS);
+      }
+      const b = targetBlk.block;
+      const nonTrades = b.txs.filter((t) => t.type !== 'BUY' && t.type !== 'SELL');
+      const tradesRev = b.txs.filter((t) => t.type === 'BUY' || t.type === 'SELL').reverse();
+      const ctx = { btcHeight: targetBlk.meta.height, inscriptionNumber: targetBlk.meta.number, getBlockHash: (h) => blockHashCache.get(h) };
+      const { block: revBlk } = E.buildCandidateBlock(pre, { id: b.id, miner: b.miner, btcRef: b.btcRef, txs: [...nonTrades, ...tradesRev], nonce: b.nonce }, ctx, PARAMS);
+      const match = revBlk.stateRoot === b.stateRoot;
+      showMsg('mev-result', match
+        ? `Zero-MEV proven on Block #${b.h}: reversed BUY/SELL order produced identical stateRoot (${b.stateRoot.slice(0, 16)}…)`
+        : `Mismatch!`);
+    };
+
+    syncFromOrd();
+  </script>
+</body>
+</html>

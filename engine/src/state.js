@@ -91,7 +91,9 @@ export function subBalance(state, pubkey, tokenId, delta) {
   setBalance(state, pubkey, tokenId, cur - delta);
 }
 
-// Deterministic canonical JSON representation for state hashing & checkpoints.
+// Deterministic canonical ledger snapshot for state hashing & checkpoints.
+// Deliberately excludes post-confirmation Bitcoin header fields (tipId, tipBtcHeight,
+// tipInscriptionNumber) so miners can compute stateRoot deterministically BEFORE grinding reveal_txid.
 export function exportCheckpoint(state) {
   const accounts = [...state.accounts.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
@@ -132,12 +134,6 @@ export function exportCheckpoint(state) {
     v: 1,
     genesisId: state.genesisId,
     height: state.height,
-    tipId: state.tipId,
-    tipBtcHeight: state.tipBtcHeight,
-    tipInscriptionNumber: state.tipInscriptionNumber,
-    epochStartBtcHeight: state.epochStartBtcHeight,
-    target: state.target.toString(16),
-    cumulativeWork: state.cumulativeWork.toString(),
     totalI0Minted: state.totalI0Minted.toString(),
     nextTokenId: state.nextTokenId,
     accounts,
@@ -146,7 +142,7 @@ export function exportCheckpoint(state) {
   };
 }
 
-export function importCheckpoint(cp) {
+export function importCheckpoint(cp, header = {}) {
   const accounts = new Map();
   for (const [pk, nonce, bals] of cp.accounts) {
     const m = new Map();
@@ -181,12 +177,12 @@ export function importCheckpoint(cp) {
     genesisId: cp.genesisId,
     chainId: cp.genesisId.slice(0, 16),
     height: cp.height,
-    tipId: cp.tipId,
-    tipBtcHeight: cp.tipBtcHeight,
-    tipInscriptionNumber: cp.tipInscriptionNumber,
-    epochStartBtcHeight: cp.epochStartBtcHeight,
-    target: BigInt('0x' + cp.target),
-    cumulativeWork: BigInt(cp.cumulativeWork),
+    tipId: header.tipId ?? cp.genesisId,
+    tipBtcHeight: header.tipBtcHeight ?? 0,
+    tipInscriptionNumber: header.tipInscriptionNumber ?? 0,
+    epochStartBtcHeight: header.epochStartBtcHeight ?? 0,
+    target: header.target ?? 0n,
+    cumulativeWork: header.cumulativeWork ?? 0n,
     totalI0Minted: BigInt(cp.totalI0Minted),
     nextTokenId: cp.nextTokenId,
     accounts,

@@ -338,12 +338,12 @@ describe('HTLC atomic swaps and cancel/replace by nonce', () => {
     ({ next: s } = mineBlock(s, { miner: miner.pk, txs: [goodClaim], btcHeight: 900_006 }));
     assert.equal(getBalance(s, bob.pk, 0), 100n * UNIT);
 
-    // After timeout (btcHeight = 900_010), claim fails and refund succeeds for swap2
+    // After timeout (btcRef.h = 900_010 -> block btcHeight = 900_011), claim fails and refund succeeds for swap2
     const lateClaim = signTx(s.chainId, { type: 'HTLC_CLAIM', from: bob.pk, swapId: swap2, preimage: secret2, nonce: 2, fee: '0' }, bob.sk);
-    assert.throws(() => mineBlock(s, { miner: miner.pk, txs: [lateClaim], btcHeight: 900_010 }), /timed out/);
+    assert.throws(() => mineBlock(s, { miner: miner.pk, txs: [lateClaim], btcHeight: 900_011 }), /timed out/);
 
     const goodRefund = signTx(s.chainId, { type: 'HTLC_REFUND', from: alice.pk, swapId: swap2, nonce: 3, fee: '0' }, alice.sk);
-    ({ next: s } = mineBlock(s, { miner: miner.pk, txs: [goodRefund], btcHeight: 900_010 }));
+    ({ next: s } = mineBlock(s, { miner: miner.pk, txs: [goodRefund], btcHeight: 900_011 }));
     assert.equal(getBalance(s, alice.pk, 0), 200n * UNIT);
     assertStateConservation(s, V1_TEST_PARAMS);
   });

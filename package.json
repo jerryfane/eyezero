@@ -13,6 +13,8 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "fuzz": "node --test test/fuzz.test.js",
+    "test:regtest": "node test/regtest.mjs",
+    "build:inscriptions": "node scripts/build-inscriptions.mjs",
     "docs:build": "mdbook build docs"
   }
 }

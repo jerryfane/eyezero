@@ -404,18 +404,21 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
 }
 
 // Helper for miners / tests: construct a complete candidate block payload with exact stateRoot, diff, and checkpoint.
-export function buildCandidateBlock(state, { id, miner, btcRef, txs = [], nonce = 0 }, btcContext, params = V1_MAINNET_PARAMS) {
+// Notice: id and btcContext are optional so a real miner can build the exact inscription payload BEFORE grinding reveal_txid!
+export function buildCandidateBlock(state, { id = null, miner, btcRef, txs = [], nonce = 0 }, btcContext = null, params = V1_MAINNET_PARAMS) {
   assertPubkey(miner, 'miner');
   const next = cloneState(state);
   const target = nextTarget(state, params);
   const h = state.height + 1;
 
   next.height = h;
-  next.tipId = id;
-  next.tipBtcHeight = btcContext.btcHeight;
-  next.tipInscriptionNumber = btcContext.inscriptionNumber;
-  if (h === 1 || (h - 1) % params.retargetInterval === 0) {
-    next.epochStartBtcHeight = btcContext.btcHeight;
+  if (id) next.tipId = id;
+  if (btcContext) {
+    next.tipBtcHeight = btcContext.btcHeight;
+    next.tipInscriptionNumber = btcContext.inscriptionNumber;
+    if (h === 1 || (h - 1) % params.retargetInterval === 0) {
+      next.epochStartBtcHeight = btcContext.btcHeight;
+    }
   }
   next.target = target;
   next.cumulativeWork = state.cumulativeWork + targetToWork(target);
@@ -424,26 +427,29 @@ export function buildCandidateBlock(state, { id, miner, btcRef, txs = [], nonce 
   next.totalI0Minted += reward;
   addBalance(next, miner, I0_TOKEN_ID, reward);
 
-  executeBlockTxs(next, miner, txs, btcContext.btcHeight, params);
+  // HTLC timeouts evaluate deterministically against block.btcRef.h (known before confirmation!).
+  executeBlockTxs(next, miner, txs, btcRef.h, params);
 
   const stateRoot = computeStateRoot(next);
   const diff = computeStateDiff(state, next);
   const checkpoint = h % params.checkpointInterval === 0 ? exportCheckpoint(next) : null;
 
+  const block = {
+    v: params.version,
+    ...(id ? { id } : {}),
+    h,
+    prev: state.tipId,
+    btcRef,
+    miner,
+    nonce,
+    stateRoot,
+    diff,
+    checkpoint,
+    txs,
+  };
+
   return {
-    block: {
-      v: params.version,
-      id,
-      h,
-      prev: state.tipId,
-      btcRef,
-      miner,
-      nonce,
-      stateRoot,
-      diff,
-      checkpoint,
-      txs,
-    },
+    block,
     nextState: next,
   };
 }
@@ -490,7 +496,8 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   next.totalI0Minted += reward;
   addBalance(next, block.miner, I0_TOKEN_ID, reward);
 
-  executeBlockTxs(next, block.miner, block.txs, btcContext.btcHeight, params);
+  // HTLC timeouts evaluate deterministically against block.btcRef.h.
+  executeBlockTxs(next, block.miner, block.txs, block.btcRef.h, params);
 
   // 4. Verify strict supply conservation.
   assertStateConservation(next, params);

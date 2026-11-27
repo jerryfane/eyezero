@@ -35,10 +35,9 @@ import {
   createGenesisState,
   hexToBytes,
   importCheckpoint,
+  importCheckpointPages,
   isValidBlockInscriptionId,
   isValidInscriptionId,
-  meetsTarget,
-  meetsWorkTarget,
   nextTarget,
   previewPending,
   taggedHash,
@@ -49,7 +48,7 @@ import { loadOrdInscribeDeps, mineVanityInscription } from './vanity.mjs';
 
 const SUPPORTED_NETWORKS = ['regtest', 'signet', 'testnet', 'testnet4'];
 const SUPPORTED_NETWORK_SET = new Set(SUPPORTED_NETWORKS);
-const MAX_SYNC_DEPTH = 10_000;
+const MAX_SYNC_DEPTH = 500_000;
 const MAX_ORD_BODY_BYTES = 512 * 1024;
 const ORD_TIMEOUT_MS = 15_000;
 const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -58,7 +57,7 @@ const VALUE_OPTS = new Set([
   'network', 'genesis', 'tip', 'tip-hints', 'ord-url', 'rpc-url', 'rpc-auth',
   'esplora-url', 'key', 'key-file', 'miner-pubkey', 'entmoot-group', 'entmoot-bin',
   'entmoot-data', 'txs-file', 'recovery-dir', 'pow-bits', 'checkpoint-interval', 'fee-rate',
-  'announce',
+  'announce', 'trusted-checkpoint-id', 'trusted-checkpoint-root', 'trusted-checkpoint-pages',
 ]);
 const BOOL_OPTS = new Set(['help', 'h', 'sync-only', 'dry-run', 'wait-confirm']);
 
@@ -359,7 +358,9 @@ export async function syncChainFromOrd({
   rpcUrl = null,
   rpcAuth = null,
   maxDepth = MAX_SYNC_DEPTH,
-  useCheckpoints = true,
+  // Optional out-of-band pinned trust anchor: { blockId, stateRoot, pageIds?: string[] }.
+  // Unpinned candidate checkpoints are NEVER trusted to certify their own ledger or cumulative work!
+  trustedCheckpoint = null,
   sharedBlockCache = null,
   deadlineMs = 0,
 }) {
@@ -368,6 +369,15 @@ export async function syncChainFromOrd({
   }
   if (!isValidInscriptionId(tipId)) {
     throw new Error(`Invalid tip inscription ID: ${tipId}`);
+  }
+  if (trustedCheckpoint) {
+    if (
+      !isValidBlockInscriptionId(trustedCheckpoint.blockId) ||
+      typeof trustedCheckpoint.stateRoot !== 'string' ||
+      !HEX64_RE.test(trustedCheckpoint.stateRoot.toLowerCase())
+    ) {
+      throw new Error('trustedCheckpoint requires valid blockId and 64-hex stateRoot');
+    }
   }
 
   const genesisMeta = await ordJson(ordUrl, `/r/inscription/${genesisId}`);
@@ -443,34 +453,47 @@ export async function syncChainFromOrd({
     if (sharedBlockCache) sharedBlockCache.set(cursor, cached);
 
     const blockWithId = { ...content, id: cursor };
-    // Fast verified checkpoint recovery: if this confirmed block carries an inline checkpoint
-    // on a checkpoint boundary and passes dual-PoW + anchor + stateRoot verification, boot straight from it!
-    if (
-      useCheckpoints &&
-      blockWithId.checkpoint &&
-      blockWithId.checkpoint.mode === 'inline' &&
-      blockWithId.h % params.checkpointInterval === 0 &&
-      blockWithId.checkpoint.page0?.genesisId === genesisId &&
-      blockWithId.checkpoint.page0?.header?.target
-    ) {
-      const cpTarget = BigInt(blockWithId.checkpoint.page0.header.target);
-      if (
-        meetsWorkTarget(blockWithId, cpTarget) &&
-        meetsTarget(blockWithId.id, cpTarget) &&
-        hashCache.get(blockWithId.btcRef.h) === blockWithId.btcRef.hash.toLowerCase() &&
-        blockWithId.btcRef.h < meta.height &&
-        meta.height - blockWithId.btcRef.h <= params.btcRefMaxLag
-      ) {
-        const restored = importCheckpoint(blockWithId.checkpoint, {
-          tipId: blockWithId.id,
-          tipBtcHeight: meta.height,
-          tipInscriptionNumber: meta.number,
-          expectedStateRoot: blockWithId.stateRoot,
-        });
-        assertStateConservation(restored, params);
-        checkpointBoot = restored;
-        break;
+    // ONLY boot from a checkpoint whose (blockId, stateRoot) was EXPLICITLY pinned out-of-band!
+    // Supports BOTH inline checkpoints AND multi-page checkpoints (fetching & Merkle-verifying all companion pages).
+    if (trustedCheckpoint && cursor === trustedCheckpoint.blockId) {
+      if (blockWithId.stateRoot !== trustedCheckpoint.stateRoot.toLowerCase()) {
+        throw new Error(
+          `Pinned checkpoint block ${cursor} stateRoot mismatch: got ${blockWithId.stateRoot}, expected ${trustedCheckpoint.stateRoot}`,
+        );
       }
+      const cp = blockWithId.checkpoint;
+      if (!cp || cp.v !== 1 || !cp.page0 || cp.page0.genesisId !== genesisId) {
+        throw new Error(`Pinned checkpoint block ${cursor} lacks valid checkpoint payload`);
+      }
+      const bootHeader = {
+        tipId: blockWithId.id,
+        tipBtcHeight: meta.height,
+        tipInscriptionNumber: meta.number,
+        expectedStateRoot: trustedCheckpoint.stateRoot.toLowerCase(),
+      };
+      let restored;
+      if (cp.mode === 'inline') {
+        restored = importCheckpoint(cp, bootHeader);
+      } else if (cp.mode === 'paged') {
+        const companionIds = trustedCheckpoint.pageIds ?? cp.pageIds ?? [];
+        if (!Array.isArray(companionIds) || companionIds.length !== cp.totalPages - 1) {
+          throw new Error(
+            `Pinned paged checkpoint ${cursor} requires ${cp.totalPages - 1} companion pageIds (got ${companionIds?.length ?? 0})`,
+          );
+        }
+        const pages = [cp.page0];
+        for (const pid of companionIds) {
+          if (!isValidInscriptionId(pid)) throw new Error(`Invalid companion checkpoint page ID: ${pid}`);
+          const pageObj = await ordJson(ordUrl, `/content/${pid}`);
+          pages.push(pageObj);
+        }
+        restored = importCheckpointPages(pages, bootHeader);
+      } else {
+        throw new Error(`Unsupported checkpoint mode: ${cp.mode}`);
+      }
+      assertStateConservation(restored, params);
+      checkpointBoot = restored;
+      break;
     }
 
     fetched.push({ block: blockWithId, meta });
@@ -502,7 +525,16 @@ export async function syncChainFromOrd({
   };
 }
 
-export async function syncBestTipFromOrd({ ordUrl, genesisId, candidateTipIds, params, rpcUrl = null, rpcAuth = null, totalBudgetMs = 60_000 }) {
+export async function syncBestTipFromOrd({
+  ordUrl,
+  genesisId,
+  candidateTipIds,
+  params,
+  rpcUrl = null,
+  rpcAuth = null,
+  trustedCheckpoint = null,
+  totalBudgetMs = 60_000,
+}) {
   const uniqueTips = [...new Set(candidateTipIds.filter((id) => isValidInscriptionId(id)))];
   const sharedBlockCache = new Map();
   const deadlineMs = Date.now() + totalBudgetMs;
@@ -512,7 +544,7 @@ export async function syncBestTipFromOrd({ ordUrl, genesisId, candidateTipIds, p
     if (Date.now() > deadlineMs) break;
     try {
       const res = await syncChainFromOrd({
-        ordUrl, genesisId, tipId, params, rpcUrl, rpcAuth, sharedBlockCache, deadlineMs,
+        ordUrl, genesisId, tipId, params, rpcUrl, rpcAuth, trustedCheckpoint, sharedBlockCache, deadlineMs,
       });
       if (!best || compareChainTips(res.state, best.state) > 0) {
         best = res;
@@ -631,6 +663,16 @@ export async function runMinerOnce(opts) {
     } catch {}
   }
 
+  const trustedCheckpoint = opts['trusted-checkpoint-id']
+    ? {
+        blockId: opts['trusted-checkpoint-id'],
+        stateRoot: opts['trusted-checkpoint-root'],
+        ...(opts['trusted-checkpoint-pages']
+          ? { pageIds: String(opts['trusted-checkpoint-pages']).split(',').map((s) => s.trim()).filter(Boolean) }
+          : {}),
+      }
+    : null;
+
   // 1. Cold-sync best verified canonical chain using fork-choice comparator!
   const { state, blockCount, genesisBtcHeight, trustModel } = await syncBestTipFromOrd({
     ordUrl,
@@ -639,6 +681,7 @@ export async function runMinerOnce(opts) {
     params,
     rpcUrl: opts['rpc-url'] ?? null,
     rpcAuth: opts['rpc-auth'] ?? null,
+    trustedCheckpoint,
   });
 
   if (opts['sync-only']) {

@@ -587,8 +587,9 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
     assert.equal(safeAccepted[0].fee, '100');
   });
 
-  it('syncs a chain longer than maxDepth directly from a verified inline checkpoint', async () => {
-    const params = { ...V1_TEST_PARAMS, checkpointInterval: 4, retargetInterval: 8, powMinBits: 8 };
+  it('rejects unpinned self-certified checkpoints and syncs pinned inline & multi-page checkpoints across long chains', async () => {
+    // Use tiny maxCheckpointPageBytes=600 so Block #4 produces a real MULTI-PAGE checkpoint (totalPages > 1)!
+    const params = { ...V1_TEST_PARAMS, checkpointInterval: 4, retargetInterval: 8, powMinBits: 8, maxCheckpointPageBytes: 600 };
     const miner = keyFor(1);
     let s = createGenesisState(GENESIS_ID, params, GENESIS_BTC_H);
     const routes = new Map([
@@ -596,9 +597,16 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
     ]);
 
     let tipId = GENESIS_ID;
+    let cpBlock = null;
+    let cpPages = null;
     for (let i = 1; i <= 6; i++) {
       const btcH = GENESIS_BTC_H + i;
-      const { block, next } = mineBlock(s, { miner: miner.pk, btcHeight: btcH, inscriptionNumber: i + 1, params });
+      const txs = i === 2
+        ? [2, 3, 4, 5, 6, 7].map((k, idx) =>
+            signTx(s.chainId, { type: 'TRANSFER', from: miner.pk, to: keyFor(k).pk, tokenId: 0, amount: (50n * UNIT).toString(), nonce: idx + 1, fee: '0' }, miner.sk),
+          )
+        : [];
+      const { block, next } = mineBlock(s, { miner: miner.pk, txs, btcHeight: btcH, inscriptionNumber: i + 1, params });
       s = next;
       tipId = block.id;
       const bodyWithoutId = { ...block };
@@ -606,6 +614,18 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
       routes.set(`/content/${block.id}`, bodyWithoutId);
       routes.set(`/r/inscription/${block.id}`, { id: block.id, number: i + 1, height: btcH });
       routes.set(`/r/blockhash/${btcH - 1}`, fakeBlockHash(btcH - 1));
+      if (i === 4) {
+        cpBlock = block;
+        cpPages = exportCheckpointPages(s, params.maxCheckpointPageBytes).pages;
+      }
+    }
+    assert.equal(cpBlock.checkpoint.mode, 'paged');
+    assert.ok(cpPages.length > 1);
+    const companionIds = [];
+    for (let p = 1; p < cpPages.length; p++) {
+      const pid = sha256Hex(`cp-page-${p}`) + 'i0';
+      companionIds.push(pid);
+      routes.set(`/content/${pid}`, cpPages[p]);
     }
 
     const server = createServer((req, res) => {
@@ -619,18 +639,46 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
     await new Promise((r) => server.listen(0, '127.0.0.1', r));
     const { port } = server.address();
     try {
-      // maxDepth=3 cannot reach Genesis across 6 blocks, so sync MUST boot from Block #4's verified checkpoint!
+      // 1. Without a pinned trustedCheckpoint, sync MUST NOT trust Block #4's self-declared checkpoint (hits maxDepth=3)!
+      await assert.rejects(
+        () => syncChainFromOrd({ ordUrl: `http://127.0.0.1:${port}`, genesisId: GENESIS_ID, tipId, params, maxDepth: 3 }),
+        /exceeded maxDepth/,
+      );
+
+      // 2. With an explicit out-of-band pinned trustedCheckpoint + companion pageIds, sync verifies ALL pages against stateRoot!
       const res = await syncChainFromOrd({
         ordUrl: `http://127.0.0.1:${port}`,
         genesisId: GENESIS_ID,
         tipId,
         params,
         maxDepth: 3,
+        trustedCheckpoint: {
+          blockId: cpBlock.id,
+          stateRoot: cpBlock.stateRoot,
+          pageIds: companionIds,
+        },
       });
       assert.equal(res.bootedFromCheckpoint, true);
       assert.equal(res.replayedBlocks, 2);
       assert.equal(res.blockCount, 6);
       assert.equal(computeStateRoot(res.state, params), computeStateRoot(s, params));
+
+      // 3. Tampered stateRoot pin MUST be rejected!
+      await assert.rejects(
+        () => syncChainFromOrd({
+          ordUrl: `http://127.0.0.1:${port}`,
+          genesisId: GENESIS_ID,
+          tipId,
+          params,
+          maxDepth: 3,
+          trustedCheckpoint: {
+            blockId: cpBlock.id,
+            stateRoot: '00'.repeat(32),
+            pageIds: companionIds,
+          },
+        }),
+        /stateRoot mismatch/,
+      );
     } finally {
       server.close();
     }

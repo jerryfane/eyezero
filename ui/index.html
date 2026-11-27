@@ -270,7 +270,7 @@
     const UNIT = E.UNIT;
     const MAX_MEMPOOL_SLOTS = 200;
     const MAX_SEEN_SIGS = 1000;
-    const MAX_SYNC_DEPTH = 2000;
+    const MAX_SYNC_DEPTH = 500_000;
     const MAX_ORD_BODY_BYTES = 512 * 1024;
     const FETCH_TIMEOUT_MS = 12_000;
     const MAX_PENDING_HINTS = 8;
@@ -332,10 +332,14 @@
     let activePersona = PERSONAS[0];
     // Strictly separate Ord-verified chain state/heights from local demo simulator state/heights!
     let ordState = null;
+    let ordBootState = null;
     let ordVerifiedBlocks = [];
     let ordGenesisBtcHeight = 0;
     let ordBtcHeight = 924_103;
     let ordTipId = null;
+    let pinnedTrustedCheckpoint = null; // optional out-of-band pinned { blockId, stateRoot, pageIds? }
+    // Track confirmation blockhash observed for each accepted Ord block so reorged tips are detected!
+    let ordConfirmedBlockHashes = new Map();
     // Cache ONLY immutable inscription content bodies (/content/:id), NEVER mutable confirmation metadata!
     const contentBodyCache = new Map();
 
@@ -491,7 +495,8 @@
       return false;
     }
 
-    // Streamed byte-capped + timeout-bounded JSON fetch (tags transient network/5xx/timeout errors).
+    // Streamed byte-capped + timeout-bounded JSON fetch.
+    // Tags ALL network/stream/timeout/5xx errors as transient so interrupted responses never demote an incumbent tip!
     async function fetchJson(url, maxBytes = MAX_ORD_BODY_BYTES) {
       let res;
       try {
@@ -506,34 +511,48 @@
         if (res.status >= 500 || res.status === 429) err.isTransient = true;
         throw err;
       }
+      let rawText;
       if (!res.body) {
-        const text = await res.text();
-        if (text.length > maxBytes) throw new Error(`${url} exceeded byte limit`);
-        return JSON.parse(text);
-      }
-      const reader = res.body.getReader();
-      const chunks = [];
-      let total = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel().catch(() => {});
-          throw new Error(`${url} exceeded byte limit`);
+        try {
+          rawText = await res.text();
+        } catch (readErr) {
+          readErr.isTransient = true;
+          throw readErr;
         }
-        chunks.push(value);
+        if (rawText.length > maxBytes) throw new Error(`${url} exceeded byte limit`);
+      } else {
+        const reader = res.body.getReader();
+        const chunks = [];
+        let total = 0;
+        while (true) {
+          let step;
+          try {
+            step = await reader.read();
+          } catch (readErr) {
+            readErr.isTransient = true;
+            throw readErr;
+          }
+          if (step.done) break;
+          total += step.value.byteLength;
+          if (total > maxBytes) {
+            await reader.cancel().catch(() => {});
+            throw new Error(`${url} exceeded byte limit`);
+          }
+          chunks.push(step.value);
+        }
+        const merged = new Uint8Array(total);
+        let off = 0;
+        for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
+        rawText = new TextDecoder().decode(merged);
       }
-      const merged = new Uint8Array(total);
-      let off = 0;
-      for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
-      return JSON.parse(new TextDecoder().decode(merged));
+      return JSON.parse(rawText);
     }
 
     // Validated ID-based replay tied strictly to live ord:
-    //   - Always fetches /r/inscription/:id and /r/blockhash/:h fresh (never trusts stale metadata across reorgs!).
-    //   - Supports fast verified checkpoint recovery when encountering a confirmed inline checkpoint block.
-    async function replayVerifiedChainFromOrd(genesisId, tipId) {
+    //   - Always replays from Genesis unless an EXPLICIT out-of-band pinned trustedCheckpoint matches (never self-certified!).
+    //   - Supports BOTH inline and multi-page pinned checkpoints (fetches & Merkle-verifies companion pages).
+    //   - Always fetches /r/inscription/:id and active-chain /r/blockhash/:h fresh; checks expectedConfirmedHashes on incumbent revalidation.
+    async function replayVerifiedChainFromOrd(genesisId, tipId, { expectedConfirmedHashes = null } = {}) {
       if (!E.isValidInscriptionId(genesisId)) throw new Error('Invalid genesis ID');
       if (!E.isValidInscriptionId(tipId)) throw new Error('Invalid tip ID');
 
@@ -543,6 +562,7 @@
       }
 
       const freshHashes = new Map();
+      const observedConfHashes = new Map();
       const rawChain = [];
       const visited = new Set([genesisId]);
       let cursor = tipId;
@@ -557,7 +577,6 @@
         if (rawChain.length >= MAX_SYNC_DEPTH) throw new Error('Max sync depth exceeded');
         visited.add(cursor);
 
-        // Always fetch /r/inscription/:id FRESH so a Bitcoin reorg invalidates orphaned confirmations!
         const cachedBody = contentBodyCache.get(cursor);
         const [blkBody, meta] = cachedBody
           ? [cachedBody, await fetchJson(`/r/inscription/${cursor}`)]
@@ -571,7 +590,6 @@
         if (typeof blkBody?.prev !== 'string' || !E.isValidInscriptionId(blkBody.prev)) {
           throw new Error(`Invalid prev in ${cursor}`);
         }
-        // Verify active-chain blockhash for BOTH btcRef.h AND the block's confirmation height meta.height!
         const refH = blkBody.btcRef.h;
         if (!freshHashes.has(refH)) {
           const refHash = await fetchJson(`/r/blockhash/${refH}`);
@@ -587,36 +605,53 @@
           }
           freshHashes.set(meta.height, confHash.toLowerCase());
         }
+        const activeConfHash = freshHashes.get(meta.height);
+        // If revalidating an incumbent tip, detect a Bitcoin reorg that changed its containing block hash!
+        if (expectedConfirmedHashes && expectedConfirmedHashes.has(cursor)) {
+          if (expectedConfirmedHashes.get(cursor) !== activeConfHash) {
+            throw new Error(`Incumbent block ${cursor} confirmation block #${meta.height} was reorged`);
+          }
+        }
+        observedConfHashes.set(cursor, activeConfHash);
 
         const blk = { ...blkBody, id: cursor };
-        // Fast verified checkpoint boot for long chains: stop walking back at the newest confirmed inline checkpoint!
-        if (
-          blk.checkpoint &&
-          blk.checkpoint.mode === 'inline' &&
-          blk.h % PARAMS.checkpointInterval === 0 &&
-          blk.checkpoint.page0?.genesisId === genesisId &&
-          blk.checkpoint.page0?.header?.target
-        ) {
-          const cpTarget = BigInt(blk.checkpoint.page0.header.target);
-          if (
-            E.meetsWorkTarget(blk, cpTarget) &&
-            E.meetsTarget(blk.id, cpTarget) &&
-            freshHashes.get(refH) === blk.btcRef.hash.toLowerCase() &&
-            refH < meta.height &&
-            meta.height - refH <= PARAMS.btcRefMaxLag
-          ) {
-            const restored = E.importCheckpoint(blk.checkpoint, {
-              tipId: blk.id,
-              tipBtcHeight: meta.height,
-              tipInscriptionNumber: meta.number,
-              expectedStateRoot: blk.stateRoot,
-            });
-            E.assertStateConservation(restored, PARAMS);
-            contentBodyCache.set(cursor, blkBody);
-            checkpointBoot = restored;
-            checkpointEntry = { block: blk, meta };
-            break;
+        // ONLY boot from a checkpoint whose (blockId, stateRoot) was EXPLICITLY pinned out-of-band!
+        if (pinnedTrustedCheckpoint && cursor === pinnedTrustedCheckpoint.blockId) {
+          if (blk.stateRoot !== pinnedTrustedCheckpoint.stateRoot.toLowerCase()) {
+            throw new Error(`Pinned checkpoint ${cursor} stateRoot mismatch`);
           }
+          const cp = blk.checkpoint;
+          if (!cp || cp.v !== 1 || !cp.page0 || cp.page0.genesisId !== genesisId) {
+            throw new Error(`Pinned checkpoint ${cursor} lacks valid checkpoint payload`);
+          }
+          const bootHeader = {
+            tipId: blk.id,
+            tipBtcHeight: meta.height,
+            tipInscriptionNumber: meta.number,
+            expectedStateRoot: pinnedTrustedCheckpoint.stateRoot.toLowerCase(),
+          };
+          let restored;
+          if (cp.mode === 'inline') {
+            restored = E.importCheckpoint(cp, bootHeader);
+          } else if (cp.mode === 'paged') {
+            const companionIds = pinnedTrustedCheckpoint.pageIds ?? cp.pageIds ?? [];
+            if (!Array.isArray(companionIds) || companionIds.length !== cp.totalPages - 1) {
+              throw new Error(`Pinned paged checkpoint ${cursor} missing companion pageIds`);
+            }
+            const pages = [cp.page0];
+            for (const pid of companionIds) {
+              if (!E.isValidInscriptionId(pid)) throw new Error(`Invalid companion page ID: ${pid}`);
+              pages.push(await fetchJson(`/content/${pid}`));
+            }
+            restored = E.importCheckpointPages(pages, bootHeader);
+          } else {
+            throw new Error(`Unsupported checkpoint mode: ${cp.mode}`);
+          }
+          E.assertStateConservation(restored, PARAMS);
+          contentBodyCache.set(cursor, blkBody);
+          checkpointBoot = restored;
+          checkpointEntry = { block: blk, meta };
+          break;
         }
 
         rawChain.push({ blk, blkBody, meta });
@@ -625,7 +660,8 @@
       if (!checkpointBoot && cursor !== genesisId) throw new Error('Ancestry did not reach pinned genesis');
       rawChain.reverse();
 
-      let s = checkpointBoot ?? E.createGenesisState(genesisId, PARAMS, genesisMeta.height);
+      const bootState = checkpointBoot ?? E.createGenesisState(genesisId, PARAMS, genesisMeta.height);
+      let s = E.cloneState(bootState);
       const blocks = checkpointEntry ? [checkpointEntry] : [];
       for (const { blk, blkBody, meta } of rawChain) {
         const ctx = {
@@ -637,7 +673,13 @@
         contentBodyCache.set(blk.id, blkBody);
         blocks.push({ block: blk, meta });
       }
-      return { state: s, blocks, genesisBtcHeight: genesisMeta.height };
+      return {
+        state: s,
+        bootState,
+        blocks,
+        genesisBtcHeight: genesisMeta.height,
+        confirmedBlockHashes: observedConfHashes,
+      };
     }
 
     function enqueueTipHint(tipId) {
@@ -656,17 +698,21 @@
           queuedHintIds.delete(tipId);
           try {
             const candidate = await replayVerifiedChainFromOrd(genesisIdPinned, tipId);
-            // Revalidate incumbent Ord tip fresh against live ord; NEVER discard incumbent on transient fetch error!
+            // Revalidate incumbent Ord tip fresh against live ord (checking its observed confirmation block hashes!).
+            // NEVER demote the incumbent on a transient network/body-stream/timeout error!
             let incumbentValid = false;
             if (ordTipId) {
               try {
-                const rechecked = await replayVerifiedChainFromOrd(genesisIdPinned, ordTipId);
+                const rechecked = await replayVerifiedChainFromOrd(genesisIdPinned, ordTipId, {
+                  expectedConfirmedHashes: ordConfirmedBlockHashes,
+                });
                 ordState = rechecked.state;
+                ordBootState = rechecked.bootState;
                 ordVerifiedBlocks = rechecked.blocks;
+                ordConfirmedBlockHashes = rechecked.confirmedBlockHashes;
                 incumbentValid = true;
               } catch (incErr) {
                 if (incErr?.isTransient) {
-                  // Transient network/timeout error re-checking incumbent: keep incumbent and stop!
                   continue;
                 }
                 incumbentValid = false;
@@ -674,8 +720,10 @@
             }
             if (!incumbentValid || !ordState || E.compareChainTips(candidate.state, ordState) > 0) {
               ordState = candidate.state;
+              ordBootState = candidate.bootState;
               ordVerifiedBlocks = candidate.blocks;
               ordGenesisBtcHeight = candidate.genesisBtcHeight;
+              ordConfirmedBlockHashes = candidate.confirmedBlockHashes;
               ordTipId = tipId;
               simActive = false;
               ordBtcHeight = Math.max(ordBtcHeight, ordState.tipBtcHeight);
@@ -785,11 +833,14 @@
         simBtcHeight = ordBtcHeight;
         genesisIdPinned = tipInfo.genesisId;
         isSimulatedSeed = Boolean(tipInfo.simulated);
+        pinnedTrustedCheckpoint = tipInfo.trustedCheckpoint ?? null;
 
-        const { state, blocks, genesisBtcHeight } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
+        const { state, bootState, blocks, genesisBtcHeight, confirmedBlockHashes } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
         ordState = state;
+        ordBootState = bootState;
         ordVerifiedBlocks = blocks;
         ordGenesisBtcHeight = genesisBtcHeight;
+        ordConfirmedBlockHashes = confirmedBlockHashes;
         ordTipId = tipInfo.tipId;
         inspectedHeight = state.height;
         invalidateProjection();
@@ -1339,8 +1390,10 @@
         const targetEntry = blocks.find((e) => e.block.h === 3) ?? blocks[blocks.length - 1];
         if (!targetEntry) return;
         const idx = blocks.indexOf(targetEntry);
-        let pre = E.createGenesisState(activeState().genesisId, PARAMS, ordGenesisBtcHeight);
-        for (let i = 0; i < idx; i++) {
+        let pre = ordBootState ? E.cloneState(ordBootState) : E.createGenesisState(activeState().genesisId, PARAMS, ordGenesisBtcHeight);
+        const startIdx = pre.height > 0 && blocks[0]?.block?.h === pre.height ? 1 : 0;
+        if (idx < startIdx) return;
+        for (let i = startIdx; i < idx; i++) {
           const e = blocks[i];
           pre = E.applyBlock(
             pre,

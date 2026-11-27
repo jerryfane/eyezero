@@ -338,8 +338,9 @@
     let ordBtcHeight = 924_103;
     let ordTipId = null;
     let pinnedTrustedCheckpoint = null; // optional out-of-band pinned { blockId, stateRoot, pageIds? }
-    // Track confirmation blockhash observed for each accepted Ord block so reorged tips are detected!
-    let ordConfirmedBlockHashes = new Map();
+    // Session-wide map of blockId -> first observed active /r/blockhash/<meta.height>.
+    // Applied symmetrically to EVERY replay (incumbent and candidate) so fork choice is order-independent.
+    const observedBlockConfHashes = new Map();
     // Cache ONLY immutable inscription content bodies (/content/:id), NEVER mutable confirmation metadata!
     const contentBodyCache = new Map();
 
@@ -551,8 +552,8 @@
     // Validated ID-based replay tied strictly to live ord:
     //   - Always replays from Genesis unless an EXPLICIT out-of-band pinned trustedCheckpoint matches (never self-certified!).
     //   - Supports BOTH inline and multi-page pinned checkpoints (fetches & Merkle-verifies companion pages).
-    //   - Always fetches /r/inscription/:id and active-chain /r/blockhash/:h fresh; checks expectedConfirmedHashes on incumbent revalidation.
-    async function replayVerifiedChainFromOrd(genesisId, tipId, { expectedConfirmedHashes = null } = {}) {
+    //   - Always fetches /r/inscription/:id and active-chain /r/blockhash/:h fresh and enforces observedBlockConfHashes symmetrically on every replay.
+    async function replayVerifiedChainFromOrd(genesisId, tipId) {
       if (!E.isValidInscriptionId(genesisId)) throw new Error('Invalid genesis ID');
       if (!E.isValidInscriptionId(tipId)) throw new Error('Invalid tip ID');
 
@@ -606,11 +607,10 @@
           freshHashes.set(meta.height, confHash.toLowerCase());
         }
         const activeConfHash = freshHashes.get(meta.height);
-        // If revalidating an incumbent tip, detect a Bitcoin reorg that changed its containing block hash!
-        if (expectedConfirmedHashes && expectedConfirmedHashes.has(cursor)) {
-          if (expectedConfirmedHashes.get(cursor) !== activeConfHash) {
-            throw new Error(`Incumbent block ${cursor} confirmation block #${meta.height} was reorged`);
-          }
+        // Symmetric reorg check applied to EVERY replay (incumbent and candidate alike):
+        // once a validated block is observed at a confirmation block hash, a later hash change at that height rejects it.
+        if (observedBlockConfHashes.has(cursor) && observedBlockConfHashes.get(cursor) !== activeConfHash) {
+          throw new Error(`Block ${cursor} confirmation block #${meta.height} hash changed (reorg detected)`);
         }
         observedConfHashes.set(cursor, activeConfHash);
 
@@ -634,7 +634,7 @@
           if (cp.mode === 'inline') {
             restored = E.importCheckpoint(cp, bootHeader);
           } else if (cp.mode === 'paged') {
-            const companionIds = pinnedTrustedCheckpoint.pageIds ?? cp.pageIds ?? [];
+            const companionIds = pinnedTrustedCheckpoint.pageIds ?? [];
             if (!Array.isArray(companionIds) || companionIds.length !== cp.totalPages - 1) {
               throw new Error(`Pinned paged checkpoint ${cursor} missing companion pageIds`);
             }
@@ -673,12 +673,14 @@
         contentBodyCache.set(blk.id, blkBody);
         blocks.push({ block: blk, meta });
       }
+      for (const [id, hash] of observedConfHashes) {
+        if (!observedBlockConfHashes.has(id)) observedBlockConfHashes.set(id, hash);
+      }
       return {
         state: s,
         bootState,
         blocks,
         genesisBtcHeight: genesisMeta.height,
-        confirmedBlockHashes: observedConfHashes,
       };
     }
 
@@ -698,18 +700,15 @@
           queuedHintIds.delete(tipId);
           try {
             const candidate = await replayVerifiedChainFromOrd(genesisIdPinned, tipId);
-            // Revalidate incumbent Ord tip fresh against live ord (checking its observed confirmation block hashes!).
+            // Revalidate incumbent Ord tip fresh against live ord using the same symmetric confirmation-hash rule.
             // NEVER demote the incumbent on a transient network/body-stream/timeout error!
             let incumbentValid = false;
             if (ordTipId) {
               try {
-                const rechecked = await replayVerifiedChainFromOrd(genesisIdPinned, ordTipId, {
-                  expectedConfirmedHashes: ordConfirmedBlockHashes,
-                });
+                const rechecked = await replayVerifiedChainFromOrd(genesisIdPinned, ordTipId);
                 ordState = rechecked.state;
                 ordBootState = rechecked.bootState;
                 ordVerifiedBlocks = rechecked.blocks;
-                ordConfirmedBlockHashes = rechecked.confirmedBlockHashes;
                 incumbentValid = true;
               } catch (incErr) {
                 if (incErr?.isTransient) {
@@ -723,7 +722,6 @@
               ordBootState = candidate.bootState;
               ordVerifiedBlocks = candidate.blocks;
               ordGenesisBtcHeight = candidate.genesisBtcHeight;
-              ordConfirmedBlockHashes = candidate.confirmedBlockHashes;
               ordTipId = tipId;
               simActive = false;
               ordBtcHeight = Math.max(ordBtcHeight, ordState.tipBtcHeight);
@@ -835,12 +833,11 @@
         isSimulatedSeed = Boolean(tipInfo.simulated);
         pinnedTrustedCheckpoint = tipInfo.trustedCheckpoint ?? null;
 
-        const { state, bootState, blocks, genesisBtcHeight, confirmedBlockHashes } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
+        const { state, bootState, blocks, genesisBtcHeight } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
         ordState = state;
         ordBootState = bootState;
         ordVerifiedBlocks = blocks;
         ordGenesisBtcHeight = genesisBtcHeight;
-        ordConfirmedBlockHashes = confirmedBlockHashes;
         ordTipId = tipInfo.tipId;
         inspectedHeight = state.height;
         invalidateProjection();
@@ -1392,7 +1389,10 @@
         const idx = blocks.indexOf(targetEntry);
         let pre = ordBootState ? E.cloneState(ordBootState) : E.createGenesisState(activeState().genesisId, PARAMS, ordGenesisBtcHeight);
         const startIdx = pre.height > 0 && blocks[0]?.block?.h === pre.height ? 1 : 0;
-        if (idx < startIdx) return;
+        if (idx < startIdx) {
+          showMsg('mev-result', 'Zero-MEV shuffle requires at least one post-checkpoint block.');
+          return;
+        }
         for (let i = startIdx; i < idx; i++) {
           const e = blocks[i];
           pre = E.applyBlock(

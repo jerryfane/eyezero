@@ -117,6 +117,10 @@ Options:
   --checkpoint-interval <n>            Override checkpoint interval (>= 1)
   --fee-rate <sat/vB>                  Bitcoin fee rate (default: 3)
   --wait-confirm                       Wait for ord confirmation before publishing #i0-blk hint to Entmoot
+  --announce <block_id>                Verify an existing block is confirmed on ord and publish #i0-blk to Entmoot
+  --trusted-checkpoint-id <block_id>   Optional out-of-band pinned checkpoint block ID (requires --trusted-checkpoint-root)
+  --trusted-checkpoint-root <64-hex>   Expected stateRoot of the pinned checkpoint block
+  --trusted-checkpoint-pages <id,...>  Comma-separated companion page inscription IDs for a paged pinned checkpoint
   --sync-only                          Verify best chain from ord and exit without mining
   --dry-run                            Grind & verify locally without broadcasting to Bitcoin`);
 }
@@ -475,7 +479,7 @@ export async function syncChainFromOrd({
       if (cp.mode === 'inline') {
         restored = importCheckpoint(cp, bootHeader);
       } else if (cp.mode === 'paged') {
-        const companionIds = trustedCheckpoint.pageIds ?? cp.pageIds ?? [];
+        const companionIds = trustedCheckpoint.pageIds ?? [];
         if (!Array.isArray(companionIds) || companionIds.length !== cp.totalPages - 1) {
           throw new Error(
             `Pinned paged checkpoint ${cursor} requires ${cp.totalPages - 1} companion pageIds (got ${companionIds?.length ?? 0})`,
@@ -663,7 +667,15 @@ export async function runMinerOnce(opts) {
     } catch {}
   }
 
-  const trustedCheckpoint = opts['trusted-checkpoint-id']
+  const hasCpFlag = Boolean(
+    opts['trusted-checkpoint-id'] || opts['trusted-checkpoint-root'] || opts['trusted-checkpoint-pages'],
+  );
+  if (hasCpFlag && (!opts['trusted-checkpoint-id'] || !opts['trusted-checkpoint-root'])) {
+    throw new Error(
+      'Partial trusted checkpoint options: --trusted-checkpoint-id and --trusted-checkpoint-root must both be provided',
+    );
+  }
+  const trustedCheckpoint = hasCpFlag
     ? {
         blockId: opts['trusted-checkpoint-id'],
         stateRoot: opts['trusted-checkpoint-root'],
@@ -934,6 +946,7 @@ export async function runMinerOnce(opts) {
 
     // Only announce #i0-blk to Entmoot after ord confirms the inscription (--wait-confirm)!
     if (opts['entmoot-group'] && opts['wait-confirm']) {
+      let lastWaitErr = null;
       for (let i = 0; i < 120; i++) {
         try {
           const meta = await ordJson(ordUrl, `/r/inscription/${mined.inscriptionId}`);
@@ -945,10 +958,16 @@ export async function runMinerOnce(opts) {
               announcement,
             });
             result.announced = true;
+            lastWaitErr = null;
             break;
           }
-        } catch {}
+        } catch (err) {
+          lastWaitErr = err?.message || String(err);
+        }
         await new Promise((r) => setTimeout(r, 5000));
+      }
+      if (!result.announced) {
+        result.announceError = lastWaitErr ?? 'Timed out waiting for ord confirmation before announcing #i0-blk';
       }
     }
   }

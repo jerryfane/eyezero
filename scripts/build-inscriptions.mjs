@@ -2,15 +2,15 @@
 // Builds self-contained Bitcoin inscription bundles for OrdStudio or direct `ord` inscription:
 //
 //   Demo mode (default):
-//     node scripts/build-inscriptions.mjs [--no-minify] [--out dist/ordstudio]
+//     node scripts/build-inscriptions.mjs [--out dist/ordstudio]
 //     Produces dist/ordstudio/ with g-rules.js, index.html, entmoot-lite.js, entmoot-config.json,
 //     3 signed dual-PoW demo blocks (blocks/b1..b3.json + tip.json), ordstudio.json, and dist/chain-overrides.json.
 //
 //   Signet production mode:
-//     node scripts/build-inscriptions.mjs --network signet [--genesis <id>] [--initial-tip <id>]
-//       [--rules-id <id>] [--entmoot-js-id <id>] [--entmoot-cfg-id <id>] [--no-minify] [--out dist/signet]
-//     Produces dist/signet/ with ONLY the 5 production files (genesis.json, g-rules.js, entmoot-lite.js,
-//     entmoot-config.json, index.html) + ordstudio.json — zero demo personas, zero fake blocks, minified & syntax-verified.
+//     node scripts/build-inscriptions.mjs --network signet (--entmoot-config <path> | --entmoot-cfg-id <id> | --offline)
+//       [--genesis <id>] [--initial-tip <id>] [--rules-id <id>] [--entmoot-js-id <id>] [--out dist/signet]
+//     Produces dist/signet/ with lossless Brotli-ready production files (exact unaltered JS/CSS/HTML + compact JSON),
+//     zero demo personas, zero fake blocks, and explicit Entmoot config (never silently shipping the demo invite).
 
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -34,7 +34,6 @@ import {
   sha256Hex,
   signTx,
 } from '../engine/src/index.js';
-import { minifyHtml, minifyJs } from './minify.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const ALLOWED_VALUE_FLAGS = new Set([
@@ -49,18 +48,19 @@ const ALLOWED_VALUE_FLAGS = new Set([
 ]);
 
 function parseBuildArgs(argv) {
-  const opts = { network: 'demo', minify: true };
+  const opts = { network: 'demo', offline: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--no-minify') { opts.minify = false; continue; }
-    if (a === '--minify') { opts.minify = true; continue; }
+    if (a === '--offline') { opts.offline = true; continue; }
     if (a.startsWith('--')) {
       const k = a.slice(2);
       if (!ALLOWED_VALUE_FLAGS.has(k)) {
         throw new Error(`Unknown option: --${k}`);
       }
       const v = argv[++i];
-      if (v === undefined || v.startsWith('--')) throw new Error(`Option --${k} requires a value`);
+      if (v === undefined || v.trim() === '' || v.startsWith('--')) {
+        throw new Error(`Option --${k} requires a non-empty value`);
+      }
       opts[k] = v;
       continue;
     }
@@ -70,15 +70,26 @@ function parseBuildArgs(argv) {
     throw new Error(`Unsupported --network "${opts.network}" (supported: demo, signet)`);
   }
   for (const idKey of ['genesis', 'initial-tip', 'rules-id', 'entmoot-js-id', 'entmoot-cfg-id']) {
-    if (opts[idKey] && !isValidInscriptionId(opts[idKey])) {
+    if (idKey in opts && !isValidInscriptionId(opts[idKey])) {
       throw new Error(`Invalid inscription ID for --${idKey}: ${opts[idKey]}`);
     }
   }
-  if (opts['initial-tip'] && !opts.genesis) {
+  if ('initial-tip' in opts && !('genesis' in opts)) {
     throw new Error('--initial-tip requires --genesis');
   }
-  if (opts['initial-tip'] && opts['initial-tip'] !== opts.genesis && !isValidBlockInscriptionId(opts['initial-tip'])) {
+  if ('initial-tip' in opts && opts['initial-tip'] !== opts.genesis && !isValidBlockInscriptionId(opts['initial-tip'])) {
     throw new Error(`Invalid non-genesis --initial-tip (must end in i0): ${opts['initial-tip']}`);
+  }
+  if (opts.network !== 'demo') {
+    const entmootChoices = Number(opts.offline) + Number('entmoot-config' in opts) + Number('entmoot-cfg-id' in opts);
+    if (entmootChoices === 0) {
+      throw new Error(
+        'Signet build requires one of --entmoot-config <path>, --entmoot-cfg-id <id>, or --offline (refusing to silently bundle the 64-use demo invite)',
+      );
+    }
+    if (entmootChoices > 1) {
+      throw new Error('Specify only one of --entmoot-config, --entmoot-cfg-id, or --offline');
+    }
   }
   return opts;
 }
@@ -122,20 +133,18 @@ for (const file of ORDER) {
   parts.push(src.trim());
   parts.push('');
 }
-const rulesRaw = parts.join('\n');
-const rulesOut = opts.minify ? minifyJs(rulesRaw) : rulesRaw;
+const rulesOut = parts.join('\n');
 checkJsSyntax(rulesOut, 'g-rules.js');
 writeFileSync(join(OUT, 'g-rules.js'), rulesOut, 'utf8');
 // Live ES module import check (convert filesystem path via pathToFileURL so `#` in paths works cleanly).
 await import(`${pathToFileURL(join(OUT, 'g-rules.js')).href}?check=${Date.now()}`);
 
-// 2. Process entmoot-lite.js and entmoot-config.json.
-const entmootRaw = readFileSync(join(ROOT, 'ui', 'entmoot-lite.js'), 'utf8');
-const entmootOut = opts.minify ? minifyJs(entmootRaw) : entmootRaw;
+// 2. Process entmoot-lite.js and entmoot-config.json (exact JS; compact lossless JSON).
+const entmootOut = readFileSync(join(ROOT, 'ui', 'entmoot-lite.js'), 'utf8');
 checkJsSyntax(entmootOut, 'entmoot-lite.js');
 writeFileSync(join(OUT, 'entmoot-lite.js'), entmootOut, 'utf8');
 
-const emitLocalEntmootCfg = isDemo || !opts['entmoot-cfg-id'];
+const emitLocalEntmootCfg = isDemo ? !opts['entmoot-cfg-id'] : Boolean(opts['entmoot-config']);
 let entmootCfgOut = null;
 if (emitLocalEntmootCfg) {
   const entmootSrcPath = opts['entmoot-config']
@@ -149,12 +158,20 @@ if (emitLocalEntmootCfg) {
         addr: cfgRaw.allowed_multiaddrs[0],
         invite: cfgRaw,
       };
-  entmootCfgOut = opts.minify ? JSON.stringify(entmootCfgObj) : JSON.stringify(entmootCfgObj, null, 2);
+  entmootCfgOut = JSON.stringify(entmootCfgObj);
   writeFileSync(join(OUT, 'entmoot-config.json'), entmootCfgOut, 'utf8');
+} else {
+  // Remove any stale entmoot-config.json left over from a prior build in the same directory so disk matches manifest.
+  rmSync(join(OUT, 'entmoot-config.json'), { force: true });
 }
 
-// 3. Configure and minify ui/index.html.
+// 3. Configure ui/index.html (lossless source; Brotli-11 compresses on inscription).
 let htmlSrc = readFileSync(join(ROOT, 'ui', 'index.html'), 'utf8');
+const entmootConfigPath = opts.offline
+  ? null
+  : opts['entmoot-cfg-id']
+    ? `/content/${opts['entmoot-cfg-id']}`
+    : '/content/local:entmoot-config.json';
 const bootConfig = isDemo
   ? {
       network: 'demo',
@@ -163,7 +180,7 @@ const bootConfig = isDemo
       initialTipId: null,
       trustedCheckpoint: null,
       tipConfigPath: '/content/local:blocks/tip.json',
-      entmootConfigPath: opts['entmoot-cfg-id'] ? `/content/${opts['entmoot-cfg-id']}` : '/content/local:entmoot-config.json',
+      entmootConfigPath,
     }
   : {
       network: opts.network,
@@ -172,7 +189,7 @@ const bootConfig = isDemo
       initialTipId: opts['initial-tip'] ?? null,
       trustedCheckpoint: null,
       tipConfigPath: null,
-      entmootConfigPath: opts['entmoot-cfg-id'] ? `/content/${opts['entmoot-cfg-id']}` : '/content/local:entmoot-config.json',
+      entmootConfigPath,
     };
 
 htmlSrc = htmlSrc.replace(
@@ -185,7 +202,7 @@ if (opts['rules-id']) {
 if (opts['entmoot-js-id']) {
   htmlSrc = htmlSrc.replaceAll('/content/local:entmoot-lite.js', `/content/${opts['entmoot-js-id']}`);
 }
-const htmlOut = opts.minify ? minifyHtml(htmlSrc) : htmlSrc;
+const htmlOut = htmlSrc;
 for (const m of htmlOut.matchAll(/<script\s+type="module">([\s\S]*?)<\/script>/g)) {
   checkJsSyntax(m[1], 'index.html <script type="module">');
 }
@@ -223,7 +240,7 @@ if (!isDemo) {
   ];
   let totalBr = 0;
   let totalVb = 0;
-  console.log(`Built ${OUT} (network=${opts.network}, minify=${opts.minify}):`);
+  console.log(`Built ${OUT} (network=${opts.network}, offline=${opts.offline}):`);
   for (const [name, content] of report) {
     const rawB = Buffer.byteLength(content, 'utf8');
     const brB = brotliLen(content);
@@ -352,7 +369,7 @@ writeFileSync(join(OUT, 'ordstudio.json'), JSON.stringify({ ordstudio: 1, files:
 writeFileSync(join(ROOT, 'dist', 'chain-overrides.json'), JSON.stringify(overrides, null, 2), 'utf8');
 
 console.log(
-  `Built ${OUT} (network=demo, minify=${opts.minify}): ` +
+  `Built ${OUT} (network=demo): ` +
   `g-rules.js=${rulesOut.length} B (br ${brotliLen(rulesOut)} B), ` +
   `index.html=${htmlOut.length} B (br ${brotliLen(htmlOut)} B), ` +
   `entmoot-lite.js=${entmootOut.length} B (br ${brotliLen(entmootOut)} B), ` +

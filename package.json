@@ -17,7 +17,7 @@
     "test:regtest:full": "node test/regtest-full.mjs",
     "test:entmoot": "node test/two-tab-entmoot.mjs",
     "build:inscriptions": "node scripts/build-inscriptions.mjs",
-    "build:signet": "node scripts/build-inscriptions.mjs --network signet",
+    "build:signet": "node scripts/build-inscriptions.mjs --network signet --offline",
     "docs:build": "mdbook build docs"
   }
 }

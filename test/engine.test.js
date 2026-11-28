@@ -1,7 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import vm from 'node:vm';
 import {
   I0_TOKEN_ID,
   UNIT,
@@ -41,11 +40,10 @@ import {
   signTx,
 } from '../engine/src/index.js';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runMinerOnce, syncChainFromOrd } from '../miner/src/cli.mjs';
-import { minifyCss, minifyHtml, minifyJs } from '../scripts/minify.mjs';
 
 const GENESIS_ID = '0000000000000000000000000000000000000000000000000000000000000001i0';
 const GENESIS_BTC_H = 900_000;
@@ -758,7 +756,7 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
   });
 });
 
-describe('Signet production parameters and inscription minifier', () => {
+describe('Signet production parameters and inscription build CLI', () => {
   it('V1_SIGNET_PARAMS inherits mainnet monetary safety with Signet PoW/checkpoint cadence', () => {
     assert.equal(V1_SIGNET_PARAMS.powMinBits, 16);
     assert.equal(V1_SIGNET_PARAMS.retargetInterval, 18);
@@ -772,101 +770,6 @@ describe('Signet production parameters and inscription minifier', () => {
 
     const g = createGenesisState(GENESIS_ID, V1_SIGNET_PARAMS, 250_000);
     assert.equal(nextTarget(g, V1_SIGNET_PARAMS), bitsToTarget(16));
-  });
-
-  it('minifyJs, minifyCss, and minifyHtml preserve semantics across 250 seeded combinations', () => {
-    // Deterministic PRNG (Mulberry32)
-    let seed = 0x10e2e0;
-    const rand = () => {
-      seed = (seed + 0x6d2b79f5) | 0;
-      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-    const pick = (arr) => arr[Math.floor(rand() * arr.length)];
-
-    const strParts = [
-      '"hello // not a comment /* nope */"',
-      "'single \\' quote /not-regex/'",
-      '`tpl ${"a // b"} and ${((x) => x.replace(/foo}/g, "bar"))("foo}")}`',
-    ];
-    const exprParts = [
-      '((a) => a++ / 2)(8)',
-      '((s) => /^\\d+(?:\\.\\d+)?$/.test(s))("12.34")',
-      '((a, b) => (a + b) / 2)(10, 6)',
-      'return /abc\\/def/i.test("ABC/DEF")',
-    ];
-
-    const t0 = performance.now();
-    for (let i = 0; i < 250; i++) {
-      const s1 = pick(strParts);
-      const s2 = pick(strParts);
-      const e1 = pick(exprParts.slice(0, 3));
-      const src = `
-        // leading line comment ${i}
-        function run_${i}() {
-          const a = ${s1} /* inline block comment */
-          const b = ${s2}
-          const c = ${e1}
-          const ok = /x[\\/]y/.test("x/y") // trailing comment
-          return [a, b, c, ok, (() => { ${exprParts[3]} })()]
-        }
-        run_${i}()
-      `;
-      const min = minifyJs(src);
-      assert.ok(min.length < src.length, `Expected JS minification to shrink case ${i}`);
-      const ctx = vm.createContext({});
-      const origRes = vm.runInContext(src, ctx);
-      const minRes = vm.runInContext(min, ctx);
-      assert.deepEqual(minRes, origRes, `Semantic mismatch on seeded JS case ${i}`);
-    }
-    assert.ok(performance.now() - t0 < 5000, 'Seeded minifyJs pass must stay fast and linear');
-
-    const cssIn = `
-      /* Header rule */
-      .badge::after { content: "a : b ; { } /* keep */"; color: #5ad8e6; }
-      .toolbar :focus { outline: 1px solid #5ad8e6; }
-      .a > .b { margin: 0 12px; }
-    `;
-    const cssOut = minifyCss(cssIn);
-    assert.ok(cssOut.includes('content:"a : b ; { } /* keep */"'));
-    assert.ok(cssOut.includes('.toolbar :focus{outline:1px solid #5ad8e6}'));
-    assert.ok(!cssOut.includes('Header rule'));
-    assert.ok(cssOut.includes('.a>.b{margin:0 12px}'));
-
-    // Multi-line block comments act as line terminators in JS (ASI) and single-line comments must not fuse operators.
-    const asiSrc = '(() => { return/*\n*/1 })()';
-    assert.equal(vm.runInNewContext(minifyJs(asiSrc)), undefined);
-    const opSrc = '((a, b) => a +/*keep space*/+ b)(3, 4)';
-    assert.equal(vm.runInNewContext(minifyJs(opSrc)), 7);
-
-    const htmlIn = `<!DOCTYPE html>
-<html>
-<head>
-  <!-- remove me -->
-  <style>
-    /* css */
-    body { color: #fff; }
-  </style>
-</head>
-<body>
-  <p>Hello
-  world</p>
-  <p><span>foo</span> <span>bar</span></p>
-  <script id="cfg" type="application/json">{ "net": "signet", "demoMode": false }</script>
-  <script>
-    // comment
-    const x = 1 + 2;
-  </script>
-</body>
-</html>`;
-    const htmlOut = minifyHtml(htmlIn);
-    assert.ok(!htmlOut.includes('remove me'));
-    assert.ok(htmlOut.includes('<p>Hello world</p>'));
-    assert.ok(htmlOut.includes('<span>foo</span> <span>bar</span>'));
-    assert.ok(htmlOut.includes('{"net":"signet","demoMode":false}'));
-    assert.ok(htmlOut.includes('<style>body{color:#fff}</style>'));
-    assert.ok(htmlOut.length < htmlIn.length);
   });
 
   it('Signet miner CLI uses V1_SIGNET_PARAMS matching the built Signet UI', async () => {
@@ -938,36 +841,53 @@ describe('Signet production parameters and inscription minifier', () => {
     }
   });
 
-  it('build-inscriptions.mjs validates flags, handles # in --out paths, and omits local entmoot-config when pinned', () => {
+  it('build-inscriptions.mjs validates flags, requires explicit Signet Entmoot choice, handles # paths, and cleans stale files', () => {
     const tmpRoot = mkdtempSync(join(tmpdir(), 'eyezero-build-test-'));
     const validId = '0'.repeat(63) + '1i0';
     const validI1 = '0'.repeat(63) + '2i1';
     try {
       // Unknown flag rejected
       assert.throws(
-        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesiss', validId], { stdio: 'pipe' }),
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--genesiss', validId], { stdio: 'pipe' }),
         /Unknown option: --genesiss/,
+      );
+      // Empty supplied pin values rejected
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--genesis', ''], { stdio: 'pipe' }),
+        /requires a non-empty value/,
+      );
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--initial-tip', ''], { stdio: 'pipe' }),
+        /requires a non-empty value/,
+      );
+      // Signet refuses to silently ship the 64-use demo invite
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--out', join(tmpRoot, 'no-cfg')], { stdio: 'pipe' }),
+        /refusing to silently bundle the 64-use demo invite/,
       );
       // Non-genesis i1 initial-tip rejected
       assert.throws(
         () => execFileSync(
           process.execPath,
-          ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesis', validId, '--initial-tip', validI1],
+          ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--genesis', validId, '--initial-tip', validI1],
           { stdio: 'pipe' },
         ),
         /must end in i0/,
       );
-      // Path with '#' works and pinned --entmoot-cfg-id omits local entmoot-config.json
+      // Path with '#' works, explicit --entmoot-config writes entmoot-config.json, and rebuilding with --entmoot-cfg-id removes stale entmoot-config.json
       const hashOut = join(tmpRoot, 'signet#dry');
+      const prodCfgPath = join(tmpRoot, 'prod-entmoot.json');
+      writeFileSync(prodCfgPath, JSON.stringify({ groupId: '11'.repeat(32), addr: '/ip4/127.0.0.1/udp/9/webrtc-direct', invite: {} }));
       execFileSync(
         process.execPath,
-        [
-          'scripts/build-inscriptions.mjs',
-          '--network', 'signet',
-          '--genesis', validId,
-          '--entmoot-cfg-id', validId,
-          '--out', hashOut,
-        ],
+        ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesis', validId, '--entmoot-config', prodCfgPath, '--out', hashOut],
+        { stdio: 'pipe' },
+      );
+      assert.equal(existsSync(join(hashOut, 'entmoot-config.json')), true);
+
+      execFileSync(
+        process.execPath,
+        ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesis', validId, '--entmoot-cfg-id', validId, '--out', hashOut],
         { stdio: 'pipe' },
       );
       assert.equal(existsSync(join(hashOut, 'g-rules.js')), true);

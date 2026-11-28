@@ -957,12 +957,32 @@
     function tryParseDecimalToBaseUnits(raw, { allowZero = false } = {}) {
       const s = String(raw ?? '').trim();
       if (s === '') return { ok: false, empty: true, error: 'Enter an amount' };
-      const m = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))$/.exec(s);
+      const m = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/.exec(s);
       if (!m) return { ok: false, empty: false, error: 'Enter a valid non-negative decimal number' };
-      const wholeStr = m[1] ?? '0';
-      const fracStr = m[2] ?? m[3] ?? '';
-      if (fracStr.length > 8) return { ok: false, empty: false, error: 'Maximum 8 decimal places (1 base unit = 0.00000001)' };
-      const units = BigInt(wholeStr) * UNIT + BigInt(fracStr.padEnd(8, '0'));
+      const intPart = m[1] ?? '';
+      const fracPart = m[2] ?? m[3] ?? '';
+      const exp = m[4] ? Number(m[4]) : 0;
+      if (!Number.isSafeInteger(exp) || Math.abs(exp) > 100) {
+        return { ok: false, empty: false, error: 'Exponent out of supported range' };
+      }
+      const digits = (intPart + fracPart).replace(/^0+/, '') || '0';
+      if (digits === '0') {
+        if (!allowZero) return { ok: false, empty: false, error: 'Amount must be greater than 0' };
+        return { ok: true, value: 0n };
+      }
+      const shift = 8 + exp - fracPart.length;
+      let scaled;
+      if (shift >= 0) {
+        scaled = digits + '0'.repeat(shift);
+      } else {
+        const cut = digits.length + shift;
+        const dropped = cut <= 0 ? digits : digits.slice(cut);
+        if (/[^0]/.test(dropped)) {
+          return { ok: false, empty: false, error: 'Maximum 8 decimal places (1 base unit = 0.00000001)' };
+        }
+        scaled = cut <= 0 ? '0' : digits.slice(0, cut);
+      }
+      const units = BigInt(scaled);
       if (!allowZero && units <= 0n) return { ok: false, empty: false, error: 'Amount must be greater than 0' };
       return { ok: true, value: units };
     }
@@ -1240,13 +1260,15 @@
       if (!adm.ok) {
         throw new Error(adm.reason);
       }
-      // Project against a tentative pool BEFORE mutating pendingBySlot/seenTxSigs/verifiedSigs so a rejected
-      // submission can NEVER evict unrelated pending orders or pollute caches!
-      const tentativeList = [];
-      for (const [k, entry] of pendingBySlot.entries()) {
-        if (k !== adm.slot) tentativeList.push(entry.tx);
+      // Project against the EXACT post-commit pool (including MAX_MEMPOOL_SLOTS eviction) BEFORE
+      // mutating pendingBySlot/seenTxSigs/verifiedSigs so a rejected submission can never evict
+      // unrelated orders and an accepted submission is guaranteed to survive its own commit.
+      const tentativeMap = new Map(pendingBySlot);
+      tentativeMap.set(adm.slot, { tx: adm.tx, fee: adm.fee });
+      if (tentativeMap.size > MAX_MEMPOOL_SLOTS) {
+        tentativeMap.delete(tentativeMap.keys().next().value);
       }
-      tentativeList.push(adm.tx);
+      const tentativeList = [...tentativeMap.values()].map((entry) => entry.tx);
       const trialSigs = new Set(verifiedSigs);
       trialSigs.add(adm.cacheKey);
       const trial = E.previewPending(s, tentativeList, activeBtcHeight() + 1, PARAMS, { verifiedSigs: trialSigs });
@@ -1255,6 +1277,8 @@
         throw new Error(rej?.reason || 'Order rejected by projected batch execution');
       }
       commitPendingTx(adm);
+      cachedProjection = trial;
+      projectionDirty = false;
       renderAll();
       if (entmootNet && entmootNet.connected) {
         try {
@@ -1580,6 +1604,10 @@
     }, 15_000);
 
     async function connectEntmoot() {
+      if (BOOT.entmootConfigPath === null) {
+        setPill('net-pill', 'warn', 'Entmoot offline (no config)');
+        return;
+      }
       try {
         const cfg = await fetchJson(BOOT.entmootConfigPath || '/content/local:entmoot-config.json');
         const keyBytes = new Uint8Array(32);
@@ -1723,14 +1751,10 @@
       }
     }
 
-    const TICKER_RE = /^[A-Za-z0-9._-]+$/;
-    const NAME_SAFE_RE = /^[\x20-\x7e]+$/;
-    const HTML_UNSAFE_RE = /[<>"'`&]/;
-
     function resolveLaunchArtId(s) {
       const rawArt = $('launch-art').value.trim();
       if (!rawArt) return { ok: true, artId: s.genesisId, defaulted: true };
-      if (!E.isValidInscriptionId(rawArt)) {
+      if (rawArt.length > PARAMS.maxArtIdLen || !E.isValidInscriptionId(rawArt)) {
         return {
           ok: false,
           error: 'Invalid Art Inscription ID: enter a valid <64-hex>i<index> ID or leave blank to default to Genesis.',
@@ -1746,14 +1770,13 @@
       const initRaw = $('launch-init').value.trim();
       const initRes = tryParseDecimalToBaseUnits(initRaw === '' ? '0' : initRaw, { allowZero: true });
       const errors = [];
-      if (!ticker || ticker.length > PARAMS.maxTickerLen || !TICKER_RE.test(ticker)) {
-        errors.push(`Ticker must be 1–${PARAMS.maxTickerLen} chars (A–Z, 0–9, . _ -)`);
-      }
-      if (!name || name.length > PARAMS.maxNameLen || !NAME_SAFE_RE.test(name) || HTML_UNSAFE_RE.test(name)) {
-        errors.push(`Token name must be 1–${PARAMS.maxNameLen} printable ASCII chars without HTML metacharacters`);
-      }
       if (!artRes.ok) errors.push(artRes.error);
       if (!initRes.ok) errors.push(initRes.error);
+      try {
+        E.validateLaunchMetadata({ ticker, name, artId: artRes.ok ? artRes.artId : '' }, PARAMS);
+      } catch (metaErr) {
+        errors.push(metaErr.message);
+      }
       return {
         ok: errors.length === 0,
         errors,
@@ -1762,7 +1785,7 @@
         artRes,
         initRes,
         launchFee: PARAMS.launchFee,
-        creatorRoyaltyPct: Number(PARAMS.tradeFeeBps) / 200,
+        creatorRoyaltyPct: (Number(PARAMS.tradeFeeBps) / Number(PARAMS.bpsDenom)) * 50,
       };
     }
 
@@ -1953,7 +1976,13 @@
         const dotCls = tx.type === 'BUY' ? 'ok' : tx.type === 'SELL' ? 'err' : 'warn';
         return el(
           'div',
-          { style: 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border-radius:8px;background:var(--panel);border:1px solid var(--line-1)' },
+          {
+            'data-tx-sig': tx.sig,
+            'data-tx-from': tx.from,
+            'data-tx-nonce': String(tx.nonce),
+            'data-tx-token': String(tx.tokenId ?? ''),
+            style: 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border-radius:8px;background:var(--panel);border:1px solid var(--line-1)',
+          },
           el('div', { style: 'display:flex;align-items:center;gap:8px;min-width:0' },
             el('span', { class: `dot ${dotCls}` }),
             el('strong', null, who),
@@ -2029,7 +2058,7 @@
           const openToken = () => { selectedTokenId = tok.id; setPage('token'); };
           return el(
             'tr',
-            { class: `clickable ${tok.id === selectedTokenId ? 'selected' : ''}`, onclick: openToken },
+            { class: `clickable ${tok.id === selectedTokenId ? 'selected' : ''}`, 'data-token-id': tok.id, onclick: openToken },
             el('td', null, el('div', { style: 'display:flex;align-items:center;gap:10px' },
               el('div', { class: 'art-sq' }, makeTokenArtSvg(tok.id, 20)),
               el('div', null, el('div', { style: 'font-family:var(--font-sans);font-weight:550' }, tok.name), el('div', { class: 'dim' }, `$${tok.ticker}`)),
@@ -2072,8 +2101,9 @@
       $('token-pending-count').textContent = `${accepted.length} active`;
       $('token-pending-list').replaceChildren(...buildMempoolNodes(s, accepted));
 
-      // 3. LAUNCH ART PREVIEW
+      // 3. LAUNCH ART PREVIEW & STEP 3 REFRESH
       $('launch-art-preview').replaceChildren(makeTokenArtSvg($('launch-ticker').value || 'SAT0', 38));
+      if (activePage === 'launch' && activeLaunchStep === 3) renderLaunchReview();
 
       // 4. SWAP BTC (Option C: P2P Orderbook + Security-Audited HTLC Cards)
       const netName = $('htlc-net').value;

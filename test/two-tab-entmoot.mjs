@@ -52,54 +52,54 @@ try {
   ]);
   console.log('[2-tab] Both browser tabs connected to Entmoot P2P live inside ord sandbox!');
 
-  // Select the exact same market ($EYE0) explicitly in BOTH tabs.
-  await f1.locator('#explore-tbody tr', { hasText: '$EYE0' }).first().click();
-  await f2.locator('#explore-tbody tr', { hasText: '$EYE0' }).first().click();
+  // Capture the EXACT immutable tokenId from Tab 1 and select that identical tokenId in BOTH tabs.
+  const firstRow = f1.locator('#explore-tbody tr[data-token-id]').first();
+  await firstRow.waitFor({ timeout: 10_000 });
+  const targetTokenId = await firstRow.getAttribute('data-token-id');
+  assert.ok(targetTokenId && targetTokenId.startsWith('t_'), `Expected immutable tokenId, got: ${targetTokenId}`);
 
-  // Pick a demo signer with pending-nonce headroom (< 8 pending orders) by inspecting actual pending nonces.
-  const SIGNERS = [
-    { id: 'alice', label: 'Alice' },
-    { id: 'creator', label: 'Creator' },
-    { id: 'miner', label: 'Miner' },
-    { id: 'bob', label: 'Bob' },
-  ];
+  await f1.locator(`#explore-tbody tr[data-token-id="${targetTokenId}"]`).click();
+  await f2.locator(`#explore-tbody tr[data-token-id="${targetTokenId}"]`).click();
+
+  // Pick a demo signer with pending-nonce headroom (< 8 pending orders) using structured data-tx-from attributes.
+  const SIGNERS = ['alice', 'creator', 'miner', 'bob'];
   let chosen = null;
-  let expectedNonce = null;
-  for (const cand of SIGNERS) {
-    await f1.locator('#wallet-select').selectOption(cand.id);
-    const pendingText = await f1.locator('#token-pending-list').textContent();
-    const matches = [...pendingText.matchAll(new RegExp(`${cand.label}[^]*?n=(\\d+)`, 'g'))].map((m) => Number(m[1]));
-    if (matches.length < 8) {
-      chosen = cand;
-      expectedNonce = matches.length ? Math.max(...matches) + 1 : null;
+  let chosenPk = null;
+  let priorSigs = new Set();
+  for (const id of SIGNERS) {
+    await f1.locator('#wallet-select').selectOption(id);
+    const pk = (await f1.locator('#wallet-pk-box').textContent()).trim();
+    const pendingForPk = await f1.locator(`#token-pending-list [data-tx-from="${pk}"]`).count();
+    if (pendingForPk < 8) {
+      chosen = id;
+      chosenPk = pk;
+      priorSigs = new Set(
+        await f1.locator(`#token-pending-list [data-tx-from="${pk}"]`).evaluateAll((els) => els.map((e) => e.getAttribute('data-tx-sig'))),
+      );
       break;
     }
   }
-  assert.ok(chosen, 'No demo signer has pending-nonce headroom (< 8 pending txs)');
+  assert.ok(chosen && chosenPk, 'No demo signer has pending-nonce headroom (< 8 pending txs)');
 
   const uniqueAmt = `${2 + (Date.now() % 7)}.${String(11 + (Math.floor(Date.now() / 10) % 88)).padStart(2, '0')}`;
-  const beforeTab2 = await f2.locator('#token-pending-list').textContent();
-  assert.ok(!beforeTab2.includes(`${uniqueAmt} I0`), `Tab 2 already contained test amount ${uniqueAmt} I0`);
-
   await f1.locator('#buy-amount').fill(uniqueAmt);
   await f1.locator('#submit-buy').click();
 
   await f1.locator('#action-msg').filter({ hasText: 'gossiped live over Entmoot' }).waitFor({ timeout: 10_000 });
-  // Read the exact assigned nonce from Tab 1's own pending row for this fresh order.
-  const tab1Row = f1.locator('#token-pending-list > div', { hasText: `${uniqueAmt} I0` }).filter({ hasText: chosen.label }).first();
-  await tab1Row.waitFor({ timeout: 5_000 });
-  const tab1RowText = await tab1Row.textContent();
-  const nonceMatch = /n=(\d+)/.exec(tab1RowText);
-  assert.ok(nonceMatch, `Could not extract nonce from Tab 1 pending row: ${tab1RowText}`);
-  const exactNonce = nonceMatch[1];
-  console.log(`[2-tab] Tab 1 (${chosen.label}, n=${exactNonce}) signed & published BUY $EYE0 ${uniqueAmt} I0 over Entmoot.`);
+  // Extract the exact signature & nonce of the newly admitted order from Tab 1's structured pending DOM!
+  const newRows = await f1.locator(`#token-pending-list [data-tx-from="${chosenPk}"][data-tx-token="${targetTokenId}"]`).evaluateAll(
+    (els) => els.map((e) => ({ sig: e.getAttribute('data-tx-sig'), nonce: e.getAttribute('data-tx-nonce') })),
+  );
+  const created = newRows.find((r) => r.sig && !priorSigs.has(r.sig));
+  assert.ok(created, 'Could not locate newly signed tx signature in Tab 1 pending list');
+  console.log(`[2-tab] Tab 1 (${chosen}, n=${created.nonce}, sig=${created.sig.slice(0, 12)}…) published BUY ${uniqueAmt} I0 on ${targetTokenId.slice(0, 12)}…`);
 
-  // Assert Tab 2 receives the EXACT same sender + market + amount + nonce live over Entmoot WebRTC-direct!
-  const tab2Row = f2.locator('#token-pending-list > div', { hasText: `BUY $EYE0 · ${uniqueAmt} I0` })
-    .filter({ hasText: chosen.label })
-    .filter({ hasText: `n=${exactNonce}` });
-  await tab2Row.first().waitFor({ timeout: 15_000 });
-  console.log(`[2-tab] PASS: Tab 2 received ${chosen.label} BUY $EYE0 · ${uniqueAmt} I0 (n=${exactNonce}) live over Entmoot P2P!`);
+  // Assert Tab 2 receives the EXACT same BIP-340 signature + sender + tokenId + nonce live over Entmoot!
+  const tab2Exact = f2.locator(
+    `#token-pending-list [data-tx-sig="${created.sig}"][data-tx-from="${chosenPk}"][data-tx-nonce="${created.nonce}"][data-tx-token="${targetTokenId}"]`,
+  );
+  await tab2Exact.waitFor({ timeout: 15_000 });
+  console.log(`[2-tab] PASS: Tab 2 received exact tx sig=${created.sig.slice(0, 12)}… (n=${created.nonce}) live over Entmoot P2P!`);
 
   assert.equal(errs.length, 0, `Page errors: ${errs.join('; ')}`);
 } finally {

@@ -45,6 +45,13 @@ export const V1_MAINNET_PARAMS = Object.freeze({
   htlcSafeMarginBtcBlocks: 12,
 });
 
+export const V1_SIGNET_PARAMS = Object.freeze({
+  ...V1_MAINNET_PARAMS,
+  powMinBits: 16,
+  retargetInterval: 18,
+  checkpointInterval: 24,
+});
+
 export const V1_TEST_PARAMS = Object.freeze({
   ...V1_MAINNET_PARAMS,
   powMinBits: 8,

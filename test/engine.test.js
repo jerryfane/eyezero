@@ -4,6 +4,8 @@ import { createServer } from 'node:http';
 import {
   I0_TOKEN_ID,
   UNIT,
+  V1_MAINNET_PARAMS,
+  V1_SIGNET_PARAMS,
   V1_TEST_PARAMS,
   applyBlock,
   assertStateConservation,
@@ -37,7 +39,11 @@ import {
   sha256Hex,
   signTx,
 } from '../engine/src/index.js';
-import { syncChainFromOrd } from '../miner/src/cli.mjs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runMinerOnce, syncChainFromOrd } from '../miner/src/cli.mjs';
 
 const GENESIS_ID = '0000000000000000000000000000000000000000000000000000000000000001i0';
 const GENESIS_BTC_H = 900_000;
@@ -747,5 +753,148 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
     const badMerkle = Uint8Array.from(rawBlock);
     badMerkle[36] ^= 0xff;
     assert.throws(() => extractBitcoinBlockTxids(bytesToHex(badMerkle)), /Merkle root/);
+  });
+});
+
+describe('Signet production parameters and inscription build CLI', () => {
+  it('V1_SIGNET_PARAMS inherits mainnet monetary safety with Signet PoW/checkpoint cadence', () => {
+    assert.equal(V1_SIGNET_PARAMS.powMinBits, 16);
+    assert.equal(V1_SIGNET_PARAMS.retargetInterval, 18);
+    assert.equal(V1_SIGNET_PARAMS.checkpointInterval, 24);
+    assert.equal(V1_SIGNET_PARAMS.initialBlockReward, V1_MAINNET_PARAMS.initialBlockReward);
+    assert.equal(V1_SIGNET_PARAMS.halvingInterval, V1_MAINNET_PARAMS.halvingInterval);
+    assert.equal(V1_SIGNET_PARAMS.maxSupply, V1_MAINNET_PARAMS.maxSupply);
+    assert.equal(V1_SIGNET_PARAMS.launchFee, V1_MAINNET_PARAMS.launchFee);
+    assert.equal(V1_SIGNET_PARAMS.tradeFeeBps, V1_MAINNET_PARAMS.tradeFeeBps);
+    assert.equal(V1_SIGNET_PARAMS.htlcSafeMarginBtcBlocks, V1_MAINNET_PARAMS.htlcSafeMarginBtcBlocks);
+
+    const g = createGenesisState(GENESIS_ID, V1_SIGNET_PARAMS, 250_000);
+    assert.equal(nextTarget(g, V1_SIGNET_PARAMS), bitsToTarget(16));
+  });
+
+  it('Signet miner CLI uses V1_SIGNET_PARAMS matching the built Signet UI', async () => {
+    const miner = keyFor(55);
+    const signetGenesis = '0000000000000000000000000000000000000000000000000000000000000042i0';
+    const gSig = createGenesisState(signetGenesis, V1_SIGNET_PARAMS, 250_000);
+    const sigBlk = mineBlock(gSig, {
+      miner: miner.pk,
+      btcHeight: 250_001,
+      inscriptionNumber: 500,
+      params: V1_SIGNET_PARAMS,
+    });
+    const gWeak = createGenesisState(signetGenesis, V1_TEST_PARAMS, 250_000);
+    // Construct a block that passes 8-bit V1_TEST_PARAMS but fails 16-bit V1_SIGNET_PARAMS!
+    let weakId = null;
+    for (let n = 0; n < 200_000; n++) {
+      const cand = sha256Hex(`weak-sig-${n}`) + 'i0';
+      if (meetsTarget(cand, bitsToTarget(8)) && !meetsTarget(cand, bitsToTarget(16))) {
+        weakId = cand;
+        break;
+      }
+    }
+    const weakBlk = mineBlock(gWeak, {
+      miner: miner.pk,
+      btcHeight: 250_001,
+      inscriptionNumber: 501,
+      id: weakId,
+      params: V1_TEST_PARAMS,
+    });
+
+    const server = createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      if (req.url === '/r/blockheight') return res.end('250001');
+      if (req.url === '/r/blockhash/250000') return res.end(JSON.stringify(fakeBlockHash(250_000)));
+      if (req.url === '/r/blockhash/250001') return res.end(JSON.stringify(fakeBlockHash(250_001)));
+      if (req.url === `/r/inscription/${signetGenesis}`) return res.end(JSON.stringify({ height: 250_000, number: 499 }));
+      if (req.url === `/r/inscription/${sigBlk.block.id}`) return res.end(JSON.stringify({ height: 250_001, number: 500 }));
+      if (req.url === `/content/${sigBlk.block.id}`) return res.end(JSON.stringify(sigBlk.block));
+      if (req.url === `/r/inscription/${weakBlk.block.id}`) return res.end(JSON.stringify({ height: 250_001, number: 501 }));
+      if (req.url === `/content/${weakBlk.block.id}`) return res.end(JSON.stringify(weakBlk.block));
+      res.statusCode = 404;
+      res.end('not found');
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const ordUrl = `http://127.0.0.1:${server.address().port}`;
+      const ok = await runMinerOnce({
+        network: 'signet',
+        'sync-only': true,
+        'ord-url': ordUrl,
+        genesis: signetGenesis,
+        tip: sigBlk.block.id,
+      });
+      assert.equal(ok.height, 1);
+      assert.equal(ok.tipId, sigBlk.block.id);
+
+      await assert.rejects(
+        () => runMinerOnce({
+          network: 'signet',
+          'sync-only': true,
+          'ord-url': ordUrl,
+          genesis: signetGenesis,
+          tip: weakBlk.block.id,
+        }),
+        /fails PoW target/,
+      );
+    } finally {
+      server.close();
+    }
+  });
+
+  it('build-inscriptions.mjs validates flags, requires explicit Signet Entmoot choice, handles # paths, and cleans stale files', () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'eyezero-build-test-'));
+    const validId = '0'.repeat(63) + '1i0';
+    const validI1 = '0'.repeat(63) + '2i1';
+    try {
+      // Unknown flag rejected
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--genesiss', validId], { stdio: 'pipe' }),
+        /Unknown option: --genesiss/,
+      );
+      // Empty supplied pin values rejected
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--genesis', ''], { stdio: 'pipe' }),
+        /requires a non-empty value/,
+      );
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--initial-tip', ''], { stdio: 'pipe' }),
+        /requires a non-empty value/,
+      );
+      // Signet refuses to silently ship the 64-use demo invite
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--out', join(tmpRoot, 'no-cfg')], { stdio: 'pipe' }),
+        /refusing to silently bundle the 64-use demo invite/,
+      );
+      // Non-genesis i1 initial-tip rejected
+      assert.throws(
+        () => execFileSync(
+          process.execPath,
+          ['scripts/build-inscriptions.mjs', '--network', 'signet', '--offline', '--genesis', validId, '--initial-tip', validI1],
+          { stdio: 'pipe' },
+        ),
+        /must end in i0/,
+      );
+      // Path with '#' works, explicit --entmoot-config writes entmoot-config.json, and rebuilding with --entmoot-cfg-id removes stale entmoot-config.json
+      const hashOut = join(tmpRoot, 'signet#dry');
+      const prodCfgPath = join(tmpRoot, 'prod-entmoot.json');
+      writeFileSync(prodCfgPath, JSON.stringify({ groupId: '11'.repeat(32), addr: '/ip4/127.0.0.1/udp/9/webrtc-direct', invite: {} }));
+      execFileSync(
+        process.execPath,
+        ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesis', validId, '--entmoot-config', prodCfgPath, '--out', hashOut],
+        { stdio: 'pipe' },
+      );
+      assert.equal(existsSync(join(hashOut, 'entmoot-config.json')), true);
+
+      execFileSync(
+        process.execPath,
+        ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesis', validId, '--entmoot-cfg-id', validId, '--out', hashOut],
+        { stdio: 'pipe' },
+      );
+      assert.equal(existsSync(join(hashOut, 'g-rules.js')), true);
+      assert.equal(existsSync(join(hashOut, 'index.html')), true);
+      assert.equal(existsSync(join(hashOut, 'entmoot-config.json')), false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

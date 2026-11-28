@@ -1,22 +1,34 @@
 #!/usr/bin/env node
-// Builds self-contained OrdStudio inscription assets:
-//   dist/ordstudio/g-rules.js           (single-file pinned G_rules ES module)
-//   dist/ordstudio/index.html           (G_ui importing /content/local:g-rules.js)
-//   dist/ordstudio/blocks/b1..b3.json   (3 real BIP-340 signed, dual-PoW demo blocks)
-//   dist/ordstudio/ordstudio.json       (OrdStudio manifest)
-//   dist/chain-overrides.json           (simulated /r/* endpoints for Local mode)
+// Builds self-contained Bitcoin inscription bundles for OrdStudio or direct `ord` inscription:
+//
+//   Demo mode (default):
+//     node scripts/build-inscriptions.mjs [--out dist/ordstudio]
+//     Produces dist/ordstudio/ with g-rules.js, index.html, entmoot-lite.js, entmoot-config.json,
+//     3 signed dual-PoW demo blocks (blocks/b1..b3.json + tip.json), ordstudio.json, and dist/chain-overrides.json.
+//
+//   Signet production mode:
+//     node scripts/build-inscriptions.mjs --network signet (--entmoot-config <path> | --entmoot-cfg-id <id> | --offline)
+//       [--genesis <id>] [--initial-tip <id>] [--rules-id <id>] [--entmoot-js-id <id>] [--out dist/signet]
+//     Produces dist/signet/ with lossless Brotli-ready production files (exact unaltered JS/CSS/HTML + compact JSON),
+//     zero demo personas, zero fake blocks, and explicit Entmoot config (never silently shipping the demo invite).
 
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { brotliCompressSync, constants as zlibConstants } from 'node:zlib';
 import {
   UNIT,
   V1_DEMO_PARAMS,
+  V1_SIGNET_PARAMS,
   applyBlock,
   buildCandidateBlock,
   computeTokenId,
   createGenesisState,
   getPublicKeyHex,
+  isValidBlockInscriptionId,
+  isValidInscriptionId,
   meetsTarget,
   nextTarget,
   sha256Hex,
@@ -24,45 +36,224 @@ import {
 } from '../engine/src/index.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const OUT = join(ROOT, 'dist', 'ordstudio');
-mkdirSync(join(OUT, 'blocks'), { recursive: true });
+const ALLOWED_VALUE_FLAGS = new Set([
+  'network',
+  'out',
+  'genesis',
+  'initial-tip',
+  'rules-id',
+  'entmoot-js-id',
+  'entmoot-cfg-id',
+  'entmoot-config',
+]);
+
+function parseBuildArgs(argv) {
+  const opts = { network: 'demo', offline: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--offline') { opts.offline = true; continue; }
+    if (a.startsWith('--')) {
+      const k = a.slice(2);
+      if (!ALLOWED_VALUE_FLAGS.has(k)) {
+        throw new Error(`Unknown option: --${k}`);
+      }
+      const v = argv[++i];
+      if (v === undefined || v.trim() === '' || v.startsWith('--')) {
+        throw new Error(`Option --${k} requires a non-empty value`);
+      }
+      opts[k] = v;
+      continue;
+    }
+    throw new Error(`Unexpected argument: ${a}`);
+  }
+  if (!['demo', 'signet'].includes(opts.network)) {
+    throw new Error(`Unsupported --network "${opts.network}" (supported: demo, signet)`);
+  }
+  for (const idKey of ['genesis', 'initial-tip', 'rules-id', 'entmoot-js-id', 'entmoot-cfg-id']) {
+    if (idKey in opts && !isValidInscriptionId(opts[idKey])) {
+      throw new Error(`Invalid inscription ID for --${idKey}: ${opts[idKey]}`);
+    }
+  }
+  if ('initial-tip' in opts && !('genesis' in opts)) {
+    throw new Error('--initial-tip requires --genesis');
+  }
+  if ('initial-tip' in opts && opts['initial-tip'] !== opts.genesis && !isValidBlockInscriptionId(opts['initial-tip'])) {
+    throw new Error(`Invalid non-genesis --initial-tip (must end in i0): ${opts['initial-tip']}`);
+  }
+  if (opts.network !== 'demo') {
+    const entmootChoices = Number(opts.offline) + Number('entmoot-config' in opts) + Number('entmoot-cfg-id' in opts);
+    if (entmootChoices === 0) {
+      throw new Error(
+        'Signet build requires one of --entmoot-config <path>, --entmoot-cfg-id <id>, or --offline (refusing to silently bundle the 64-use demo invite)',
+      );
+    }
+    if (entmootChoices > 1) {
+      throw new Error('Specify only one of --entmoot-config, --entmoot-cfg-id, or --offline');
+    }
+  }
+  return opts;
+}
+
+function checkJsSyntax(code, label) {
+  const tmp = join(tmpdir(), `eyezero-syntax-${process.pid}-${Date.now()}.mjs`);
+  writeFileSync(tmp, code, 'utf8');
+  try {
+    execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe' });
+  } catch (err) {
+    throw new Error(`Syntax check failed for ${label}: ${err.stderr?.toString() || err.message}`);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function brotliLen(str) {
+  return brotliCompressSync(Buffer.from(str, 'utf8'), {
+    params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 },
+  }).length;
+}
+
+const opts = parseBuildArgs(process.argv.slice(2));
+const isDemo = opts.network === 'demo';
+const OUT = opts.out
+  ? (opts.out.startsWith('/') ? opts.out : join(ROOT, opts.out))
+  : join(ROOT, 'dist', isDemo ? 'ordstudio' : opts.network);
+
+mkdirSync(OUT, { recursive: true });
+if (isDemo) mkdirSync(join(OUT, 'blocks'), { recursive: true });
 
 // 1. Bundle engine/src/*.js into one clean zero-dependency ES module (g-rules.js).
 const ORDER = ['constants.js', 'crypto.js', 'pow.js', 'state.js', 'apply.js', 'btc-htlc.js'];
 const parts = [
   '// eyezero (i0) G_rules v1 — zero-dependency deterministic consensus & BIP-340 engine.',
-  '// Generated by scripts/build-inscriptions.mjs from engine/src/*.js',
   '',
 ];
-
 for (const file of ORDER) {
   let src = readFileSync(join(ROOT, 'engine', 'src', file), 'utf8');
   src = src.replace(/^import\s+[\s\S]*?from\s+['"]\.\/[^'"]+['"];\s*$/gm, '');
-  parts.push(`// --- ${file} ---`);
   parts.push(src.trim());
   parts.push('');
 }
+const rulesOut = parts.join('\n');
+checkJsSyntax(rulesOut, 'g-rules.js');
+writeFileSync(join(OUT, 'g-rules.js'), rulesOut, 'utf8');
+// Live ES module import check (convert filesystem path via pathToFileURL so `#` in paths works cleanly).
+await import(`${pathToFileURL(join(OUT, 'g-rules.js')).href}?check=${Date.now()}`);
 
-const rulesBundle = parts.join('\n');
-writeFileSync(join(OUT, 'g-rules.js'), rulesBundle, 'utf8');
-// Verify the concatenated g-rules.js bundle parses and imports cleanly as an ES module!
-await import(`${join(OUT, 'g-rules.js')}?check=${Date.now()}`);
+// 2. Process entmoot-lite.js and entmoot-config.json (exact JS; compact lossless JSON).
+const entmootOut = readFileSync(join(ROOT, 'ui', 'entmoot-lite.js'), 'utf8');
+checkJsSyntax(entmootOut, 'entmoot-lite.js');
+writeFileSync(join(OUT, 'entmoot-lite.js'), entmootOut, 'utf8');
 
-// 2. Copy UI inscription, entmoot-lite.js, and Entmoot testnet config.
-copyFileSync(join(ROOT, 'ui', 'index.html'), join(OUT, 'index.html'));
-copyFileSync(join(ROOT, 'ui', 'entmoot-lite.js'), join(OUT, 'entmoot-lite.js'));
-const inviteRaw = JSON.parse(readFileSync(join(ROOT, 'ui', 'entmoot-invite.json'), 'utf8'));
-writeFileSync(
-  join(OUT, 'entmoot-config.json'),
-  JSON.stringify({
-    groupId: inviteRaw.group_id,
-    addr: inviteRaw.allowed_multiaddrs[0],
-    invite: inviteRaw,
-  }, null, 2),
-  'utf8',
+const emitLocalEntmootCfg = !opts.offline && (isDemo ? !opts['entmoot-cfg-id'] : Boolean(opts['entmoot-config']));
+let entmootCfgOut = null;
+if (emitLocalEntmootCfg) {
+  const entmootSrcPath = opts['entmoot-config']
+    ? (opts['entmoot-config'].startsWith('/') ? opts['entmoot-config'] : join(ROOT, opts['entmoot-config']))
+    : join(ROOT, 'ui', 'entmoot-invite.json');
+  const cfgRaw = JSON.parse(readFileSync(entmootSrcPath, 'utf8'));
+  const entmootCfgObj = cfgRaw.groupId && cfgRaw.addr
+    ? cfgRaw
+    : {
+        groupId: cfgRaw.group_id,
+        addr: cfgRaw.allowed_multiaddrs[0],
+        invite: cfgRaw,
+      };
+  entmootCfgOut = JSON.stringify(entmootCfgObj);
+  writeFileSync(join(OUT, 'entmoot-config.json'), entmootCfgOut, 'utf8');
+} else {
+  // Remove any stale entmoot-config.json left over from a prior build in the same directory so disk matches manifest.
+  rmSync(join(OUT, 'entmoot-config.json'), { force: true });
+}
+
+// 3. Configure ui/index.html (lossless source; Brotli-11 compresses on inscription).
+let htmlSrc = readFileSync(join(ROOT, 'ui', 'index.html'), 'utf8');
+const entmootConfigPath = opts.offline
+  ? null
+  : opts['entmoot-cfg-id']
+    ? `/content/${opts['entmoot-cfg-id']}`
+    : '/content/local:entmoot-config.json';
+const bootConfig = isDemo
+  ? {
+      network: 'demo',
+      demoMode: true,
+      genesisId: null,
+      initialTipId: null,
+      trustedCheckpoint: null,
+      tipConfigPath: '/content/local:blocks/tip.json',
+      entmootConfigPath,
+    }
+  : {
+      network: opts.network,
+      demoMode: false,
+      genesisId: opts.genesis ?? null,
+      initialTipId: opts['initial-tip'] ?? null,
+      trustedCheckpoint: null,
+      tipConfigPath: null,
+      entmootConfigPath,
+    };
+
+htmlSrc = htmlSrc.replace(
+  /<script id="eyezero-boot" type="application\/json">[\s\S]*?<\/script>/,
+  `<script id="eyezero-boot" type="application/json">${JSON.stringify(bootConfig)}</script>`,
 );
+if (opts['rules-id']) {
+  htmlSrc = htmlSrc.replaceAll('/content/local:g-rules.js', `/content/${opts['rules-id']}`);
+}
+if (opts['entmoot-js-id']) {
+  htmlSrc = htmlSrc.replaceAll('/content/local:entmoot-lite.js', `/content/${opts['entmoot-js-id']}`);
+}
+const htmlOut = htmlSrc;
+for (const m of htmlOut.matchAll(/<script\s+type="module">([\s\S]*?)<\/script>/g)) {
+  checkJsSyntax(m[1], 'index.html <script type="module">');
+}
+writeFileSync(join(OUT, 'index.html'), htmlOut, 'utf8');
 
-// 3. Generate 3 real BIP-340 signed, dual-PoW demo blocks using the shared V1_DEMO_PARAMS!
+const filesManifest = {
+  'g-rules.js': { id: opts['rules-id'] ?? null, role: 'library', compress: 'br' },
+  'entmoot-lite.js': { id: opts['entmoot-js-id'] ?? null, role: 'library', compress: 'br' },
+  ...(emitLocalEntmootCfg ? { 'entmoot-config.json': { id: opts['entmoot-cfg-id'] ?? null, role: 'asset', compress: null } } : {}),
+  'index.html': { id: null, role: 'parent', compress: 'br' },
+};
+
+if (!isDemo) {
+  // Emit canonical Genesis JSON for Signet inscription!
+  const genesisObj = {
+    p: 'eyezero',
+    v: 1,
+    op: 'genesis',
+    network: opts.network,
+    powMinBits: V1_SIGNET_PARAMS.powMinBits,
+    retargetInterval: V1_SIGNET_PARAMS.retargetInterval,
+    checkpointInterval: V1_SIGNET_PARAMS.checkpointInterval,
+  };
+  const genesisOut = JSON.stringify(genesisObj);
+  writeFileSync(join(OUT, 'genesis.json'), genesisOut, 'utf8');
+  filesManifest['genesis.json'] = { id: opts.genesis ?? null, role: 'asset', compress: null };
+  writeFileSync(join(OUT, 'ordstudio.json'), JSON.stringify({ ordstudio: 1, files: filesManifest }, null, 2), 'utf8');
+
+  const report = [
+    ['genesis.json', genesisOut],
+    ...(emitLocalEntmootCfg ? [['entmoot-config.json', entmootCfgOut]] : []),
+    ['entmoot-lite.js', entmootOut],
+    ['g-rules.js', rulesOut],
+    ['index.html', htmlOut],
+  ];
+  let totalBr = 0;
+  let totalVb = 0;
+  console.log(`Built ${OUT} (network=${opts.network}, offline=${opts.offline}):`);
+  for (const [name, content] of report) {
+    const rawB = Buffer.byteLength(content, 'utf8');
+    const brB = brotliLen(content);
+    const estVb = Math.ceil((name.endsWith('.json') ? rawB : brB) / 4) + 160;
+    totalBr += name.endsWith('.json') ? rawB : brB;
+    totalVb += estVb;
+    console.log(`  ${name.padEnd(20)} raw=${rawB} B  br=${brB} B  ~${estVb} vB`);
+  }
+  console.log(`  TOTAL (${report.length} prod inscriptions): compressed=${totalBr} B (~${totalVb} vB, ~${totalVb * 2} sats @ 2 sat/vB)`);
+  process.exit(0);
+}
+
+// 4. Demo mode only: generate 3 real BIP-340 signed, dual-PoW demo blocks using V1_DEMO_PARAMS!
 const DEMO_GENESIS_ID = '0000000000000000000000000000000000000000000000000000000000000001i0';
 const DEMO_GENESIS_BTC_HEIGHT = 924_100;
 
@@ -106,7 +297,6 @@ function pushBlock(label, btcHeight, inscNum, minerPk, txs) {
   const target = nextTarget(state, V1_DEMO_PARAMS);
   const id = grindId(label, target);
   const ctx = { btcHeight, inscriptionNumber: inscNum, getBlockHash: btcHash };
-  // Production block bodies omit `id` (the inscription ID is assigned by Bitcoin/ord).
   const { block: bodyBlock } = buildCandidateBlock(
     state,
     { miner: minerPk, btcRef: { h: refH, hash: btcHash(refH) }, txs, grindWork: true },
@@ -137,18 +327,13 @@ function pushBlock(label, btcHeight, inscNum, minerPk, txs) {
   });
 }
 
-// Block 1: Miner mines genesis reward (1,000 I0)
 pushBlock('b1', 924_101, 80_100_001, personas.miner.pk, []);
-
-// Block 2: Miner funds Creator, Alice, Bob (250 I0 each)
 pushBlock('b2', 924_102, 80_100_002, personas.miner.pk, [
   signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.creator.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 1, fee: '0' }, personas.miner.sk),
   signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.alice.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 2, fee: '0' }, personas.miner.sk),
   signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.bob.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 3, fee: '0' }, personas.miner.sk),
 ]);
 
-// Block 3: Creator launches $EYE0 and $SATCAT with full 256-bit launch-bound tokenIds;
-// Alice & Bob buy in the same MEV-free batch!
 const launchEye0 = { type: 'LAUNCH', from: personas.creator.pk, ticker: 'EYE0', name: 'EyeZero', artId: DEMO_GENESIS_ID, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' };
 const launchSatcat = { type: 'LAUNCH', from: personas.creator.pk, ticker: 'SATCAT', name: 'Satoshi Cat', artId: DEMO_GENESIS_ID, initialBuy: (25n * UNIT).toString(), nonce: 2, fee: '0' };
 const eye0Id = computeTokenId(state.chainId, launchEye0);
@@ -161,35 +346,15 @@ pushBlock('b3', 924_103, 80_100_003, personas.miner.pk, [
   signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: satcatId, i0In: (60n * UNIT).toString(), minTokOut: '1', nonce: 2, fee: '0' }, personas.bob.sk),
 ]);
 
-overrides.unshift({
-  route: '/r/blockheight',
-  status: 200,
-  contentType: 'application/json',
-  body: JSON.stringify(924_103),
-  enabled: true,
-});
-overrides.push({
-  route: '/r/blockhash/924103',
-  status: 200,
-  contentType: 'application/json',
-  body: JSON.stringify(btcHash(924_103)),
-  enabled: true,
-});
+overrides.unshift({ route: '/r/blockheight', status: 200, contentType: 'application/json', body: JSON.stringify(924_103), enabled: true });
+overrides.push({ route: '/r/blockhash/924103', status: 200, contentType: 'application/json', body: JSON.stringify(btcHash(924_103)), enabled: true });
 
-const filesManifest = {
-  'g-rules.js': { id: null, role: 'library', compress: 'br' },
-  'entmoot-lite.js': { id: null, role: 'library', compress: 'br' },
-  'entmoot-config.json': { id: null, role: 'asset', compress: null },
-  'index.html': { id: null, role: 'parent', compress: 'br' },
-  'blocks/tip.json': { id: null, role: 'asset', compress: null },
-};
-
+filesManifest['blocks/tip.json'] = { id: null, role: 'asset', compress: null };
 for (const b of blocks) {
   const rel = `blocks/${b.label}.json`;
-  writeFileSync(join(OUT, rel), JSON.stringify(b.block, null, 2), 'utf8');
+  writeFileSync(join(OUT, rel), JSON.stringify(b.block), 'utf8');
   filesManifest[rel] = { id: b.id, role: 'asset', compress: 'br' };
 }
-
 writeFileSync(
   join(OUT, 'blocks', 'tip.json'),
   JSON.stringify({
@@ -197,16 +362,16 @@ writeFileSync(
     tipId: blocks[blocks.length - 1].id,
     tipBtcHeight: blocks[blocks.length - 1].btcHeight,
     simulated: true,
-  }, null, 2),
+  }),
   'utf8',
 );
-
-writeFileSync(
-  join(OUT, 'ordstudio.json'),
-  JSON.stringify({ ordstudio: 1, files: filesManifest }, null, 2),
-  'utf8',
-);
-
+writeFileSync(join(OUT, 'ordstudio.json'), JSON.stringify({ ordstudio: 1, files: filesManifest }, null, 2), 'utf8');
 writeFileSync(join(ROOT, 'dist', 'chain-overrides.json'), JSON.stringify(overrides, null, 2), 'utf8');
 
-console.log(`Built dist/ordstudio: g-rules.js (${rulesBundle.length} B), ${blocks.length} signed dual-PoW blocks, tip=${blocks[blocks.length - 1].id}`);
+console.log(
+  `Built ${OUT} (network=demo): ` +
+  `g-rules.js=${rulesOut.length} B (br ${brotliLen(rulesOut)} B), ` +
+  `index.html=${htmlOut.length} B (br ${brotliLen(htmlOut)} B), ` +
+  `entmoot-lite.js=${entmootOut.length} B (br ${brotliLen(entmootOut)} B), ` +
+  `tip=${blocks[blocks.length - 1].id}`,
+);

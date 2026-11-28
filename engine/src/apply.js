@@ -65,6 +65,35 @@ export function isValidTokenId(tokenId) {
   return tokenId === I0_TOKEN_ID || (typeof tokenId === 'string' && TOKEN_ID_RE.test(tokenId));
 }
 
+export function validateLaunchMetadata({ ticker, name, artId = '' }, params = V1_MAINNET_PARAMS) {
+  if (
+    typeof ticker !== 'string' ||
+    ticker.length < 1 ||
+    ticker.length > params.maxTickerLen ||
+    !TICKER_RE.test(ticker)
+  ) {
+    throw new Error(`Invalid ticker (must match ^[A-Za-z0-9._-]{1,${params.maxTickerLen}}$)`);
+  }
+  if (
+    typeof name !== 'string' ||
+    name.length < 1 ||
+    name.length > params.maxNameLen ||
+    !NAME_SAFE_RE.test(name) ||
+    HTML_UNSAFE_RE.test(name)
+  ) {
+    throw new Error(`Invalid token name (printable ASCII 1..${params.maxNameLen} chars, no HTML metacharacters)`);
+  }
+  const normalizedArt = artId ?? '';
+  if (
+    typeof normalizedArt !== 'string' ||
+    normalizedArt.length > params.maxArtIdLen ||
+    (normalizedArt !== '' && !isValidInscriptionId(normalizedArt))
+  ) {
+    throw new Error('Invalid artId (must be empty or a valid inscription ID)');
+  }
+  return { ticker, name, artId: normalizedArt };
+}
+
 // Full 256-bit launch-bound immutable token ID: binds every signed LAUNCH parameter
 // (chainId, from, nonce, ticker, name, artId, initialBuy) so competing launches on
 // forks can never alias the same tokenId.
@@ -332,31 +361,10 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
       }
 
       case 'LAUNCH': {
-        if (
-          typeof tx.ticker !== 'string' ||
-          tx.ticker.length < 1 ||
-          tx.ticker.length > params.maxTickerLen ||
-          !TICKER_RE.test(tx.ticker)
-        ) {
-          throw new Error('Invalid ticker (must match ^[A-Za-z0-9._-]{1,12}$)');
-        }
-        if (
-          typeof tx.name !== 'string' ||
-          tx.name.length < 1 ||
-          tx.name.length > params.maxNameLen ||
-          !NAME_SAFE_RE.test(tx.name) ||
-          HTML_UNSAFE_RE.test(tx.name)
-        ) {
-          throw new Error('Invalid token name (printable ASCII 1..32 chars, no HTML metacharacters)');
-        }
-        const artId = tx.artId ?? '';
-        if (
-          typeof artId !== 'string' ||
-          artId.length > params.maxArtIdLen ||
-          (artId !== '' && !isValidInscriptionId(artId))
-        ) {
-          throw new Error('Invalid artId (must be empty or a valid inscription ID)');
-        }
+        const { artId } = validateLaunchMetadata(
+          { ticker: tx.ticker, name: tx.name, artId: tx.artId ?? '' },
+          params,
+        );
         subBalance(next, tx.from, I0_TOKEN_ID, params.launchFee);
         addBalance(next, miner, I0_TOKEN_ID, params.launchFee);
 

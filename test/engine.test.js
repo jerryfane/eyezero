@@ -16,6 +16,7 @@ import {
   buildCandidateBlock,
   bytesToHex,
   compareChainTips,
+  computeBlockTradeStats,
   computeStateRoot,
   computeSwapId,
   computeTokenId,
@@ -37,7 +38,12 @@ import {
   resolvePendingMempool,
   sha256,
   sha256Hex,
+  signSwapFill,
+  signSwapQuote,
   signTx,
+  validateLaunchMetadata,
+  verifySwapFill,
+  verifySwapQuote,
 } from '../engine/src/index.js';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -896,5 +902,221 @@ describe('Signet production parameters and inscription build CLI', () => {
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
     }
+  });
+
+  it('LAUNCH metadata (desc/web/x) binds tokenId, round-trips checkpoints, and rejects XSS/bad schemes across 200 seeded inputs', () => {
+    const miner = keyFor(70);
+    const creator = keyFor(71);
+    let s = createGenesisState(GENESIS_ID, V1_TEST_PARAMS, GENESIS_BTC_H);
+    s = mineBlock(s, { miner: miner.pk, btcHeight: GENESIS_BTC_H + 1, inscriptionNumber: 10 }).next;
+    s = mineBlock(s, {
+      miner: miner.pk,
+      btcHeight: GENESIS_BTC_H + 2,
+      inscriptionNumber: 11,
+      txs: [signTx(s.chainId, { type: 'TRANSFER', from: miner.pk, to: creator.pk, tokenId: 0, amount: (100n * UNIT).toString(), nonce: 1, fee: '0' }, miner.sk)],
+    }).next;
+
+    const launchBody = {
+      type: 'LAUNCH',
+      from: creator.pk,
+      ticker: 'META',
+      name: 'Meta Coin',
+      artId: GENESIS_ID,
+      desc: 'Fair Bitcoin token with on-chain metadata.',
+      web: 'eyezero.themartian.app/meta',
+      x: 'eyezero_btc',
+      initialBuy: (10n * UNIT).toString(),
+      nonce: 1,
+      fee: '0',
+    };
+    const tidWithMeta = computeTokenId(s.chainId, launchBody);
+    const tidWithoutMeta = computeTokenId(s.chainId, { ...launchBody, desc: '', web: '', x: '' });
+    assert.notEqual(tidWithMeta, tidWithoutMeta, 'Metadata must bind into immutable tokenId');
+
+    const res = mineBlock(s, {
+      miner: miner.pk,
+      btcHeight: GENESIS_BTC_H + 3,
+      inscriptionNumber: 12,
+      txs: [signTx(s.chainId, launchBody, creator.sk)],
+    });
+    const tok = res.next.tokens.get(tidWithMeta);
+    assert.ok(tok);
+    assert.equal(tok.desc, launchBody.desc);
+    assert.equal(tok.web, launchBody.web);
+    assert.equal(tok.x, launchBody.x);
+
+    // Round-trip through checkpoint pages
+    const { pages, stateRoot } = exportCheckpointPages(res.next);
+    const restored = importCheckpointPages(pages, { tipId: res.block.id, tipBtcHeight: GENESIS_BTC_H + 3, expectedStateRoot: stateRoot });
+    const rTok = restored.tokens.get(tidWithMeta);
+    assert.equal(rTok.desc, launchBody.desc);
+    assert.equal(rTok.web, launchBody.web);
+    assert.equal(rTok.x, launchBody.x);
+
+    // Deterministic seeded fuzz pass (200 cases) asserting bad schemes, HTML, and oversized fields are rejected
+    let seed = 0x51a7c0de;
+    const rand = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const badWebs = ['javascript:alert(1)', 'data:text/html,<svg>', 'http://insecure.example', 'https://with-scheme.example', 'bad.example/<script>', 'localhost', 'ftp://foo.bar'];
+    const badDescs = ['hello <img src=x>', 'bad & entity', 'quote "test"', "single 'quote'", 'back`tick', 'a'.repeat(161), 'ctrl\x07char'];
+    const badXs = ['@leading_at', 'way_too_long_handle_16', 'bad-dash', 'bad space', '<xss>'];
+    for (let i = 0; i < 200; i++) {
+      const kind = i % 3;
+      if (kind === 0) {
+        const w = badWebs[Math.floor(rand() * badWebs.length)];
+        assert.throws(() => validateLaunchMetadata({ ticker: 'OK', name: 'Valid', artId: '', web: w }, V1_TEST_PARAMS));
+      } else if (kind === 1) {
+        const d = badDescs[Math.floor(rand() * badDescs.length)];
+        assert.throws(() => validateLaunchMetadata({ ticker: 'OK', name: 'Valid', artId: '', desc: d }, V1_TEST_PARAMS));
+      } else {
+        const x = badXs[Math.floor(rand() * badXs.length)];
+        assert.throws(() => validateLaunchMetadata({ ticker: 'OK', name: 'Valid', artId: '', x }, V1_TEST_PARAMS));
+      }
+    }
+  });
+
+  it('signSwapQuote and verifySwapQuote authenticate P2P swap orderbook quotes', () => {
+    const maker = keyFor(80);
+    const other = keyFor(81);
+    const chainId = GENESIS_ID.slice(0, 16);
+    const q = signSwapQuote(chainId, {
+      id: 'q_test_1',
+      maker: maker.pk,
+      side: 'SELL_I0',
+      rateSatsPerI0: '1420',
+      minI0: (1n * UNIT).toString(),
+      maxI0: (100n * UNIT).toString(),
+      network: 'signet',
+      expiresAt: 2_000_000_000,
+    }, maker.sk);
+    assert.equal(verifySwapQuote(chainId, q), true);
+    assert.equal(verifySwapQuote(chainId, { ...q, rateSatsPerI0: '1400' }), false);
+    assert.equal(verifySwapQuote(chainId, { ...q, maker: other.pk }), false);
+    assert.equal(verifySwapQuote('deadbeef00000000', q), false);
+    assert.throws(() => signSwapQuote(chainId, { ...q, minI0: (200n * UNIT).toString(), maxI0: (100n * UNIT).toString() }, maker.sk), /maxI0 < minI0/);
+  });
+
+  it('signSwapFill and verifySwapFill cryptographically bind agreed BTC sats, quote, and HTLC escrow', () => {
+    const maker = keyFor(82);
+    const taker = keyFor(83);
+    const chainId = GENESIS_ID.slice(0, 16);
+    const q = signSwapQuote(chainId, {
+      id: 'q_fill_1',
+      maker: maker.pk,
+      side: 'BUY_I0',
+      rateSatsPerI0: '1385',
+      minI0: (1n * UNIT).toString(),
+      maxI0: (180n * UNIT).toString(),
+      network: 'signet',
+      expiresAt: 2_000_000_000,
+    }, maker.sk);
+    const swapId = computeSwapId(chainId, taker.pk, 1);
+    const hashlock = sha256Hex('preimage-secret-test');
+    const i0Amount = 25n * UNIT;
+    const btcSats = (i0Amount * 1385n) / UNIT;
+    const fill = signSwapFill(chainId, {
+      id: 'fill_test_1',
+      quoteId: q.id,
+      quoteSig: q.sig,
+      maker: maker.pk,
+      taker: taker.pk,
+      side: 'SELL_I0',
+      rateSatsPerI0: q.rateSatsPerI0,
+      i0Amount: i0Amount.toString(),
+      btcSats: btcSats.toString(),
+      network: 'signet',
+      swapId,
+      hashlock,
+      expiresAt: 2_000_000_000,
+    }, taker.sk);
+    assert.equal(verifySwapFill(chainId, fill), true);
+    assert.equal(verifySwapFill(chainId, { ...fill, btcSats: (btcSats + 1n).toString() }), false);
+    assert.equal(verifySwapFill(chainId, { ...fill, quoteId: 'q_other' }), false);
+    assert.equal(verifySwapFill(chainId, { ...fill, swapId: 'ab'.repeat(32) }), false);
+    assert.equal(verifySwapFill('deadbeef00000000', fill), false);
+    assert.throws(() => signSwapFill(chainId, { ...fill, taker: maker.pk }, maker.sk), /maker and taker must differ/);
+    assert.throws(() => signSwapFill(chainId, { ...fill, btcSats: '999999' }, taker.sk), /does not match/);
+    assert.throws(() => signSwapFill(chainId, { ...fill, hashlock: undefined }, taker.sk), /set together/);
+
+    // BUY_I0 fill (no swapId/hashlock yet) + maker completion bind (signedBy: 'maker') both verify cleanly
+    const buyFill = signSwapFill(chainId, {
+      id: 'fill_buy_1',
+      quoteId: q.id,
+      quoteSig: q.sig,
+      maker: maker.pk,
+      taker: taker.pk,
+      side: 'BUY_I0',
+      rateSatsPerI0: q.rateSatsPerI0,
+      i0Amount: i0Amount.toString(),
+      btcSats: btcSats.toString(),
+      network: 'signet',
+      expiresAt: 2_000_000_000,
+    }, taker.sk);
+    assert.equal(verifySwapFill(chainId, buyFill), true);
+
+    const makerSwapId = computeSwapId(chainId, maker.pk, 1);
+    const makerBind = signSwapFill(chainId, {
+      id: 'bind_maker_1',
+      signedBy: 'maker',
+      quoteId: q.id,
+      quoteSig: q.sig,
+      takerFillId: buyFill.id,
+      takerFillSig: buyFill.sig,
+      maker: maker.pk,
+      taker: taker.pk,
+      side: 'BUY_I0',
+      rateSatsPerI0: q.rateSatsPerI0,
+      i0Amount: i0Amount.toString(),
+      btcSats: btcSats.toString(),
+      network: 'signet',
+      swapId: makerSwapId,
+      hashlock,
+      expiresAt: 2_000_000_000,
+    }, maker.sk);
+    assert.equal(verifySwapFill(chainId, makerBind), true);
+    assert.equal(verifySwapFill(chainId, { ...makerBind, takerFillSig: '00'.repeat(64) }), false);
+    assert.equal(verifySwapFill(chainId, { ...makerBind, sig: buyFill.sig }), false);
+    assert.throws(() => signSwapFill(chainId, { ...makerBind, swapId: undefined, hashlock: undefined }, maker.sk), /requires swapId and hashlock/);
+  });
+
+  it('computeBlockTradeStats matches exact settled gross turnover and uniform clearing price', () => {
+    const miner = keyFor(84);
+    const alice = keyFor(85);
+    const bob = keyFor(86);
+    let state = createGenesisState(GENESIS_ID, V1_TEST_PARAMS, GENESIS_BTC_H);
+    state = mineBlock(state, { miner: miner.pk, btcHeight: GENESIS_BTC_H + 1 }).next;
+
+    const txs2 = [
+      signTx(state.chainId, { type: 'TRANSFER', from: miner.pk, to: alice.pk, tokenId: I0_TOKEN_ID, amount: (400n * UNIT).toString(), nonce: 1, fee: '0' }, miner.sk),
+      signTx(state.chainId, { type: 'TRANSFER', from: miner.pk, to: bob.pk, tokenId: I0_TOKEN_ID, amount: (400n * UNIT).toString(), nonce: 2, fee: '0' }, miner.sk),
+    ];
+    state = mineBlock(state, { miner: miner.pk, txs: txs2, btcHeight: GENESIS_BTC_H + 2 }).next;
+
+    const launchTx = signTx(state.chainId, { type: 'LAUNCH', from: bob.pk, ticker: 'EXACT', name: 'Exact Batch', artId: '', initialBuy: (100n * UNIT).toString(), nonce: 1, fee: '0' }, bob.sk);
+    const tid = computeTokenId(state.chainId, launchTx);
+    state = mineBlock(state, { miner: miner.pk, txs: [launchTx], btcHeight: GENESIS_BTC_H + 3 }).next;
+
+    const bobTok = getBalance(state, bob.pk, tid);
+    const sellAmt = bobTok / 2n;
+    const buyAmt = 60n * UNIT;
+    const txs4 = [
+      signTx(state.chainId, { type: 'BUY', from: alice.pk, tokenId: tid, i0In: buyAmt.toString(), minTokOut: '0', nonce: 1, fee: '0' }, alice.sk),
+      signTx(state.chainId, { type: 'SELL', from: bob.pk, tokenId: tid, tokIn: sellAmt.toString(), minI0Out: '0', nonce: 2, fee: '0' }, bob.sk),
+    ];
+    const prev = state;
+    const { block: b4, next } = mineBlock(state, { miner: miner.pk, txs: txs4, btcHeight: GENESIS_BTC_H + 4 });
+
+    const st = computeBlockTradeStats(prev, b4.txs, V1_TEST_PARAMS).get(tid);
+    const tokPre = prev.tokens.get(tid);
+    const tokPost = next.tokens.get(tid);
+    const expectedSettledSellGross = tokPre.realI0 + st.netBuyI0 - tokPost.realI0;
+    assert.equal(st.settledSellGrossI0, expectedSettledSellGross);
+    assert.equal(st.grossVolI0, buyAmt + expectedSettledSellGross);
+    const expectedClear = Number(tokPre.virtualI0 + tokPre.realI0 + st.netBuyI0) / Number(tokPre.realTok + sellAmt);
+    assert.equal(st.clearPrice, expectedClear);
   });
 });

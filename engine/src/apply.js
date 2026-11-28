@@ -1,7 +1,7 @@
 // Core deterministic transaction canonicalization, BIP-340 signing, mempool cancel/replace,
 // joint-validated batch selection/preview, uniform zero-MEV batch clearing, and applyBlock().
 
-import { I0_TOKEN_ID, V1_MAINNET_PARAMS, blockRewardForHeight } from './constants.js';
+import { I0_TOKEN_ID, UNIT, V1_MAINNET_PARAMS, blockRewardForHeight } from './constants.js';
 import {
   bytesToHex,
   hexToBytes,
@@ -37,6 +37,10 @@ const HEX128_RE = /^[0-9a-f]{128}$/;
 const TOKEN_ID_RE = /^t_[0-9a-f]{64}$/;
 const TICKER_RE = /^[A-Za-z0-9._-]{1,12}$/;
 const NAME_SAFE_RE = /^[ -~]{1,32}$/;
+const DESC_SAFE_RE = /^[ -~]{0,160}$/;
+// Canonical bare domain[/path] (no scheme, so block JSON stays offline-scanner clean while UI renders https://).
+const WEB_SAFE_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}(?:\/[A-Za-z0-9._~:/?#[\]@!$&()*+,;=-]*)?$/;
+const X_HANDLE_RE = /^[A-Za-z0-9_]{1,15}$/;
 const HTML_UNSAFE_RE = /[<>&"'`]/;
 const PLACEHOLDER_BLOCK_ID = '0'.repeat(64) + 'i0';
 
@@ -65,7 +69,7 @@ export function isValidTokenId(tokenId) {
   return tokenId === I0_TOKEN_ID || (typeof tokenId === 'string' && TOKEN_ID_RE.test(tokenId));
 }
 
-export function validateLaunchMetadata({ ticker, name, artId = '' }, params = V1_MAINNET_PARAMS) {
+export function validateLaunchMetadata({ ticker, name, artId = '', desc = '', web = '', x = '' }, params = V1_MAINNET_PARAMS) {
   if (
     typeof ticker !== 'string' ||
     ticker.length < 1 ||
@@ -91,12 +95,43 @@ export function validateLaunchMetadata({ ticker, name, artId = '' }, params = V1
   ) {
     throw new Error('Invalid artId (must be empty or a valid inscription ID)');
   }
-  return { ticker, name, artId: normalizedArt };
+  const maxDescLen = params.maxDescLen ?? V1_MAINNET_PARAMS.maxDescLen;
+  const normalizedDesc = desc ?? '';
+  if (
+    typeof normalizedDesc !== 'string' ||
+    normalizedDesc.length > maxDescLen ||
+    !DESC_SAFE_RE.test(normalizedDesc) ||
+    HTML_UNSAFE_RE.test(normalizedDesc)
+  ) {
+    throw new Error(`Invalid description (printable ASCII 0..${maxDescLen} chars, no HTML metacharacters)`);
+  }
+  const maxWebLen = params.maxWebLen ?? V1_MAINNET_PARAMS.maxWebLen;
+  const normalizedWeb = web ?? '';
+  if (
+    typeof normalizedWeb !== 'string' ||
+    normalizedWeb.length > maxWebLen ||
+    (normalizedWeb !== '' && (!WEB_SAFE_RE.test(normalizedWeb) || HTML_UNSAFE_RE.test(normalizedWeb)))
+  ) {
+    throw new Error(`Invalid website domain/path (must be empty or domain.tld[/path] without scheme, up to ${maxWebLen} chars)`);
+  }
+  const maxXLen = params.maxXLen ?? V1_MAINNET_PARAMS.maxXLen;
+  const normalizedX = x ?? '';
+  if (typeof normalizedX !== 'string' || (normalizedX !== '' && (normalizedX.length > maxXLen || !X_HANDLE_RE.test(normalizedX)))) {
+    throw new Error(`Invalid X handle (1..${maxXLen} chars without @: A-Z, a-z, 0-9, _)`);
+  }
+  return {
+    ticker,
+    name,
+    artId: normalizedArt,
+    desc: normalizedDesc,
+    web: normalizedWeb,
+    x: normalizedX,
+  };
 }
 
 // Full 256-bit launch-bound immutable token ID: binds every signed LAUNCH parameter
-// (chainId, from, nonce, ticker, name, artId, initialBuy) so competing launches on
-// forks can never alias the same tokenId.
+// (chainId, from, nonce, ticker, name, artId, initialBuy, plus optional desc/web/x) so competing launches on
+// forks can never alias the same tokenId while remaining 100% identical for launches without extra metadata.
 export function computeTokenId(chainId, launch) {
   if (!launch || typeof launch !== 'object') {
     throw new Error('computeTokenId requires a launch object');
@@ -110,6 +145,9 @@ export function computeTokenId(chainId, launch) {
     artId: launch.artId ?? '',
     initialBuy: String(launch.initialBuy ?? '0'),
   };
+  if (launch.desc) payload.desc = launch.desc;
+  if (launch.web) payload.web = launch.web;
+  if (launch.x) payload.x = launch.x;
   return 't_' + sha256Hex(`eyezero:v1:token:${JSON.stringify(payload)}`);
 }
 
@@ -143,6 +181,9 @@ export function canonicalizeTx(tx) {
       out.ticker = tx.ticker;
       out.name = tx.name;
       out.artId = tx.artId ?? '';
+      if (tx.desc) out.desc = tx.desc;
+      if (tx.web) out.web = tx.web;
+      if (tx.x) out.x = tx.x;
       out.initialBuy = String(tx.initialBuy ?? '0');
       break;
     case 'BUY':
@@ -211,6 +252,144 @@ export function verifyTxSignature(chainId, tx) {
   try {
     const digest = txDigest(chainId, tx);
     return schnorrVerify(digest, tx.from, tx.sig);
+  } catch {
+    return false;
+  }
+}
+
+// Off-chain signed BIP-340 P2P swap quotes for Entmoot #i0-swap Market/Limit orderbook.
+export function canonicalizeSwapQuote(q) {
+  if (!q || typeof q !== 'object') throw new Error('Swap quote must be an object');
+  if (q.side !== 'BUY_I0' && q.side !== 'SELL_I0') throw new Error('Swap quote side must be BUY_I0 or SELL_I0');
+  if (q.network !== 'signet' && q.network !== 'regtest' && q.network !== 'mainnet') {
+    throw new Error('Invalid swap quote network');
+  }
+  assertPubkey(q.maker, 'quote.maker');
+  const rate = parseAmount(q.rateSatsPerI0, 'rateSatsPerI0');
+  const minI0 = parseAmount(q.minI0, 'minI0');
+  const maxI0 = parseAmount(q.maxI0, 'maxI0');
+  if (maxI0 < minI0) throw new Error('Swap quote maxI0 < minI0');
+  if (!Number.isInteger(q.expiresAt) || q.expiresAt < 1) throw new Error('Invalid quote expiresAt');
+  const out = {
+    v: 1,
+    id: typeof q.id === 'string' && /^[A-Za-z0-9_-]{4,48}$/.test(q.id) ? q.id : null,
+    maker: q.maker,
+    side: q.side,
+    rateSatsPerI0: rate.toString(),
+    minI0: minI0.toString(),
+    maxI0: maxI0.toString(),
+    network: q.network,
+    expiresAt: q.expiresAt,
+  };
+  if (!out.id) throw new Error('Invalid quote id');
+  if (q.sig !== undefined) out.sig = q.sig;
+  return out;
+}
+
+export function swapQuoteDigest(chainId, q) {
+  const canon = canonicalizeSwapQuote(q);
+  delete canon.sig;
+  return sha256(`eyezero:v1:swap-quote:${JSON.stringify({ chainId, ...canon })}`);
+}
+
+export function signSwapQuote(chainId, q, privKeyBytes, auxRandBytes) {
+  const canon = canonicalizeSwapQuote(q);
+  delete canon.sig;
+  const sig = bytesToHex(schnorrSign(swapQuoteDigest(chainId, canon), privKeyBytes, auxRandBytes));
+  return { ...canon, sig };
+}
+
+export function verifySwapQuote(chainId, q) {
+  if (!q || typeof q.sig !== 'string' || !HEX128_RE.test(q.sig)) return false;
+  try {
+    const canon = canonicalizeSwapQuote(q);
+    return schnorrVerify(swapQuoteDigest(chainId, canon), canon.maker, canon.sig);
+  } catch {
+    return false;
+  }
+}
+
+// Off-chain signed BIP-340 P2P swap fill binding a taker's agreed BTC satoshis, quoteId, quoteSig,
+// network, and (when I0 is locked by taker) on-chain swapId + hashlock on Entmoot #i0-swap.
+export function canonicalizeSwapFill(f) {
+  if (!f || typeof f !== 'object') throw new Error('Swap fill must be an object');
+  if (f.kind !== undefined && f.kind !== 'SWAP_FILL') throw new Error('Swap fill kind must be SWAP_FILL');
+  if (f.side !== 'BUY_I0' && f.side !== 'SELL_I0') throw new Error('Swap fill side must be BUY_I0 or SELL_I0');
+  if (f.network !== 'signet' && f.network !== 'regtest' && f.network !== 'mainnet') {
+    throw new Error('Invalid swap fill network');
+  }
+  const signedBy = f.signedBy ?? 'taker';
+  if (signedBy !== 'taker' && signedBy !== 'maker') throw new Error('Swap fill signedBy must be taker or maker');
+  assertPubkey(f.maker, 'fill.maker');
+  assertPubkey(f.taker, 'fill.taker');
+  if (f.maker === f.taker) throw new Error('Swap fill maker and taker must differ');
+  if (typeof f.id !== 'string' || !/^[A-Za-z0-9_-]{4,48}$/.test(f.id)) throw new Error('Invalid fill id');
+  if (typeof f.quoteId !== 'string' || !/^[A-Za-z0-9_-]{4,48}$/.test(f.quoteId)) throw new Error('Invalid fill quoteId');
+  if (typeof f.quoteSig !== 'string' || !HEX128_RE.test(f.quoteSig)) throw new Error('Invalid fill quoteSig');
+  const rate = parseAmount(f.rateSatsPerI0, 'rateSatsPerI0');
+  const i0Amount = parseAmount(f.i0Amount, 'i0Amount');
+  const btcSats = parseAmount(f.btcSats, 'btcSats');
+  const floorSats = (i0Amount * rate) / UNIT;
+  const ceilSats = (i0Amount * rate + UNIT - 1n) / UNIT;
+  if (btcSats < floorSats || btcSats > ceilSats) {
+    throw new Error('Swap fill btcSats does not match i0Amount * rateSatsPerI0');
+  }
+  if (!Number.isInteger(f.expiresAt) || f.expiresAt < 1) throw new Error('Invalid fill expiresAt');
+  const hasSwapId = f.swapId !== undefined && f.swapId !== null && f.swapId !== '';
+  const hasHashlock = f.hashlock !== undefined && f.hashlock !== null && f.hashlock !== '';
+  if (hasSwapId !== hasHashlock) throw new Error('Swap fill swapId and hashlock must be set together');
+  if (hasSwapId && (typeof f.swapId !== 'string' || !HEX64_RE.test(f.swapId))) throw new Error('Invalid fill swapId');
+  if (hasHashlock && (typeof f.hashlock !== 'string' || !HEX64_RE.test(f.hashlock))) throw new Error('Invalid fill hashlock');
+  if (signedBy === 'maker') {
+    if (f.side !== 'BUY_I0') throw new Error('Maker-bound swap fill must be for BUY_I0');
+    if (!hasSwapId || !hasHashlock) throw new Error('Maker-bound swap fill requires swapId and hashlock');
+    if (typeof f.takerFillId !== 'string' || !/^[A-Za-z0-9_-]{4,48}$/.test(f.takerFillId)) throw new Error('Invalid takerFillId');
+    if (typeof f.takerFillSig !== 'string' || !HEX128_RE.test(f.takerFillSig)) throw new Error('Invalid takerFillSig');
+  }
+  const out = {
+    v: 1,
+    kind: 'SWAP_FILL',
+    ...(signedBy === 'maker' ? { signedBy: 'maker' } : {}),
+    id: f.id,
+    quoteId: f.quoteId,
+    quoteSig: f.quoteSig,
+    ...(signedBy === 'maker' ? { takerFillId: f.takerFillId, takerFillSig: f.takerFillSig } : {}),
+    maker: f.maker,
+    taker: f.taker,
+    side: f.side,
+    rateSatsPerI0: rate.toString(),
+    i0Amount: i0Amount.toString(),
+    btcSats: btcSats.toString(),
+    network: f.network,
+    expiresAt: f.expiresAt,
+  };
+  if (hasSwapId) {
+    out.swapId = f.swapId;
+    out.hashlock = f.hashlock;
+  }
+  if (f.sig !== undefined) out.sig = f.sig;
+  return out;
+}
+
+export function swapFillDigest(chainId, f) {
+  const canon = canonicalizeSwapFill(f);
+  delete canon.sig;
+  return sha256(`eyezero:v1:swap-fill:${JSON.stringify({ chainId, ...canon })}`);
+}
+
+export function signSwapFill(chainId, f, privKeyBytes, auxRandBytes) {
+  const canon = canonicalizeSwapFill(f);
+  delete canon.sig;
+  const sig = bytesToHex(schnorrSign(swapFillDigest(chainId, canon), privKeyBytes, auxRandBytes));
+  return { ...canon, sig };
+}
+
+export function verifySwapFill(chainId, f) {
+  if (!f || typeof f.sig !== 'string' || !HEX128_RE.test(f.sig)) return false;
+  try {
+    const canon = canonicalizeSwapFill(f);
+    const signer = canon.signedBy === 'maker' ? canon.maker : canon.taker;
+    return schnorrVerify(swapFillDigest(chainId, canon), signer, canon.sig);
   } catch {
     return false;
   }
@@ -288,7 +467,7 @@ export function resolvePendingMempool(state, pendingTxs, { verifiedSigs = null }
 // Execute deterministic state transition for a list of transactions inside a block.
 // `skipSigVerify` is strictly internal for pre-verified batches inside previewPending/selectCandidateTxs;
 // consensus applyBlock() ALWAYS passes skipSigVerify=false.
-function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = false } = {}) {
+function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = false, tradeStats = null } = {}) {
   if (txs.length > params.maxTxsPerBlock) {
     throw new Error(`Block exceeds maxTxsPerBlock (${txs.length} > ${params.maxTxsPerBlock})`);
   }
@@ -361,8 +540,15 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
       }
 
       case 'LAUNCH': {
-        const { artId } = validateLaunchMetadata(
-          { ticker: tx.ticker, name: tx.name, artId: tx.artId ?? '' },
+        const meta = validateLaunchMetadata(
+          {
+            ticker: tx.ticker,
+            name: tx.name,
+            artId: tx.artId ?? '',
+            desc: tx.desc ?? '',
+            web: tx.web ?? '',
+            x: tx.x ?? '',
+          },
           params,
         );
         subBalance(next, tx.from, I0_TOKEN_ID, params.launchFee);
@@ -372,9 +558,12 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
         const tokenId = computeTokenId(next.chainId, {
           from: tx.from,
           nonce: tx.nonce,
-          ticker: tx.ticker,
-          name: tx.name,
-          artId,
+          ticker: meta.ticker,
+          name: meta.name,
+          artId: meta.artId,
+          ...(meta.desc ? { desc: meta.desc } : {}),
+          ...(meta.web ? { web: meta.web } : {}),
+          ...(meta.x ? { x: meta.x } : {}),
           initialBuy: initialBuy.toString(),
         });
         if (next.tokens.has(tokenId)) {
@@ -382,9 +571,12 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
         }
         next.tokens.set(tokenId, {
           id: tokenId,
-          ticker: tx.ticker,
-          name: tx.name,
-          artId,
+          ticker: meta.ticker,
+          name: meta.name,
+          artId: meta.artId,
+          desc: meta.desc,
+          web: meta.web,
+          x: meta.x,
           creator: tx.from,
           virtualI0: params.virtualI0,
           realI0: 0n,
@@ -393,14 +585,11 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
 
         if (initialBuy > 0n) {
           subBalance(next, tx.from, I0_TOKEN_ID, initialBuy);
-          const totalFee = (initialBuy * params.tradeFeeBps) / params.bpsDenom;
-          const creatorFee = totalFee / 2n;
-          const minerFee = totalFee - creatorFee;
+          const { creatorFee, minerFee, netI0: netB } = splitTradeFee(initialBuy, params);
           addBalance(next, tx.from, I0_TOKEN_ID, creatorFee);
           addBalance(next, miner, I0_TOKEN_ID, minerFee);
-          const netB = initialBuy - totalFee;
           if (netB <= 0n) throw new Error('initialBuy too small after fee');
-          getBatch(tokenId).buys.push({ from: tx.from, netB, minTokOut: 0n });
+          getBatch(tokenId).buys.push({ from: tx.from, grossI0: initialBuy, netB, minTokOut: 0n });
         }
         break;
       }
@@ -461,14 +650,11 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
         const minTokOut = parseAmount(tx.minTokOut ?? '0', 'minTokOut', true);
         const tok = next.tokens.get(tx.tokenId);
         subBalance(next, tx.from, I0_TOKEN_ID, i0In);
-        const totalFee = (i0In * params.tradeFeeBps) / params.bpsDenom;
-        const creatorFee = totalFee / 2n;
-        const minerFee = totalFee - creatorFee;
+        const { creatorFee, minerFee, netI0: netB } = splitTradeFee(i0In, params);
         addBalance(next, tok.creator, I0_TOKEN_ID, creatorFee);
         addBalance(next, miner, I0_TOKEN_ID, minerFee);
-        const netB = i0In - totalFee;
         if (netB <= 0n) throw new Error('BUY amount too small after fee');
-        getBatch(tx.tokenId).buys.push({ from: tx.from, netB, minTokOut });
+        getBatch(tx.tokenId).buys.push({ from: tx.from, grossI0: i0In, netB, minTokOut });
         break;
       }
 
@@ -494,21 +680,20 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
     const { buys, sells } = batches.get(tokenId);
 
     let B = 0n;
-    for (const o of buys) B += o.netB;
-    let S = 0n;
-    for (const o of sells) S += o.tokIn;
-    if (B === 0n && S === 0n) continue;
-
+    let grossBuyI0 = 0n;
+    for (const o of buys) {
+      B += o.netB;
+      grossBuyI0 += o.grossI0 ?? 0n;
+    }
     const X = tok.virtualI0 + tok.realI0;
     const Y = tok.realTok;
     const kBefore = X * Y;
-
-    const outTokTotal = B > 0n ? (B * (Y + S)) / (X + B) : 0n;
-    const outI0Total = S > 0n ? (S * (X + B)) / (Y + S) : 0n;
+    const clear = computeUniformBatchClear(X, Y, B, sells.map((o) => o.tokIn));
+    if (B === 0n && clear.S === 0n) continue;
 
     let actualPaidTok = 0n;
     for (const o of buys) {
-      const tokOut = (o.netB * outTokTotal) / B;
+      const tokOut = (o.netB * clear.outTokTotal) / B;
       if (tokOut < o.minTokOut) {
         throw new Error(`BUY slippage exceeded on token ${tokenId}: got ${tokOut} < min ${o.minTokOut}`);
       }
@@ -516,24 +701,20 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
       actualPaidTok += tokOut;
     }
 
-    let actualPaidI0 = 0n;
-    for (const o of sells) {
-      const grossI0 = (o.tokIn * outI0Total) / S;
-      const totalFee = (grossI0 * params.tradeFeeBps) / params.bpsDenom;
-      const creatorFee = totalFee / 2n;
-      const minerFee = totalFee - creatorFee;
-      const netI0 = grossI0 - totalFee;
+    for (let i = 0; i < sells.length; i++) {
+      const o = sells[i];
+      const grossI0 = clear.sellGrossI0s[i];
+      const { creatorFee, minerFee, netI0 } = splitTradeFee(grossI0, params);
       if (netI0 < o.minI0Out) {
         throw new Error(`SELL slippage exceeded on token ${tokenId}: got ${netI0} < min ${o.minI0Out}`);
       }
       addBalance(next, o.from, I0_TOKEN_ID, netI0);
       addBalance(next, tok.creator, I0_TOKEN_ID, creatorFee);
       addBalance(next, miner, I0_TOKEN_ID, minerFee);
-      actualPaidI0 += grossI0;
     }
 
-    const newRealI0 = tok.realI0 + B - actualPaidI0;
-    const newRealTok = tok.realTok + S - actualPaidTok;
+    const newRealI0 = tok.realI0 + B - clear.actualPaidI0;
+    const newRealTok = tok.realTok + clear.S - actualPaidTok;
     if (newRealI0 < 0n || newRealTok < 0n) {
       throw new Error(`Solvency violation on token ${tokenId}: realI0=${newRealI0}, realTok=${newRealTok}`);
     }
@@ -543,7 +724,104 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
     }
     tok.realI0 = newRealI0;
     tok.realTok = newRealTok;
+    if (tradeStats) {
+      tradeStats.set(tokenId, {
+        grossBuyI0,
+        netBuyI0: B,
+        sellTok: clear.S,
+        settledSellGrossI0: clear.actualPaidI0,
+        grossVolI0: grossBuyI0 + clear.actualPaidI0,
+        openPrice: Number(X) / Number(Y),
+        clearPrice: clear.clearPrice,
+      });
+    }
   }
+}
+
+// Shared fee split & uniform batch clearing arithmetic (single source of truth for both settlement and OHLC stats).
+export function splitTradeFee(grossI0, params = V1_MAINNET_PARAMS) {
+  const totalFee = (grossI0 * params.tradeFeeBps) / params.bpsDenom;
+  const creatorFee = (totalFee * (params.creatorFeeNum ?? 1n)) / (params.creatorFeeDen ?? 2n);
+  const minerFee = totalFee - creatorFee;
+  return { totalFee, creatorFee, minerFee, netI0: grossI0 - totalFee };
+}
+
+function computeUniformBatchClear(X, Y, B, sellTokAmounts) {
+  let S = 0n;
+  for (const tokIn of sellTokAmounts) S += tokIn;
+  const outTokTotal = B > 0n ? (B * (Y + S)) / (X + B) : 0n;
+  const outI0Total = S > 0n ? (S * (X + B)) / (Y + S) : 0n;
+  const sellGrossI0s = [];
+  let actualPaidI0 = 0n;
+  for (const tokIn of sellTokAmounts) {
+    const grossI0 = (tokIn * outI0Total) / S;
+    sellGrossI0s.push(grossI0);
+    actualPaidI0 += grossI0;
+  }
+  return { S, outTokTotal, outI0Total, sellGrossI0s, actualPaidI0, clearPrice: Number(X + B) / Number(Y + S) };
+}
+
+// Compute exact settled gross turnover and uniform clearing price using the exact same shared
+// splitTradeFee() and computeUniformBatchClear() helpers as executeBlockTxs().
+export function computeBlockTradeStats(prevState, txs, params = V1_MAINNET_PARAMS) {
+  const preTokens = new Map();
+  for (const [tid, tok] of prevState.tokens.entries()) {
+    preTokens.set(tid, { virtualI0: tok.virtualI0, realI0: tok.realI0, realTok: tok.realTok });
+  }
+  const batches = new Map();
+  const getBatch = (tid) => {
+    let b = batches.get(tid);
+    if (!b) {
+      b = { grossBuyI0: 0n, netBuyI0: 0n, sells: [] };
+      batches.set(tid, b);
+    }
+    return b;
+  };
+  for (const tx of txs || []) {
+    if (tx.type === 'LAUNCH') {
+      const tid = computeTokenId(prevState.chainId, tx);
+      if (!preTokens.has(tid)) {
+        preTokens.set(tid, { virtualI0: params.virtualI0, realI0: 0n, realTok: params.initialTokSupply });
+      }
+      const initialBuy = BigInt(tx.initialBuy || '0');
+      if (initialBuy > 0n) {
+        const { netI0: netB } = splitTradeFee(initialBuy, params);
+        const b = getBatch(tid);
+        b.grossBuyI0 += initialBuy;
+        b.netBuyI0 += netB;
+      }
+    } else if (tx.type === 'BUY' && preTokens.has(tx.tokenId)) {
+      const i0In = BigInt(tx.i0In || '0');
+      if (i0In > 0n) {
+        const { netI0: netB } = splitTradeFee(i0In, params);
+        const b = getBatch(tx.tokenId);
+        b.grossBuyI0 += i0In;
+        b.netBuyI0 += netB;
+      }
+    } else if (tx.type === 'SELL' && preTokens.has(tx.tokenId)) {
+      const tokIn = BigInt(tx.tokIn || '0');
+      if (tokIn > 0n) getBatch(tx.tokenId).sells.push(tokIn);
+    }
+  }
+  const stats = new Map();
+  for (const [tid, b] of batches.entries()) {
+    const tok = preTokens.get(tid);
+    if (!tok) continue;
+    const X = tok.virtualI0 + tok.realI0;
+    const Y = tok.realTok;
+    const clear = computeUniformBatchClear(X, Y, b.netBuyI0, b.sells);
+    if (b.netBuyI0 === 0n && clear.S === 0n) continue;
+    stats.set(tid, {
+      grossBuyI0: b.grossBuyI0,
+      netBuyI0: b.netBuyI0,
+      sellTok: clear.S,
+      settledSellGrossI0: clear.actualPaidI0,
+      grossVolI0: b.grossBuyI0 + clear.actualPaidI0,
+      openPrice: Number(X) / Number(Y),
+      clearPrice: clear.clearPrice,
+    });
+  }
+  return stats;
 }
 
 // Helper for miners / tests: construct a complete candidate block payload with exact stateRoot,

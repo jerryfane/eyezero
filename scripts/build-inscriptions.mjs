@@ -329,25 +329,109 @@ function pushBlock(label, btcHeight, inscNum, minerPk, txs) {
 
 pushBlock('b1', 924_101, 80_100_001, personas.miner.pk, []);
 pushBlock('b2', 924_102, 80_100_002, personas.miner.pk, [
-  signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.creator.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 1, fee: '0' }, personas.miner.sk),
-  signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.alice.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 2, fee: '0' }, personas.miner.sk),
-  signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.bob.pk, tokenId: 0, amount: (250n * UNIT).toString(), nonce: 3, fee: '0' }, personas.miner.sk),
+  signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.creator.pk, tokenId: 0, amount: (600n * UNIT).toString(), nonce: 1, fee: '0' }, personas.miner.sk),
+  signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.alice.pk, tokenId: 0, amount: (500n * UNIT).toString(), nonce: 2, fee: '0' }, personas.miner.sk),
+  signTx(state.chainId, { type: 'TRANSFER', from: personas.miner.pk, to: personas.bob.pk, tokenId: 0, amount: (500n * UNIT).toString(), nonce: 3, fee: '0' }, personas.miner.sk),
 ]);
 
-const launchEye0 = { type: 'LAUNCH', from: personas.creator.pk, ticker: 'EYE0', name: 'EyeZero', artId: DEMO_GENESIS_ID, initialBuy: (50n * UNIT).toString(), nonce: 1, fee: '0' };
-const launchSatcat = { type: 'LAUNCH', from: personas.creator.pk, ticker: 'SATCAT', name: 'Satoshi Cat', artId: DEMO_GENESIS_ID, initialBuy: (25n * UNIT).toString(), nonce: 2, fee: '0' };
-const eye0Id = computeTokenId(state.chainId, launchEye0);
-const satcatId = computeTokenId(state.chainId, launchSatcat);
+const launchSpecs = [
+  { key: 'eye0', from: personas.creator, ticker: 'EYE0', name: 'EyeZero', desc: 'Zero-sequencer, zero-MEV flagship token inscribed directly on Bitcoin L1.', web: 'eyezero.themartian.app', x: 'eyezero_btc', init: 60n * UNIT, nonce: 1 },
+  { key: 'btcr', from: personas.creator, ticker: 'BTCR', name: 'BitRune Native', desc: 'Deep-liquidity bonding curve benchmark with uniform batch clearing.', web: 'eyezero.themartian.app', x: 'bitrune_i0', init: 110n * UNIT, nonce: 2 },
+  { key: 'satcat', from: personas.creator, ticker: 'SATCAT', name: 'Satoshi Cat', desc: 'Bitcoin-native Ordinals cat token with 0.5% perpetual creator royalties.', web: 'eyezero.themartian.app', x: 'satoshicat_btc', init: 45n * UNIT, nonce: 3 },
+  { key: 'zero', from: personas.creator, ticker: 'ZERO', name: 'No-MEV Club', desc: 'Uniform clearing price for every trader in the same Bitcoin block.', web: 'eyezero.themartian.app', x: 'nomev_club', init: 30n * UNIT, nonce: 4 },
+  { key: 'tapr', from: personas.creator, ticker: 'TAPR', name: 'Taproot Punk', desc: 'Fresh Taproot-anchored token launched with zero pre-mine or admin keys.', web: '', x: 'taproot_punk', init: 22n * UNIT, nonce: 5 },
+  { key: 'sat0', from: personas.creator, ticker: 'SAT0', name: 'Satoshi Zero', desc: 'Brand-new genesis fair-launch token on the eyezero curve.', web: '', x: 'sat0_btc', init: 14n * UNIT, nonce: 6 },
+];
+const tokIds = {};
+const makeLaunchTx = (sp) => {
+  const tx = {
+    type: 'LAUNCH',
+    from: sp.from.pk,
+    ticker: sp.ticker,
+    name: sp.name,
+    artId: DEMO_GENESIS_ID,
+    ...(sp.desc ? { desc: sp.desc } : {}),
+    ...(sp.web ? { web: sp.web } : {}),
+    ...(sp.x ? { x: sp.x } : {}),
+    initialBuy: sp.init.toString(),
+    nonce: sp.nonce,
+    fee: '0',
+  };
+  tokIds[sp.key] = computeTokenId(state.chainId, tx);
+  return signTx(state.chainId, tx, sp.from.sk);
+};
+
+// Block 3: launch EYE0 + BTCR + initial buys
 pushBlock('b3', 924_103, 80_100_003, personas.miner.pk, [
-  signTx(state.chainId, launchEye0, personas.creator.sk),
-  signTx(state.chainId, launchSatcat, personas.creator.sk),
-  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: eye0Id, i0In: (80n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.alice.sk),
-  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: eye0Id, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.bob.sk),
-  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: satcatId, i0In: (60n * UNIT).toString(), minTokOut: '1', nonce: 2, fee: '0' }, personas.bob.sk),
+  makeLaunchTx(launchSpecs[0]),
+  makeLaunchTx(launchSpecs[1]),
+  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: tokIds.eye0, i0In: (45n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.alice.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: tokIds.btcr, i0In: (70n * UNIT).toString(), minTokOut: '1', nonce: 1, fee: '0' }, personas.bob.sk),
 ]);
 
-overrides.unshift({ route: '/r/blockheight', status: 200, contentType: 'application/json', body: JSON.stringify(924_103), enabled: true });
-overrides.push({ route: '/r/blockhash/924103', status: 200, contentType: 'application/json', body: JSON.stringify(btcHash(924_103)), enabled: true });
+// Block 4: launch SATCAT + momentum buys on EYE0
+pushBlock('b4', 924_104, 80_100_004, personas.miner.pk, [
+  makeLaunchTx(launchSpecs[2]),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: tokIds.eye0, i0In: (55n * UNIT).toString(), minTokOut: '1', nonce: 2, fee: '0' }, personas.bob.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: tokIds.satcat, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 2, fee: '0' }, personas.alice.sk),
+]);
+
+// Block 5: pullback sell on EYE0 + buy on SATCAT
+const aliceEye0Bal5 = state.accounts.get(personas.alice.pk)?.balances.get(tokIds.eye0) ?? 0n;
+pushBlock('b5', 924_105, 80_100_005, personas.miner.pk, [
+  signTx(state.chainId, { type: 'SELL', from: personas.alice.pk, tokenId: tokIds.eye0, tokIn: (aliceEye0Bal5 / 3n).toString(), minI0Out: '1', nonce: 3, fee: '0' }, personas.alice.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: tokIds.satcat, i0In: (55n * UNIT).toString(), minTokOut: '1', nonce: 3, fee: '0' }, personas.bob.sk),
+]);
+
+// Block 6 (mandatory checkpoint block 1.5x!): launch ZERO + buys on EYE0 & BTCR
+pushBlock('b6', 924_106, 80_100_006, personas.miner.pk, [
+  makeLaunchTx(launchSpecs[3]),
+  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: tokIds.eye0, i0In: (65n * UNIT).toString(), minTokOut: '1', nonce: 4, fee: '0' }, personas.alice.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.miner.pk, tokenId: tokIds.btcr, i0In: (95n * UNIT).toString(), minTokOut: '1', nonce: 4, fee: '0' }, personas.miner.sk),
+]);
+
+// Block 7: healthy dip on EYE0 + SATCAT rally
+const bobEye0Bal7 = state.accounts.get(personas.bob.pk)?.balances.get(tokIds.eye0) ?? 0n;
+pushBlock('b7', 924_107, 80_100_007, personas.miner.pk, [
+  signTx(state.chainId, { type: 'SELL', from: personas.bob.pk, tokenId: tokIds.eye0, tokIn: (bobEye0Bal7 / 2n).toString(), minI0Out: '1', nonce: 4, fee: '0' }, personas.bob.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: tokIds.zero, i0In: (35n * UNIT).toString(), minTokOut: '1', nonce: 5, fee: '0' }, personas.alice.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.miner.pk, tokenId: tokIds.satcat, i0In: (50n * UNIT).toString(), minTokOut: '1', nonce: 5, fee: '0' }, personas.miner.sk),
+]);
+
+// Block 8: launch TAPR + strong breakout buy on EYE0
+pushBlock('b8', 924_108, 80_100_008, personas.miner.pk, [
+  makeLaunchTx(launchSpecs[4]),
+  signTx(state.chainId, { type: 'BUY', from: personas.miner.pk, tokenId: tokIds.eye0, i0In: (85n * UNIT).toString(), minTokOut: '1', nonce: 6, fee: '0' }, personas.miner.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: tokIds.tapr, i0In: (28n * UNIT).toString(), minTokOut: '1', nonce: 5, fee: '0' }, personas.bob.sk),
+]);
+
+// Block 9: launch SAT0 + mixed two-sided batch on EYE0 + ZERO buy
+const aliceEye0Bal9 = state.accounts.get(personas.alice.pk)?.balances.get(tokIds.eye0) ?? 0n;
+pushBlock('b9', 924_109, 80_100_009, personas.miner.pk, [
+  makeLaunchTx(launchSpecs[5]),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: tokIds.eye0, i0In: (70n * UNIT).toString(), minTokOut: '1', nonce: 6, fee: '0' }, personas.bob.sk),
+  signTx(state.chainId, { type: 'SELL', from: personas.alice.pk, tokenId: tokIds.eye0, tokIn: (aliceEye0Bal9 / 4n).toString(), minI0Out: '1', nonce: 6, fee: '0' }, personas.alice.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.miner.pk, tokenId: tokIds.zero, i0In: (40n * UNIT).toString(), minTokOut: '1', nonce: 7, fee: '0' }, personas.miner.sk),
+]);
+
+// Block 10: fresh highs on EYE0 + SAT0 buy + active HTLC escrow seed
+pushBlock('b10', 924_110, 80_100_010, personas.miner.pk, [
+  signTx(state.chainId, { type: 'BUY', from: personas.alice.pk, tokenId: tokIds.eye0, i0In: (50n * UNIT).toString(), minTokOut: '1', nonce: 7, fee: '0' }, personas.alice.sk),
+  signTx(state.chainId, { type: 'BUY', from: personas.bob.pk, tokenId: tokIds.sat0, i0In: (18n * UNIT).toString(), minTokOut: '1', nonce: 7, fee: '0' }, personas.bob.sk),
+  signTx(state.chainId, {
+    type: 'HTLC_LOCK',
+    from: personas.miner.pk,
+    recipient: personas.alice.pk,
+    amount: (45n * UNIT).toString(),
+    hashlock: sha256Hex('eyezero-demo-htlc-secret-1'),
+    timeoutBtcHeight: 924_142,
+    nonce: 8,
+    fee: '0',
+  }, personas.miner.sk),
+]);
+
+overrides.unshift({ route: '/r/blockheight', status: 200, contentType: 'application/json', body: JSON.stringify(924_110), enabled: true });
+overrides.push({ route: '/r/blockhash/924110', status: 200, contentType: 'application/json', body: JSON.stringify(btcHash(924_110)), enabled: true });
 
 filesManifest['blocks/tip.json'] = { id: null, role: 'asset', compress: null };
 for (const b of blocks) {

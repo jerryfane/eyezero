@@ -52,14 +52,14 @@ try {
   ]);
   console.log('[2-tab] Both browser tabs connected to Entmoot P2P live inside ord sandbox!');
 
-  // Capture the EXACT immutable tokenId from Tab 1 and select that identical tokenId in BOTH tabs.
-  const firstRow = f1.locator('#explore-tbody tr[data-token-id]').first();
+  // Capture the EXACT immutable tokenId from Tab 1's Trenches board and open that identical tokenId in BOTH tabs.
+  const firstRow = f1.locator('#explore-board [data-token-id]').first();
   await firstRow.waitFor({ timeout: 10_000 });
   const targetTokenId = await firstRow.getAttribute('data-token-id');
   assert.ok(targetTokenId && targetTokenId.startsWith('t_'), `Expected immutable tokenId, got: ${targetTokenId}`);
 
-  await f1.locator(`#explore-tbody tr[data-token-id="${targetTokenId}"]`).click();
-  await f2.locator(`#explore-tbody tr[data-token-id="${targetTokenId}"]`).click();
+  await f1.locator(`#explore-board [data-token-id="${targetTokenId}"]`).first().click();
+  await f2.locator(`#explore-board [data-token-id="${targetTokenId}"]`).first().click();
 
   // Pick a demo signer with pending-nonce headroom (< 8 pending orders) using structured data-tx-from attributes.
   const SIGNERS = ['alice', 'creator', 'miner', 'bob'];

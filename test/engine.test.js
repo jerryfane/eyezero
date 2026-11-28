@@ -40,7 +40,11 @@ import {
   sha256Hex,
   signTx,
 } from '../engine/src/index.js';
-import { syncChainFromOrd } from '../miner/src/cli.mjs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runMinerOnce, syncChainFromOrd } from '../miner/src/cli.mjs';
 import { minifyCss, minifyHtml, minifyJs } from '../scripts/minify.mjs';
 
 const GENESIS_ID = '0000000000000000000000000000000000000000000000000000000000000001i0';
@@ -821,12 +825,20 @@ describe('Signet production parameters and inscription minifier', () => {
     const cssIn = `
       /* Header rule */
       .badge::after { content: "a : b ; { } /* keep */"; color: #5ad8e6; }
+      .toolbar :focus { outline: 1px solid #5ad8e6; }
       .a > .b { margin: 0 12px; }
     `;
     const cssOut = minifyCss(cssIn);
     assert.ok(cssOut.includes('content:"a : b ; { } /* keep */"'));
+    assert.ok(cssOut.includes('.toolbar :focus{outline:1px solid #5ad8e6}'));
     assert.ok(!cssOut.includes('Header rule'));
     assert.ok(cssOut.includes('.a>.b{margin:0 12px}'));
+
+    // Multi-line block comments act as line terminators in JS (ASI) and single-line comments must not fuse operators.
+    const asiSrc = '(() => { return/*\n*/1 })()';
+    assert.equal(vm.runInNewContext(minifyJs(asiSrc)), undefined);
+    const opSrc = '((a, b) => a +/*keep space*/+ b)(3, 4)';
+    assert.equal(vm.runInNewContext(minifyJs(opSrc)), 7);
 
     const htmlIn = `<!DOCTYPE html>
 <html>
@@ -840,6 +852,7 @@ describe('Signet production parameters and inscription minifier', () => {
 <body>
   <p>Hello
   world</p>
+  <p><span>foo</span> <span>bar</span></p>
   <script id="cfg" type="application/json">{ "net": "signet", "demoMode": false }</script>
   <script>
     // comment
@@ -850,8 +863,118 @@ describe('Signet production parameters and inscription minifier', () => {
     const htmlOut = minifyHtml(htmlIn);
     assert.ok(!htmlOut.includes('remove me'));
     assert.ok(htmlOut.includes('<p>Hello world</p>'));
+    assert.ok(htmlOut.includes('<span>foo</span> <span>bar</span>'));
     assert.ok(htmlOut.includes('{"net":"signet","demoMode":false}'));
     assert.ok(htmlOut.includes('<style>body{color:#fff}</style>'));
     assert.ok(htmlOut.length < htmlIn.length);
+  });
+
+  it('Signet miner CLI uses V1_SIGNET_PARAMS matching the built Signet UI', async () => {
+    const miner = keyFor(55);
+    const signetGenesis = '0000000000000000000000000000000000000000000000000000000000000042i0';
+    const gSig = createGenesisState(signetGenesis, V1_SIGNET_PARAMS, 250_000);
+    const sigBlk = mineBlock(gSig, {
+      miner: miner.pk,
+      btcHeight: 250_001,
+      inscriptionNumber: 500,
+      params: V1_SIGNET_PARAMS,
+    });
+    const gWeak = createGenesisState(signetGenesis, V1_TEST_PARAMS, 250_000);
+    // Construct a block that passes 8-bit V1_TEST_PARAMS but fails 16-bit V1_SIGNET_PARAMS!
+    let weakId = null;
+    for (let n = 0; n < 200_000; n++) {
+      const cand = sha256Hex(`weak-sig-${n}`) + 'i0';
+      if (meetsTarget(cand, bitsToTarget(8)) && !meetsTarget(cand, bitsToTarget(16))) {
+        weakId = cand;
+        break;
+      }
+    }
+    const weakBlk = mineBlock(gWeak, {
+      miner: miner.pk,
+      btcHeight: 250_001,
+      inscriptionNumber: 501,
+      id: weakId,
+      params: V1_TEST_PARAMS,
+    });
+
+    const server = createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      if (req.url === '/r/blockheight') return res.end('250001');
+      if (req.url === '/r/blockhash/250000') return res.end(JSON.stringify(fakeBlockHash(250_000)));
+      if (req.url === '/r/blockhash/250001') return res.end(JSON.stringify(fakeBlockHash(250_001)));
+      if (req.url === `/r/inscription/${signetGenesis}`) return res.end(JSON.stringify({ height: 250_000, number: 499 }));
+      if (req.url === `/r/inscription/${sigBlk.block.id}`) return res.end(JSON.stringify({ height: 250_001, number: 500 }));
+      if (req.url === `/content/${sigBlk.block.id}`) return res.end(JSON.stringify(sigBlk.block));
+      if (req.url === `/r/inscription/${weakBlk.block.id}`) return res.end(JSON.stringify({ height: 250_001, number: 501 }));
+      if (req.url === `/content/${weakBlk.block.id}`) return res.end(JSON.stringify(weakBlk.block));
+      res.statusCode = 404;
+      res.end('not found');
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    try {
+      const ordUrl = `http://127.0.0.1:${server.address().port}`;
+      const ok = await runMinerOnce({
+        network: 'signet',
+        'sync-only': true,
+        'ord-url': ordUrl,
+        genesis: signetGenesis,
+        tip: sigBlk.block.id,
+      });
+      assert.equal(ok.height, 1);
+      assert.equal(ok.tipId, sigBlk.block.id);
+
+      await assert.rejects(
+        () => runMinerOnce({
+          network: 'signet',
+          'sync-only': true,
+          'ord-url': ordUrl,
+          genesis: signetGenesis,
+          tip: weakBlk.block.id,
+        }),
+        /fails PoW target/,
+      );
+    } finally {
+      server.close();
+    }
+  });
+
+  it('build-inscriptions.mjs validates flags, handles # in --out paths, and omits local entmoot-config when pinned', () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'eyezero-build-test-'));
+    const validId = '0'.repeat(63) + '1i0';
+    const validI1 = '0'.repeat(63) + '2i1';
+    try {
+      // Unknown flag rejected
+      assert.throws(
+        () => execFileSync(process.execPath, ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesiss', validId], { stdio: 'pipe' }),
+        /Unknown option: --genesiss/,
+      );
+      // Non-genesis i1 initial-tip rejected
+      assert.throws(
+        () => execFileSync(
+          process.execPath,
+          ['scripts/build-inscriptions.mjs', '--network', 'signet', '--genesis', validId, '--initial-tip', validI1],
+          { stdio: 'pipe' },
+        ),
+        /must end in i0/,
+      );
+      // Path with '#' works and pinned --entmoot-cfg-id omits local entmoot-config.json
+      const hashOut = join(tmpRoot, 'signet#dry');
+      execFileSync(
+        process.execPath,
+        [
+          'scripts/build-inscriptions.mjs',
+          '--network', 'signet',
+          '--genesis', validId,
+          '--entmoot-cfg-id', validId,
+          '--out', hashOut,
+        ],
+        { stdio: 'pipe' },
+      );
+      assert.equal(existsSync(join(hashOut, 'g-rules.js')), true);
+      assert.equal(existsSync(join(hashOut, 'index.html')), true);
+      assert.equal(existsSync(join(hashOut, 'entmoot-config.json')), false);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });

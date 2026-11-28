@@ -24,6 +24,7 @@ import {
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
+  V1_SIGNET_PARAMS,
   V1_TEST_PARAMS,
   applyBlock,
   assertStateConservation,
@@ -648,8 +649,9 @@ export async function runMinerOnce(opts) {
   }
   const powBits = parsePositiveIntOption(opts['pow-bits'], 'pow-bits', { min: 1, max: 255 });
   const cpInterval = parsePositiveIntOption(opts['checkpoint-interval'], 'checkpoint-interval', { min: 1 });
+  const baseParams = network === 'signet' ? V1_SIGNET_PARAMS : V1_TEST_PARAMS;
   const params = {
-    ...V1_TEST_PARAMS,
+    ...baseParams,
     ...(powBits !== undefined ? { powMinBits: powBits } : {}),
     ...(cpInterval !== undefined ? { checkpointInterval: cpInterval } : {}),
   };

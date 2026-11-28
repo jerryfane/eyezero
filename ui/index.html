@@ -649,12 +649,12 @@
                 </div>
               </div>
               <div class="field">
-                <div class="field-t"><span>Ticker (2–10 uppercase A–Z / 0–9)</span></div>
-                <input class="field-in num" id="launch-ticker" maxlength="10" placeholder="CYBER" value="SAT0" />
+                <div class="field-t"><span>Ticker (1–12 chars: A–Z, 0–9, . _ -)</span></div>
+                <input class="field-in num" id="launch-ticker" maxlength="12" placeholder="CYBER" value="SAT0" />
               </div>
               <div class="field">
-                <div class="field-t"><span>Token name</span></div>
-                <input class="field-in" id="launch-name" maxlength="40" placeholder="Satoshi Zero" value="Satoshi Zero" />
+                <div class="field-t"><span>Token name (1–32 printable ASCII chars)</span></div>
+                <input class="field-in" id="launch-name" maxlength="32" placeholder="Satoshi Zero" value="Satoshi Zero" />
               </div>
               <div class="field">
                 <div class="field-t"><span>Art Inscription ID (optional — defaults to Genesis)</span></div>
@@ -1088,7 +1088,6 @@
     let activePage = 'explore';
     let activeTradeSide = 'buy';
     let activeExploreSort = 'reserve';
-    let activeWalletTab = 'balances';
     let activeLaunchStep = 1;
 
     // Strictly separate Ord-verified chain state/heights from local demo simulator state/heights!
@@ -1167,51 +1166,64 @@
       return max + 1;
     }
 
-    // Verify once on admission, strip unsigned fields, keep only best tx per (from, nonce).
-    function ingestPendingTx(rawTx) {
+    // Pure read-only admission check so local submissions can project tentatively before mutating any cache or evicting slots.
+    function validatePendingTxAdmission(rawTx) {
       const s = activeState();
-      if (!s || !rawTx || typeof rawTx.sig !== 'string') return false;
-      if (seenTxSigs.has(rawTx.sig)) return false;
+      if (!s || !rawTx || typeof rawTx.sig !== 'string') return { ok: false, reason: 'Invalid transaction payload' };
+      if (seenTxSigs.has(rawTx.sig)) return { ok: false, reason: 'Duplicate transaction signature' };
 
       let tx;
       try {
         tx = E.canonicalizeTx(rawTx);
       } catch {
-        return false;
+        return { ok: false, reason: 'Transaction failed canonical validation' };
       }
-      if (!Number.isInteger(tx.nonce) || tx.nonce < 1) return false;
+      if (!Number.isInteger(tx.nonce) || tx.nonce < 1) return { ok: false, reason: 'Invalid nonce' };
       if ((tx.type === 'BUY' || tx.type === 'SELL') && (typeof tx.tokenId !== 'string' || !E.isValidTokenId(tx.tokenId))) {
-        return false;
+        return { ok: false, reason: 'Invalid tokenId' };
       }
-      if (tx.type === 'TRANSFER' && !E.isValidTokenId(tx.tokenId)) return false;
+      if (tx.type === 'TRANSFER' && !E.isValidTokenId(tx.tokenId)) return { ok: false, reason: 'Invalid tokenId' };
       const curNonce = s.accounts.get(tx.from)?.nonce ?? 0;
-      if (tx.nonce <= curNonce || tx.nonce > curNonce + 8) return false;
-      if (!s.accounts.has(tx.from) && tx.type !== 'HTLC_CLAIM') return false;
+      if (tx.nonce <= curNonce) return { ok: false, reason: 'Nonce already confirmed on chain' };
+      if (tx.nonce > curNonce + 8) {
+        return { ok: false, reason: 'Max 8 pending orders per account — cancel an existing order or wait for the next block.' };
+      }
+      if (!s.accounts.has(tx.from) && tx.type !== 'HTLC_CLAIM') return { ok: false, reason: 'Account has no on-chain balance' };
 
       let fee;
       try {
         fee = BigInt(tx.fee ?? '0');
-        if (fee < 0n) return false;
+        if (fee < 0n) return { ok: false, reason: 'Negative fee' };
       } catch {
-        return false;
+        return { ok: false, reason: 'Invalid fee' };
       }
 
       const slot = `${tx.from}:${tx.nonce}`;
       const existing = pendingBySlot.get(slot);
       if (existing && (fee < existing.fee || (fee === existing.fee && tx.sig >= existing.tx.sig))) {
-        return false;
+        return { ok: false, reason: 'Replacement fee too low for pending nonce' };
       }
 
-      if (!E.verifyTxSignature(s.chainId, tx)) return false;
+      if (!E.verifyTxSignature(s.chainId, tx)) return { ok: false, reason: 'Invalid BIP-340 signature' };
       const cacheKey = `${E.bytesToHex(E.txDigest(s.chainId, tx))}:${tx.sig}`;
+      return { ok: true, tx, fee, slot, cacheKey };
+    }
 
-      seenTxSigs.add(tx.sig);
-      verifiedSigs.add(cacheKey);
+    function commitPendingTx(adm) {
+      seenTxSigs.add(adm.tx.sig);
+      verifiedSigs.add(adm.cacheKey);
       if (seenTxSigs.size > MAX_SEEN_SIGS) seenTxSigs.delete(seenTxSigs.values().next().value);
       if (verifiedSigs.size > MAX_SEEN_SIGS) verifiedSigs.delete(verifiedSigs.values().next().value);
-      pendingBySlot.set(slot, { tx, fee });
+      pendingBySlot.set(adm.slot, { tx: adm.tx, fee: adm.fee });
       if (pendingBySlot.size > MAX_MEMPOOL_SLOTS) pendingBySlot.delete(pendingBySlot.keys().next().value);
       invalidateProjection();
+    }
+
+    // Verify once on admission, strip unsigned fields, keep only best tx per (from, nonce).
+    function ingestPendingTx(rawTx) {
+      const adm = validatePendingTxAdmission(rawTx);
+      if (!adm.ok) return false;
+      commitPendingTx(adm);
       return true;
     }
 
@@ -1224,32 +1236,29 @@
 
     async function broadcastTx(tx) {
       const s = activeState();
-      const curNonce = s?.accounts.get(tx.from)?.nonce ?? 0;
-      if (tx.nonce > curNonce + 8) {
-        throw new Error('Max 8 pending orders per account — cancel an existing order or wait for the next block.');
+      const adm = validatePendingTxAdmission(tx);
+      if (!adm.ok) {
+        throw new Error(adm.reason);
       }
-      const slot = `${tx.from}:${tx.nonce}`;
-      const prevSlot = pendingBySlot.get(slot);
-      const admitted = ingestPendingTx(tx);
-      if (!admitted) {
-        throw new Error('Order rejected by mempool admission (invalid nonce, fee, or account state)');
+      // Project against a tentative pool BEFORE mutating pendingBySlot/seenTxSigs/verifiedSigs so a rejected
+      // submission can NEVER evict unrelated pending orders or pollute caches!
+      const tentativeList = [];
+      for (const [k, entry] of pendingBySlot.entries()) {
+        if (k !== adm.slot) tentativeList.push(entry.tx);
       }
-      const { accepted, dropped } = getProjected();
-      if (!accepted.some((a) => a.sig === tx.sig)) {
-        if (prevSlot) pendingBySlot.set(slot, prevSlot);
-        else pendingBySlot.delete(slot);
-        seenTxSigs.delete(tx.sig);
-        const s = activeState();
-        if (s) verifiedSigs.delete(`${E.bytesToHex(E.txDigest(s.chainId, tx))}:${tx.sig}`);
-        invalidateProjection();
-        renderAll();
-        const rej = Array.isArray(dropped) ? dropped.find((d) => d.tx?.sig === tx.sig) : null;
+      tentativeList.push(adm.tx);
+      const trialSigs = new Set(verifiedSigs);
+      trialSigs.add(adm.cacheKey);
+      const trial = E.previewPending(s, tentativeList, activeBtcHeight() + 1, PARAMS, { verifiedSigs: trialSigs });
+      if (!trial.accepted.some((a) => a.sig === adm.tx.sig)) {
+        const rej = Array.isArray(trial.dropped) ? trial.dropped.find((d) => d.tx?.sig === adm.tx.sig) : null;
         throw new Error(rej?.reason || 'Order rejected by projected batch execution');
       }
+      commitPendingTx(adm);
       renderAll();
       if (entmootNet && entmootNet.connected) {
         try {
-          await entmootNet.publish('i0-tx', JSON.stringify(tx));
+          await entmootNet.publish('i0-tx', JSON.stringify(adm.tx));
           return true;
         } catch (err) {
           console.warn('Entmoot publish failed (kept locally):', err);
@@ -1706,7 +1715,6 @@
     }
 
     function setWalletTab(tab) {
-      activeWalletTab = tab;
       for (const btn of $('wallet-tabs').querySelectorAll('[data-wtab]')) {
         btn.classList.toggle('active', btn.dataset.wtab === tab);
       }
@@ -1714,6 +1722,10 @@
         $(`wtab-${t}`).hidden = t !== tab;
       }
     }
+
+    const TICKER_RE = /^[A-Za-z0-9._-]+$/;
+    const NAME_SAFE_RE = /^[\x20-\x7e]+$/;
+    const HTML_UNSAFE_RE = /[<>"'`&]/;
 
     function resolveLaunchArtId(s) {
       const rawArt = $('launch-art').value.trim();
@@ -1727,32 +1739,58 @@
       return { ok: true, artId: rawArt, defaulted: false };
     }
 
-    function renderLaunchReview() {
-      const s = activeState();
+    function buildLaunchDraft(s) {
       const ticker = $('launch-ticker').value.trim().toUpperCase();
       const name = $('launch-name').value.trim();
       const artRes = s ? resolveLaunchArtId(s) : { ok: false, error: 'Chain not synced yet' };
       const initRaw = $('launch-init').value.trim();
       const initRes = tryParseDecimalToBaseUnits(initRaw === '' ? '0' : initRaw, { allowZero: true });
+      const errors = [];
+      if (!ticker || ticker.length > PARAMS.maxTickerLen || !TICKER_RE.test(ticker)) {
+        errors.push(`Ticker must be 1–${PARAMS.maxTickerLen} chars (A–Z, 0–9, . _ -)`);
+      }
+      if (!name || name.length > PARAMS.maxNameLen || !NAME_SAFE_RE.test(name) || HTML_UNSAFE_RE.test(name)) {
+        errors.push(`Token name must be 1–${PARAMS.maxNameLen} printable ASCII chars without HTML metacharacters`);
+      }
+      if (!artRes.ok) errors.push(artRes.error);
+      if (!initRes.ok) errors.push(initRes.error);
+      return {
+        ok: errors.length === 0,
+        errors,
+        ticker,
+        name,
+        artRes,
+        initRes,
+        launchFee: PARAMS.launchFee,
+        creatorRoyaltyPct: Number(PARAMS.tradeFeeBps) / 200,
+      };
+    }
+
+    function renderLaunchReview() {
+      const draft = buildLaunchDraft(activeState());
       const rows = [
-        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Ticker'), el('strong', { class: 'num' }, ticker ? `$${ticker}` : '—')),
-        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Name'), el('strong', null, name || '—')),
-        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Launch fee'), el('strong', { class: 'num' }, '10.00 I0')),
-        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Initial buy'), initRes.ok
-          ? el('strong', { class: 'num' }, `${formatBaseUnitsExact(initRes.value)} I0`)
-          : el('strong', { class: 'bad' }, initRes.error)),
-        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Creator royalty'), el('strong', { class: 'num ok' }, '0.5% forever')),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Ticker'), el('strong', { class: 'num' }, draft.ticker ? `$${draft.ticker}` : '—')),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Name'), el('strong', null, draft.name || '—')),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Launch fee'), el('strong', { class: 'num' }, `${fmtI0(draft.launchFee)} I0`)),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Initial buy'), draft.initRes.ok
+          ? el('strong', { class: 'num' }, `${formatBaseUnitsExact(draft.initRes.value)} I0`)
+          : el('strong', { class: 'bad' }, draft.initRes.error)),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Creator royalty'), el('strong', { class: 'num ok' }, `${draft.creatorRoyaltyPct}% forever`)),
       ];
-      if (artRes.ok) {
+      if (draft.artRes.ok) {
         rows.push(
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, artRes.defaulted ? 'Art Inscription ID (default: Genesis)' : 'Art Inscription ID')),
-          el('span', { class: 'code-inline', id: 'launch-review-art' }, artRes.artId),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, draft.artRes.defaulted ? 'Art Inscription ID (default: Genesis)' : 'Art Inscription ID')),
+          el('span', { class: 'code-inline', id: 'launch-review-art' }, draft.artRes.artId),
         );
       } else {
-        rows.push(el('div', { class: 'bad', id: 'launch-review-art-err', style: 'margin-top:4px;font-size:12px' }, artRes.error));
+        rows.push(el('div', { class: 'bad', id: 'launch-review-art-err', style: 'margin-top:4px;font-size:12px' }, draft.artRes.error));
+      }
+      for (const errMsg of draft.errors) {
+        if (errMsg === draft.artRes.error || errMsg === draft.initRes.error) continue;
+        rows.push(el('div', { class: 'bad', style: 'margin-top:4px;font-size:12px' }, errMsg));
       }
       $('launch-review-box').replaceChildren(...rows);
-      $('submit-launch').disabled = !artRes.ok || !initRes.ok || !ticker || !name;
+      $('submit-launch').disabled = !draft.ok;
     }
 
     function setLaunchStep(step) {
@@ -2383,18 +2421,14 @@
     $('submit-launch').onclick = async () => {
       try {
         const s = activeState();
-        const ticker = $('launch-ticker').value.trim().toUpperCase();
-        const name = $('launch-name').value.trim();
-        const artRes = resolveLaunchArtId(s);
-        if (!artRes.ok) throw new Error(artRes.error);
-        const initRaw = $('launch-init').value.trim();
-        const initialBuy = parseDecimalToBaseUnits(initRaw === '' ? '0' : initRaw, { allowZero: true });
+        const draft = buildLaunchDraft(s);
+        if (!draft.ok) throw new Error(draft.errors[0]);
         const tx = E.signTx(s.chainId, {
-          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId: artRes.artId,
-          initialBuy: initialBuy.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
+          type: 'LAUNCH', from: activePersona.pk, ticker: draft.ticker, name: draft.name, artId: draft.artRes.artId,
+          initialBuy: draft.initRes.value.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
         const live = await broadcastTx(tx);
-        showMsg('action-msg', `Signed LAUNCH $${ticker} (art ${shortId(artRes.artId)}) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
+        showMsg('action-msg', `Signed LAUNCH $${draft.ticker} (art ${shortId(draft.artRes.artId)}) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
         setPage('explore');
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };

@@ -16,7 +16,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { brotliCompressSync, constants as zlibConstants } from 'node:zlib';
 import {
   UNIT,
@@ -27,6 +27,7 @@ import {
   computeTokenId,
   createGenesisState,
   getPublicKeyHex,
+  isValidBlockInscriptionId,
   isValidInscriptionId,
   meetsTarget,
   nextTarget,
@@ -36,6 +37,16 @@ import {
 import { minifyHtml, minifyJs } from './minify.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const ALLOWED_VALUE_FLAGS = new Set([
+  'network',
+  'out',
+  'genesis',
+  'initial-tip',
+  'rules-id',
+  'entmoot-js-id',
+  'entmoot-cfg-id',
+  'entmoot-config',
+]);
 
 function parseBuildArgs(argv) {
   const opts = { network: 'demo', minify: true };
@@ -45,6 +56,9 @@ function parseBuildArgs(argv) {
     if (a === '--minify') { opts.minify = true; continue; }
     if (a.startsWith('--')) {
       const k = a.slice(2);
+      if (!ALLOWED_VALUE_FLAGS.has(k)) {
+        throw new Error(`Unknown option: --${k}`);
+      }
       const v = argv[++i];
       if (v === undefined || v.startsWith('--')) throw new Error(`Option --${k} requires a value`);
       opts[k] = v;
@@ -59,6 +73,12 @@ function parseBuildArgs(argv) {
     if (opts[idKey] && !isValidInscriptionId(opts[idKey])) {
       throw new Error(`Invalid inscription ID for --${idKey}: ${opts[idKey]}`);
     }
+  }
+  if (opts['initial-tip'] && !opts.genesis) {
+    throw new Error('--initial-tip requires --genesis');
+  }
+  if (opts['initial-tip'] && opts['initial-tip'] !== opts.genesis && !isValidBlockInscriptionId(opts['initial-tip'])) {
+    throw new Error(`Invalid non-genesis --initial-tip (must end in i0): ${opts['initial-tip']}`);
   }
   return opts;
 }
@@ -106,8 +126,8 @@ const rulesRaw = parts.join('\n');
 const rulesOut = opts.minify ? minifyJs(rulesRaw) : rulesRaw;
 checkJsSyntax(rulesOut, 'g-rules.js');
 writeFileSync(join(OUT, 'g-rules.js'), rulesOut, 'utf8');
-// Live ES module import check!
-await import(`${join(OUT, 'g-rules.js')}?check=${Date.now()}`);
+// Live ES module import check (convert filesystem path via pathToFileURL so `#` in paths works cleanly).
+await import(`${pathToFileURL(join(OUT, 'g-rules.js')).href}?check=${Date.now()}`);
 
 // 2. Process entmoot-lite.js and entmoot-config.json.
 const entmootRaw = readFileSync(join(ROOT, 'ui', 'entmoot-lite.js'), 'utf8');
@@ -115,14 +135,23 @@ const entmootOut = opts.minify ? minifyJs(entmootRaw) : entmootRaw;
 checkJsSyntax(entmootOut, 'entmoot-lite.js');
 writeFileSync(join(OUT, 'entmoot-lite.js'), entmootOut, 'utf8');
 
-const inviteRaw = JSON.parse(readFileSync(join(ROOT, 'ui', 'entmoot-invite.json'), 'utf8'));
-const entmootCfgObj = {
-  groupId: inviteRaw.group_id,
-  addr: inviteRaw.allowed_multiaddrs[0],
-  invite: inviteRaw,
-};
-const entmootCfgOut = opts.minify ? JSON.stringify(entmootCfgObj) : JSON.stringify(entmootCfgObj, null, 2);
-writeFileSync(join(OUT, 'entmoot-config.json'), entmootCfgOut, 'utf8');
+const emitLocalEntmootCfg = isDemo || !opts['entmoot-cfg-id'];
+let entmootCfgOut = null;
+if (emitLocalEntmootCfg) {
+  const entmootSrcPath = opts['entmoot-config']
+    ? (opts['entmoot-config'].startsWith('/') ? opts['entmoot-config'] : join(ROOT, opts['entmoot-config']))
+    : join(ROOT, 'ui', 'entmoot-invite.json');
+  const cfgRaw = JSON.parse(readFileSync(entmootSrcPath, 'utf8'));
+  const entmootCfgObj = cfgRaw.groupId && cfgRaw.addr
+    ? cfgRaw
+    : {
+        groupId: cfgRaw.group_id,
+        addr: cfgRaw.allowed_multiaddrs[0],
+        invite: cfgRaw,
+      };
+  entmootCfgOut = opts.minify ? JSON.stringify(entmootCfgObj) : JSON.stringify(entmootCfgObj, null, 2);
+  writeFileSync(join(OUT, 'entmoot-config.json'), entmootCfgOut, 'utf8');
+}
 
 // 3. Configure and minify ui/index.html.
 let htmlSrc = readFileSync(join(ROOT, 'ui', 'index.html'), 'utf8');
@@ -165,7 +194,7 @@ writeFileSync(join(OUT, 'index.html'), htmlOut, 'utf8');
 const filesManifest = {
   'g-rules.js': { id: opts['rules-id'] ?? null, role: 'library', compress: 'br' },
   'entmoot-lite.js': { id: opts['entmoot-js-id'] ?? null, role: 'library', compress: 'br' },
-  'entmoot-config.json': { id: opts['entmoot-cfg-id'] ?? null, role: 'asset', compress: null },
+  ...(emitLocalEntmootCfg ? { 'entmoot-config.json': { id: opts['entmoot-cfg-id'] ?? null, role: 'asset', compress: null } } : {}),
   'index.html': { id: null, role: 'parent', compress: 'br' },
 };
 
@@ -187,7 +216,7 @@ if (!isDemo) {
 
   const report = [
     ['genesis.json', genesisOut],
-    ['entmoot-config.json', entmootCfgOut],
+    ...(emitLocalEntmootCfg ? [['entmoot-config.json', entmootCfgOut]] : []),
     ['entmoot-lite.js', entmootOut],
     ['g-rules.js', rulesOut],
     ['index.html', htmlOut],
@@ -203,7 +232,7 @@ if (!isDemo) {
     totalVb += estVb;
     console.log(`  ${name.padEnd(20)} raw=${rawB} B  br=${brB} B  ~${estVb} vB`);
   }
-  console.log(`  TOTAL (5 prod inscriptions): compressed=${totalBr} B (~${totalVb} vB, ~${totalVb * 2} sats @ 2 sat/vB)`);
+  console.log(`  TOTAL (${report.length} prod inscriptions): compressed=${totalBr} B (~${totalVb} vB, ~${totalVb * 2} sats @ 2 sat/vB)`);
   process.exit(0);
 }
 

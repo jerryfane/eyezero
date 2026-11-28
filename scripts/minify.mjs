@@ -64,8 +64,14 @@ export function minifyJs(src) {
             while (i < n && src[i] !== '\n') i++;
           } else if (ch === '/' && src[i + 1] === '*') {
             i += 2;
-            while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
+            let hasNl = false;
+            while (i < n && !(src[i] === '*' && src[i + 1] === '/')) {
+              if (src[i] === '\n' || src[i] === '\r' || src[i] === '\u2028' || src[i] === '\u2029') hasNl = true;
+              i++;
+            }
             i += 2;
+            if (hasNl) out += '\n';
+            else if (out.length && !/[ \t\n]/.test(out[out.length - 1])) out += ' ';
           } else if (ch === '/' && ['start', 'punct', 'kw'].includes(lastNonWsTokenKind(out))) {
             copyRegex();
           } else {
@@ -114,9 +120,18 @@ export function minifyJs(src) {
     }
     if (ch === '/' && src[i + 1] === '*') {
       i += 2;
-      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
+      let hasNl = false;
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) {
+        if (src[i] === '\n' || src[i] === '\r' || src[i] === '\u2028' || src[i] === '\u2029') hasNl = true;
+        i++;
+      }
       i += 2;
-      if (out.length && /[A-Za-z0-9_$]/.test(out[out.length - 1])) out += ' ';
+      if (hasNl) {
+        while (out.length && (out[out.length - 1] === ' ' || out[out.length - 1] === '\t')) out = out.slice(0, -1);
+        if (out.length && out[out.length - 1] !== '\n') out += '\n';
+      } else if (out.length && !/[ \t\n]/.test(out[out.length - 1])) {
+        out += ' ';
+      }
       continue;
     }
     if (ch === '/') {
@@ -157,7 +172,8 @@ export function minifyCss(css) {
   let out = '';
   const n = css.length;
   let i = 0;
-  const PUNCT = new Set(['{', ':', ';', ',', '>', '~', '}']);
+  // Never strip whitespace BEFORE ':' so descendant pseudo-selectors like `.toolbar :focus` stay intact.
+  const PUNCT = new Set(['{', ';', ',', '>', '~', '}']);
   while (i < n) {
     const ch = css[i];
     if (ch === '"' || ch === "'") {
@@ -181,9 +197,14 @@ export function minifyCss(css) {
       while (i < n && /\s/.test(css[i])) i++;
       const prev = out[out.length - 1];
       const next = css[i];
-      if (out.length && prev !== ' ' && !PUNCT.has(prev) && next && !PUNCT.has(next)) {
+      if (out.length && prev !== ' ' && prev !== ':' && !PUNCT.has(prev) && next && !PUNCT.has(next)) {
         out += ' ';
       }
+      continue;
+    }
+    if (ch === ':') {
+      out += css[i++];
+      while (i < n && /\s/.test(css[i])) i++;
       continue;
     }
     if (PUNCT.has(ch)) {
@@ -197,6 +218,10 @@ export function minifyCss(css) {
   }
   return out.trim();
 }
+
+const BLOCK_TAGS = 'html|head|body|meta|title|link|style|script|header|nav|aside|main|section|div|table|thead|tbody|tr|th|td|ul|ol|li|pre|hr|br';
+const BEFORE_BLOCK_RE = new RegExp(`>\\s+(?=<\\/?(?:${BLOCK_TAGS})\\b)`, 'gi');
+const AFTER_BLOCK_RE = new RegExp(`(<\\/?(?:${BLOCK_TAGS})\\b[^>]*>)\\s+<`, 'gi');
 
 export function minifyHtml(html) {
   // 1. Protect <style> and <script> blocks while minifying each with its proper minifier.
@@ -214,12 +239,13 @@ export function minifyHtml(html) {
     return `__EYEZERO_BLK_${idx}__`;
   });
 
-  // 2. Strip HTML comments and collapse inter-tag whitespace safely without fusing words.
+  // 2. Strip HTML comments and collapse structural whitespace without removing separators between inline elements.
   work = work
     .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/>\s+</g, '><')
     .replace(/\r?\n\s*/g, ' ')
     .replace(/\s{2,}/g, ' ')
+    .replace(BEFORE_BLOCK_RE, '>')
+    .replace(AFTER_BLOCK_RE, '$1<')
     .trim();
 
   // 3. Restore protected blocks.

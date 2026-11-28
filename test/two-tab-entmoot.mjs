@@ -52,21 +52,30 @@ try {
   ]);
   console.log('[2-tab] Both browser tabs connected to Entmoot P2P live inside ord sandbox!');
 
-  // Pick a demo signer with pending-nonce headroom (< 8 pending orders) and a fresh unique amount
-  // so we strictly prove THIS order propagates live over WebRTC-direct (not stale Entmoot history).
-  await f1.locator('#explore-tbody tr').first().click();
-  await f2.locator('#explore-tbody tr').first().click();
+  // Select the exact same market ($EYE0) explicitly in BOTH tabs.
+  await f1.locator('#explore-tbody tr', { hasText: '$EYE0' }).first().click();
+  await f2.locator('#explore-tbody tr', { hasText: '$EYE0' }).first().click();
 
-  let chosenSigner = null;
-  for (const cand of ['alice', 'creator', 'miner', 'bob']) {
-    await f1.locator('#wallet-select').selectOption(cand);
-    const pendingCount = await f1.locator('#token-pending-list button', { hasText: 'Cancel (RBF)' }).count();
-    if (pendingCount < 8) {
-      chosenSigner = cand;
+  // Pick a demo signer with pending-nonce headroom (< 8 pending orders) by inspecting actual pending nonces.
+  const SIGNERS = [
+    { id: 'alice', label: 'Alice' },
+    { id: 'creator', label: 'Creator' },
+    { id: 'miner', label: 'Miner' },
+    { id: 'bob', label: 'Bob' },
+  ];
+  let chosen = null;
+  let expectedNonce = null;
+  for (const cand of SIGNERS) {
+    await f1.locator('#wallet-select').selectOption(cand.id);
+    const pendingText = await f1.locator('#token-pending-list').textContent();
+    const matches = [...pendingText.matchAll(new RegExp(`${cand.label}[^]*?n=(\\d+)`, 'g'))].map((m) => Number(m[1]));
+    if (matches.length < 8) {
+      chosen = cand;
+      expectedNonce = matches.length ? Math.max(...matches) + 1 : null;
       break;
     }
   }
-  assert.ok(chosenSigner, 'No demo signer has pending-nonce headroom (< 8 pending txs)');
+  assert.ok(chosen, 'No demo signer has pending-nonce headroom (< 8 pending txs)');
 
   const uniqueAmt = `${2 + (Date.now() % 7)}.${String(11 + (Math.floor(Date.now() / 10) % 88)).padStart(2, '0')}`;
   const beforeTab2 = await f2.locator('#token-pending-list').textContent();
@@ -76,11 +85,21 @@ try {
   await f1.locator('#submit-buy').click();
 
   await f1.locator('#action-msg').filter({ hasText: 'gossiped live over Entmoot' }).waitFor({ timeout: 10_000 });
-  console.log(`[2-tab] Tab 1 (${chosenSigner}) signed & published BUY ${uniqueAmt} I0 over Entmoot.`);
+  // Read the exact assigned nonce from Tab 1's own pending row for this fresh order.
+  const tab1Row = f1.locator('#token-pending-list > div', { hasText: `${uniqueAmt} I0` }).filter({ hasText: chosen.label }).first();
+  await tab1Row.waitFor({ timeout: 5_000 });
+  const tab1RowText = await tab1Row.textContent();
+  const nonceMatch = /n=(\d+)/.exec(tab1RowText);
+  assert.ok(nonceMatch, `Could not extract nonce from Tab 1 pending row: ${tab1RowText}`);
+  const exactNonce = nonceMatch[1];
+  console.log(`[2-tab] Tab 1 (${chosen.label}, n=${exactNonce}) signed & published BUY $EYE0 ${uniqueAmt} I0 over Entmoot.`);
 
-  // Assert Tab 2 receives the exact fresh order live over Entmoot WebRTC-direct without refreshing!
-  await f2.locator('#token-pending-list').filter({ hasText: `${uniqueAmt} I0` }).waitFor({ timeout: 15_000 });
-  console.log(`[2-tab] PASS: Tab 2 received ${chosenSigner} BUY ${uniqueAmt} I0 live over Entmoot P2P!`);
+  // Assert Tab 2 receives the EXACT same sender + market + amount + nonce live over Entmoot WebRTC-direct!
+  const tab2Row = f2.locator('#token-pending-list > div', { hasText: `BUY $EYE0 · ${uniqueAmt} I0` })
+    .filter({ hasText: chosen.label })
+    .filter({ hasText: `n=${exactNonce}` });
+  await tab2Row.first().waitFor({ timeout: 15_000 });
+  console.log(`[2-tab] PASS: Tab 2 received ${chosen.label} BUY $EYE0 · ${uniqueAmt} I0 (n=${exactNonce}) live over Entmoot P2P!`);
 
   assert.equal(errs.length, 0, `Page errors: ${errs.join('; ')}`);
 } finally {

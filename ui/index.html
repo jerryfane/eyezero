@@ -725,6 +725,11 @@
           </section>
 
           <section class="pane">
+            <div class="pane-h"><span>SIGNED SWAP FILLS (#i0-swap)</span><span class="mag num" id="swap-fills-cnt">0 FILLS</span></div>
+            <div class="pane-b" id="swap-fills-list" style="display:flex;flex-direction:column;gap:7px"></div>
+          </section>
+
+          <section class="pane">
             <div class="pane-h"><span>IN-FLIGHT HTLC ESCROWS</span><span class="cyan num" id="swap-escrow-mini-cnt">0 ACTIVE</span></div>
             <div class="pane-b" id="swap-escrow-preview" style="display:flex;flex-direction:column;gap:8px"></div>
           </section>
@@ -1102,6 +1107,9 @@
     let chartHoverIdx = null;
     let activeSwapMode = 'market';
     let activeSwapDir = 'buy_i0';
+    let selectedSwapQuoteId = null;
+    let htlcSubmitInFlight = false;
+    let lastChartRender = null;
 
     // Strictly separate Ord-verified chain state/history from local demo simulator state/history!
     let ordState = null;
@@ -1140,6 +1148,8 @@
     const seenTxSigs = new Set();
     const verifiedSigs = new Set();
     const swapQuotesById = new Map();
+    const swapFillsById = new Map();
+    const MAX_SWAP_FILLS = 64;
 
     let cachedProjection = null;
     let projectionDirty = true;
@@ -1161,45 +1171,87 @@
       return Number(tok.virtualI0 + tok.realI0) / Number(tok.realTok);
     }
 
+    function computeBlockTradeStatsCompat(prevState, txs, params) {
+      if (typeof E.computeBlockTradeStats === 'function') {
+        return E.computeBlockTradeStats(prevState, txs, params);
+      }
+      const preTokens = new Map();
+      for (const [tid, tok] of prevState.tokens.entries()) {
+        preTokens.set(tid, { virtualI0: tok.virtualI0, realI0: tok.realI0, realTok: tok.realTok });
+      }
+      const batches = new Map();
+      const getB = (tid) => {
+        let b = batches.get(tid);
+        if (!b) { b = { grossBuyI0: 0n, netBuyI0: 0n, sells: [] }; batches.set(tid, b); }
+        return b;
+      };
+      for (const tx of txs || []) {
+        if (tx.type === 'LAUNCH') {
+          const tid = E.computeTokenId(prevState.chainId, tx);
+          if (!preTokens.has(tid)) preTokens.set(tid, { virtualI0: params.virtualI0, realI0: 0n, realTok: params.initialTokSupply });
+          const ib = BigInt(tx.initialBuy || '0');
+          if (ib > 0n) {
+            const fee = (ib * params.tradeFeeBps) / params.bpsDenom;
+            const b = getB(tid);
+            b.grossBuyI0 += ib;
+            b.netBuyI0 += ib - fee;
+          }
+        } else if (tx.type === 'BUY' && preTokens.has(tx.tokenId)) {
+          const i0In = BigInt(tx.i0In || '0');
+          if (i0In > 0n) {
+            const fee = (i0In * params.tradeFeeBps) / params.bpsDenom;
+            const b = getB(tx.tokenId);
+            b.grossBuyI0 += i0In;
+            b.netBuyI0 += i0In - fee;
+          }
+        } else if (tx.type === 'SELL' && preTokens.has(tx.tokenId)) {
+          const tokIn = BigInt(tx.tokIn || '0');
+          if (tokIn > 0n) getB(tx.tokenId).sells.push(tokIn);
+        }
+      }
+      const out = new Map();
+      for (const [tid, b] of batches.entries()) {
+        const tok = preTokens.get(tid);
+        if (!tok) continue;
+        const B = b.netBuyI0;
+        let S = 0n;
+        for (const t of b.sells) S += t;
+        if (B === 0n && S === 0n) continue;
+        const X = tok.virtualI0 + tok.realI0;
+        const Y = tok.realTok;
+        const outI0Total = S > 0n ? (S * (X + B)) / (Y + S) : 0n;
+        let settledSellGrossI0 = 0n;
+        for (const t of b.sells) settledSellGrossI0 += (t * outI0Total) / S;
+        out.set(tid, {
+          grossBuyI0: b.grossBuyI0,
+          netBuyI0: B,
+          sellTok: S,
+          settledSellGrossI0,
+          grossVolI0: b.grossBuyI0 + settledSellGrossI0,
+          openPrice: Number(X) / Number(Y),
+          clearPrice: Number(X + B) / Number(Y + S),
+        });
+      }
+      return out;
+    }
+
     function recordBlockOhlc(ohlcMap, launchMap, prevState, nextState, block, btcHeight) {
-      const buysByTok = new Map();
-      const sellsByTok = new Map();
       for (const tx of block.txs || []) {
         if (tx.type === 'LAUNCH') {
           const tid = E.computeTokenId(prevState.chainId, tx);
           if (!launchMap.has(tid)) launchMap.set(tid, block.h);
-          const ib = BigInt(tx.initialBuy || '0');
-          if (ib > 0n) buysByTok.set(tid, (buysByTok.get(tid) ?? 0n) + ib);
-        } else if (tx.type === 'BUY') {
-          buysByTok.set(tx.tokenId, (buysByTok.get(tx.tokenId) ?? 0n) + BigInt(tx.i0In || '0'));
-        } else if (tx.type === 'SELL') {
-          sellsByTok.set(tx.tokenId, (sellsByTok.get(tx.tokenId) ?? 0n) + BigInt(tx.tokIn || '0'));
         }
       }
+      const statsByTok = computeBlockTradeStatsCompat(prevState, block.txs || [], PARAMS);
       for (const [tid, tokAfter] of nextState.tokens.entries()) {
         if (!launchMap.has(tid)) launchMap.set(tid, block.h);
         const tokBefore = prevState.tokens.get(tid);
         const open = tokBefore ? spotPriceOf(tokBefore) : Number(PARAMS.virtualI0) / Number(PARAMS.initialTokSupply);
         const close = spotPriceOf(tokAfter);
-        const buyI0 = buysByTok.get(tid) ?? 0n;
-        const sellTok = sellsByTok.get(tid) ?? 0n;
-        const estSellI0 = sellTok > 0n ? (sellTok * (tokAfter.virtualI0 + tokAfter.realI0)) / tokAfter.realTok : 0n;
-        const volI0 = Number(buyI0 + estSellI0) / Number(UNIT);
-        // Compute deterministic intra-batch high/low excursion when both buys and sells occurred in the block.
-        let high = Math.max(open, close);
-        let low = Math.min(open, close);
-        if (buyI0 > 0n && sellTok > 0n && tokBefore) {
-          const X = tokBefore.virtualI0 + tokBefore.realI0;
-          const Y = tokBefore.realTok;
-          const buyPeak = Number(X + buyI0) / Number(Y > 1n ? Y : 1n);
-          const sellDip = Number(X > estSellI0 ? X - estSellI0 : X) / Number(Y + sellTok);
-          high = Math.max(high, buyPeak);
-          low = Math.min(low, sellDip);
-        } else if (volI0 > 0) {
-          // Slight deterministic wick proportional to fee spread when single-sided volume moved price.
-          high = Math.max(high, Math.max(open, close) * 1.008);
-          low = Math.min(low, Math.min(open, close) * 0.994);
-        }
+        const st = statsByTok.get(tid);
+        const volI0 = st ? Number(st.grossVolI0) / Number(UNIT) : 0;
+        const high = st ? Math.max(open, close, st.clearPrice) : Math.max(open, close);
+        const low = st ? Math.min(open, close, st.clearPrice) : Math.min(open, close);
         if (!ohlcMap.has(tid)) ohlcMap.set(tid, []);
         ohlcMap.get(tid).push({ blk: `#${block.h}`, hNum: block.h, btc: btcHeight, o: open, h: high, l: low, c: close, vol: volI0 });
       }
@@ -1294,7 +1346,7 @@
       }
     }
 
-    async function broadcastTx(tx) {
+    async function broadcastTx(tx, { onLocalCommit = null } = {}) {
       const s = activeState();
       const adm = validatePendingTxAdmission(tx);
       if (!adm.ok) throw new Error(adm.reason);
@@ -1308,6 +1360,7 @@
         throw new Error(rej?.reason || 'Order rejected by projected batch execution');
       }
       commitPendingTx(adm);
+      if (typeof onLocalCommit === 'function') onLocalCommit(adm);
       cachedProjection = trial;
       projectionDirty = false;
       renderAll();
@@ -1322,7 +1375,15 @@
       return false;
     }
 
-    // Signed Entmoot #i0-swap quote ingestion & demo orderbook seeding
+    // Signed Entmoot #i0-swap quote & fill ingestion + demo orderbook seeding
+    function quoteMapKey(q) {
+      return `${q.network}:${q.maker}:${q.id}`;
+    }
+
+    function fillMapKey(f) {
+      return `${f.network}:${f.taker}:${f.id}`;
+    }
+
     function ingestSwapQuote(raw) {
       const s = activeState();
       if (!s || !raw || typeof raw !== 'object') return false;
@@ -1330,9 +1391,35 @@
       if (!E.verifySwapQuote(s.chainId, raw)) return false;
       const canon = E.canonicalizeSwapQuote(raw);
       if (canon.expiresAt <= Math.floor(Date.now() / 1000)) return false;
-      swapQuotesById.set(canon.id, canon);
+      swapQuotesById.set(quoteMapKey(canon), canon);
       if (swapQuotesById.size > MAX_SWAP_QUOTES) swapQuotesById.delete(swapQuotesById.keys().next().value);
       return true;
+    }
+
+    function ingestSwapFill(raw) {
+      const s = activeState();
+      if (!s || !raw || typeof raw !== 'object') return false;
+      if (typeof E.verifySwapFill !== 'function') return false;
+      if (!E.verifySwapFill(s.chainId, raw)) return false;
+      const canon = E.canonicalizeSwapFill(raw);
+      if (canon.expiresAt <= Math.floor(Date.now() / 1000)) return false;
+      const matchedQuote = swapQuotesById.get(`${canon.network}:${canon.maker}:${canon.quoteId}`);
+      if (matchedQuote) {
+        if (matchedQuote.sig !== canon.quoteSig || matchedQuote.rateSatsPerI0 !== canon.rateSatsPerI0 || matchedQuote.side === canon.side) {
+          return false;
+        }
+        const amt = BigInt(canon.i0Amount);
+        if (amt < BigInt(matchedQuote.minI0) || amt > BigInt(matchedQuote.maxI0)) return false;
+      }
+      swapFillsById.set(fillMapKey(canon), canon);
+      if (swapFillsById.size > MAX_SWAP_FILLS) swapFillsById.delete(swapFillsById.keys().next().value);
+      return true;
+    }
+
+    function ingestSwapMessage(raw) {
+      if (!raw || typeof raw !== 'object') return false;
+      if (raw.kind === 'SWAP_FILL' || typeof raw.quoteId === 'string') return ingestSwapFill(raw);
+      return ingestSwapQuote(raw);
     }
 
     function seedDemoSwapQuotes(state) {
@@ -1350,7 +1437,7 @@
       ].filter(Boolean);
       for (const sd of seeds) {
         const { sk, ...q } = sd;
-        if (!swapQuotesById.has(q.id)) ingestSwapQuote(E.signSwapQuote(state.chainId, q, sk));
+        if (!swapQuotesById.has(quoteMapKey(q))) ingestSwapQuote(E.signSwapQuote(state.chainId, q, sk));
       }
     }
 
@@ -1613,7 +1700,7 @@
           } catch {}
         });
         net.on('i0-swap', (msg) => {
-          try { if (typeof msg.text === 'string' && msg.text.length <= 2048 && ingestSwapQuote(JSON.parse(msg.text))) scheduleRender(); } catch {}
+          try { if (typeof msg.text === 'string' && msg.text.length <= 2048 && ingestSwapMessage(JSON.parse(msg.text))) scheduleRender(); } catch {}
         });
 
         try {
@@ -1639,7 +1726,7 @@
           const swHist = await net.history('i0-swap', 40);
           let loadedQ = 0;
           for (const msg of swHist) {
-            try { if (typeof msg.text === 'string' && msg.text.length <= 2048 && ingestSwapQuote(JSON.parse(msg.text))) loadedQ++; } catch {}
+            try { if (typeof msg.text === 'string' && msg.text.length <= 2048 && ingestSwapMessage(JSON.parse(msg.text))) loadedQ++; } catch {}
           }
           if (loadedQ > 0) renderAll();
         } catch {}
@@ -1719,10 +1806,37 @@
       for (const t of ['pending', 'blocks', 'prov']) $(`tbtab-${t}`).hidden = t !== tab;
     }
 
-    // Backwards-compatible Launch metadata validation (works even when pinned to older v1 G_rules!)
+    const RULES_SUPPORT_LAUNCH_META = (() => {
+      if (typeof E.validateLaunchMetadata !== 'function') return false;
+      try {
+        const probe = E.validateLaunchMetadata(
+          { ticker: 'A', name: 'A', artId: '', desc: 'x', web: 'a.co', x: 'a' },
+          PARAMS,
+        );
+        return probe?.desc === 'x' && probe?.web === 'a.co' && probe?.x === 'a';
+      } catch {
+        return false;
+      }
+    })();
+    if (!RULES_SUPPORT_LAUNCH_META) {
+      for (const id of ['launch-desc', 'launch-web', 'launch-x']) {
+        const inp = $(id);
+        if (inp) { inp.disabled = true; inp.placeholder = 'Unavailable on pinned G_rules v1'; }
+      }
+    }
+
+    function creatorRoyaltyPct() {
+      return (Number(PARAMS.tradeFeeBps) / Number(PARAMS.bpsDenom)) * 50;
+    }
+
+    // Backwards-compatible Launch metadata validation (rejects extended fields if pinned to legacy v1 G_rules!)
     function validateLaunchMetaCompat({ ticker, name, artId, desc = '', web = '', x = '' }, params) {
+      if (!RULES_SUPPORT_LAUNCH_META && (desc || web || x)) {
+        throw new Error('Pinned G_rules v1 does not support on-chain description, website, or X metadata - leave those fields blank.');
+      }
       if (typeof E.validateLaunchMetadata === 'function') {
-        return E.validateLaunchMetadata({ ticker, name, artId, desc, web, x }, params);
+        const res = E.validateLaunchMetadata({ ticker, name, artId, desc, web, x }, params);
+        return { ticker: res.ticker, name: res.name, artId: res.artId, desc: res.desc ?? '', web: res.web ?? '', x: res.x ?? '' };
       }
       if (typeof ticker !== 'string' || ticker.length < 1 || ticker.length > params.maxTickerLen || !/^[A-Za-z0-9._-]+$/.test(ticker)) {
         throw new Error(`Invalid ticker (1..${params.maxTickerLen} chars: A-Z, 0-9, . _ -)`);
@@ -1752,20 +1866,20 @@
       if (!s) {
         artRes = { ok: false, error: 'Chain not synced yet' };
         errors.push(artRes.error);
-      } else if (!rawArt) {
-        artRes = { ok: true, artId: s.genesisId, defaulted: true };
-      } else if (rawArt.length > PARAMS.maxArtIdLen || !E.isValidInscriptionId(rawArt)) {
-        artRes = { ok: false, error: 'Invalid Art Inscription ID: enter <64-hex>i<index> or leave blank for Genesis.' };
-        errors.push(artRes.error);
       } else {
-        artRes = { ok: true, artId: rawArt, defaulted: false };
+        artRes = { ok: true, artId: rawArt || s.genesisId, defaulted: !rawArt };
       }
       if (!initRes.ok) errors.push(initRes.error);
       let meta = { ticker, name, artId: artRes.ok ? artRes.artId : '', desc, web, x };
       try {
         meta = validateLaunchMetaCompat(meta, PARAMS);
       } catch (metaErr) {
-        errors.push(metaErr.message);
+        if (/artId|Art Inscription/i.test(metaErr.message)) {
+          artRes = { ok: false, error: 'Invalid Art Inscription ID: enter <64-hex>i<index> or leave blank for Genesis.' };
+          errors.push(artRes.error);
+        } else {
+          errors.push(metaErr.message);
+        }
       }
       return {
         ok: errors.length === 0,
@@ -1774,14 +1888,23 @@
         artRes,
         initRes,
         launchFee: PARAMS.launchFee,
-        creatorRoyaltyPct: (Number(PARAMS.tradeFeeBps) / Number(PARAMS.bpsDenom)) * 50,
+        creatorRoyaltyPct: creatorRoyaltyPct(),
       };
     }
 
     function renderLaunchReview() {
       const s = activeState();
+      if (!RULES_SUPPORT_LAUNCH_META) {
+        for (const id of ['launch-desc', 'launch-web', 'launch-x']) {
+          const inp = $(id);
+          inp.disabled = true;
+          inp.placeholder = 'Unavailable on pinned G_rules v1';
+        }
+      }
       const draft = buildLaunchDraft(s);
-      $('launch-desc-cnt').textContent = `${$('launch-desc').value.length} / ${PARAMS.maxDescLen ?? 160}`;
+      $('launch-desc-cnt').textContent = RULES_SUPPORT_LAUNCH_META
+        ? `${$('launch-desc').value.length} / ${PARAMS.maxDescLen ?? 160}`
+        : 'UNSUPPORTED ON PINNED RULES';
       $('launch-fee-lbl').textContent = `FEE ${fmtI0(draft.launchFee)} I0 · ${draft.creatorRoyaltyPct}% CR FOREVER`;
       $('launch-art-preview').replaceChildren(makeTokenArtNode({ id: draft.meta.ticker || 'SAT0', ticker: draft.meta.ticker || 'SAT0', artId: draft.artRes.ok ? draft.artRes.artId : '' }, 26));
       const totalDebit = draft.initRes.ok ? draft.launchFee + draft.initRes.value : draft.launchFee;
@@ -1826,22 +1949,15 @@
       return { grossI0, fee, netI0, minI0Out: (netI0 * (100n - slip)) / 100n };
     }
 
-    // Aggregate verified OHLC series + append live pending Entmoot batch candle
+    // Aggregate verified OHLC series + append live pending Entmoot batch candle (exact batch clearing math)
     function getTokenCandles(tok, projTok, accepted) {
+      const s = activeState();
       const base = (activeOhlcMap().get(tok.id) ?? []).slice();
       const curSpot = spotPriceOf(tok);
       if (base.length === 0) {
-        base.push({ blk: `#${activeState()?.height ?? 0}`, hNum: activeState()?.height ?? 0, btc: activeBtcHeight(), o: curSpot, h: curSpot, l: curSpot, c: curSpot, vol: 0 });
+        base.push({ blk: `#${s?.height ?? 0}`, hNum: s?.height ?? 0, btc: activeBtcHeight(), o: curSpot, h: curSpot, l: curSpot, c: curSpot, vol: 0 });
       }
-      let pendVol = 0n;
-      let pendCnt = 0;
-      for (const tx of accepted) {
-        if (tx.tokenId === tok.id) {
-          pendCnt++;
-          if (tx.type === 'BUY') pendVol += BigInt(tx.i0In || '0');
-          else if (tx.type === 'SELL') pendVol += (BigInt(tx.tokIn || '0') * (tok.virtualI0 + tok.realI0)) / tok.realTok;
-        }
-      }
+      const pendStats = s ? computeBlockTradeStatsCompat(s, accepted, PARAMS).get(tok.id) : null;
       const out = [];
       const tf = activeChartTf;
       for (let i = 0; i < base.length; i += tf) {
@@ -1857,22 +1973,61 @@
         });
       }
       const pSpot = projTok ? spotPriceOf(projTok) : curSpot;
-      if (pendCnt > 0 || pSpot !== curSpot) {
+      if (pendStats || pSpot !== curSpot) {
         out.push({
-          blk: `PEND #${(activeState()?.height ?? 0) + 1}`,
+          blk: `PEND #${(s?.height ?? 0) + 1}`,
           btc: activeBtcHeight() + 1,
           o: curSpot,
-          h: Math.max(curSpot, pSpot),
-          l: Math.min(curSpot, pSpot),
+          h: pendStats ? Math.max(curSpot, pSpot, pendStats.clearPrice) : Math.max(curSpot, pSpot),
+          l: pendStats ? Math.min(curSpot, pSpot, pendStats.clearPrice) : Math.min(curSpot, pSpot),
           c: pSpot,
-          vol: Number(pendVol) / Number(UNIT),
+          vol: pendStats ? Number(pendStats.grossVolI0) / Number(UNIT) : 0,
           pending: true,
         });
       }
       return out;
     }
 
-    function renderInteractiveChart(tok, projTok, accepted) {
+    function renderChartHoverOverlay(hoverIdx) {
+      if (!lastChartRender || lastChartRender.mode === 'curve') return;
+      const { candles: data, mode, W, H, padL, padR, padT, padB, pBot, step, minP, maxP } = lastChartRender;
+      if (!data.length) return;
+      const idx = hoverIdx !== null && hoverIdx >= 0 && hoverIdx < data.length ? hoverIdx : data.length - 1;
+      const cur = data[idx];
+      const upCur = cur.c >= cur.o;
+      const chg = cur.o > 0 ? (((cur.c - cur.o) / cur.o) * 100).toFixed(2) : '0.00';
+      const curCls = cur.pending ? 'mag' : upCur ? 'ok' : 'bad';
+      const prefix = cur.pending ? 'EST. ' : '';
+      $('ohlc-readout').replaceChildren(
+        el('span', null, el('b', { class: cur.pending ? 'mag' : '' }, `${prefix}${cur.blk}`), ' ', el('span', { class: 'dim' }, `BTC #${cur.btc}`)),
+        el('span', null, 'O ', el('b', null, cur.o.toFixed(7))),
+        el('span', null, 'H ', el('b', { class: 'ok' }, cur.h.toFixed(7))),
+        el('span', null, 'L ', el('b', { class: 'bad' }, cur.l.toFixed(7))),
+        el('span', null, `${prefix}C `, el('b', { class: curCls }, cur.c.toFixed(7))),
+        el('span', { class: curCls }, `${upCur ? '+' : ''}${chg}%`),
+        el('span', null, `${prefix}VOL `, el('b', null, `${cur.vol.toFixed(2)} I0`)),
+      );
+      const overlay = $('ohlc-crosshair');
+      if (!overlay) return;
+      const yP = (p) => pBot - ((pBot - padT) * (p - minP)) / Math.max(1e-12, maxP - minP);
+      const gy = yP(cur.c);
+      const gc = cur.pending ? '#ed4abf' : upCur ? '#3ecf8e' : '#f2556b';
+      const nodes = [
+        sEl('line', { x1: padL, y1: gy.toFixed(1), x2: W - padR, y2: gy.toFixed(1), stroke: gc, 'stroke-dasharray': '3 3', opacity: 0.65 }),
+        sEl('rect', { x: W - padR + 2, y: (gy - 8.5).toFixed(1), width: 73, height: 17, rx: 3, fill: gc }),
+        sEl('text', { x: W - padR + 38.5, y: (gy + 3).toFixed(1), 'text-anchor': 'middle', fill: '#040406', 'font-size': 10, 'font-weight': 700, 'font-family': 'ui-monospace,monospace' }, cur.c.toFixed(7)),
+      ];
+      if (hoverIdx !== null && hoverIdx >= 0 && hoverIdx < data.length) {
+        const hx = padL + step * hoverIdx + step / 2;
+        nodes.push(sEl('line', { x1: hx.toFixed(1), y1: padT, x2: hx.toFixed(1), y2: H - padB, stroke: 'rgba(255,255,255,0.28)', 'stroke-dasharray': '3 3' }));
+        if (mode === 'line') {
+          nodes.push(sEl('circle', { cx: hx.toFixed(1), cy: gy.toFixed(1), r: 4, fill: gc }));
+        }
+      }
+      overlay.replaceChildren(...nodes);
+    }
+
+    function renderInteractiveChart(tok, projTok, accepted, precomputedCandles = null) {
       const svg = $('ohlc-svg');
       const readout = $('ohlc-readout');
       $('chart-tf-seg').style.opacity = activeChartMode === 'curve' ? '0.35' : '1';
@@ -1880,6 +2035,7 @@
       const volH = 58, pBot = H - padB - volH - 8, plotW = W - padL - padR;
 
       if (activeChartMode === 'curve') {
+        lastChartRender = { mode: 'curve', candles: [] };
         const vI0 = Number(tok.virtualI0 / UNIT);
         const rI0 = Number(tok.realI0) / Number(UNIT);
         const pI0 = projTok ? Number(projTok.realI0) / Number(UNIT) : rI0;
@@ -1899,7 +2055,7 @@
         readout.replaceChildren(
           el('span', null, 'MODE ', el('b', null, 'BONDING CURVE')),
           el('span', null, 'CONFIRMED ', el('b', { class: 'cyan' }, `${rI0.toFixed(2)} I0`)),
-          el('span', null, 'PENDING ', el('b', { class: 'mag' }, `${pI0.toFixed(2)} I0`)),
+          el('span', null, 'EST. PENDING ', el('b', { class: 'mag' }, `${pI0.toFixed(2)} I0`)),
         );
         const nodes = [
           sEl('path', { d: `${pathD} L${(padL + plotW).toFixed(1)},${H - padB} L${padL},${H - padB} Z`, fill: '#5ad8e6', 'fill-opacity': 0.11 }),
@@ -1918,22 +2074,7 @@
         return;
       }
 
-      const data = getTokenCandles(tok, projTok, accepted);
-      const idx = chartHoverIdx !== null && chartHoverIdx < data.length ? chartHoverIdx : data.length - 1;
-      const cur = data[idx];
-      const upCur = cur.c >= cur.o;
-      const chg = cur.o > 0 ? (((cur.c - cur.o) / cur.o) * 100).toFixed(2) : '0.00';
-      const curCls = cur.pending ? 'mag' : upCur ? 'ok' : 'bad';
-      readout.replaceChildren(
-        el('span', null, el('b', null, cur.blk), ' ', el('span', { class: 'dim' }, `BTC #${cur.btc}`)),
-        el('span', null, 'O ', el('b', null, cur.o.toFixed(7))),
-        el('span', null, 'H ', el('b', { class: 'ok' }, cur.h.toFixed(7))),
-        el('span', null, 'L ', el('b', { class: 'bad' }, cur.l.toFixed(7))),
-        el('span', null, 'C ', el('b', { class: curCls }, cur.c.toFixed(7))),
-        el('span', { class: curCls }, `${upCur ? '+' : ''}${chg}%`),
-        el('span', null, 'VOL ', el('b', null, `${cur.vol.toFixed(2)} I0`)),
-      );
-
+      const data = precomputedCandles ?? getTokenCandles(tok, projTok, accepted);
       let minP = Math.min(...data.map((d) => d.l));
       let maxP = Math.max(...data.map((d) => d.h));
       if (maxP - minP < 1e-12) { minP *= 0.96; maxP *= 1.04; }
@@ -1988,7 +2129,7 @@
               ...(d.pending ? { 'stroke-dasharray': '3 2' } : {}),
             }),
           );
-        } else if (d.pending || i === chartHoverIdx) {
+        } else if (d.pending) {
           nodes.push(sEl('circle', { cx: cx.toFixed(1), cy: yP(d.c).toFixed(1), r: 4, fill: col }));
         }
         if (i === 0 || i === data.length - 1 || i % Math.max(1, Math.ceil(data.length / 6)) === 0) {
@@ -1996,18 +2137,10 @@
         }
       });
 
-      const gy = yP(cur.c);
-      const gc = cur.pending ? '#ed4abf' : upCur ? '#3ecf8e' : '#f2556b';
-      nodes.push(
-        sEl('line', { x1: padL, y1: gy.toFixed(1), x2: W - padR, y2: gy.toFixed(1), stroke: gc, 'stroke-dasharray': '3 3', opacity: 0.65 }),
-        sEl('rect', { x: W - padR + 2, y: (gy - 8.5).toFixed(1), width: 73, height: 17, rx: 3, fill: gc }),
-        sEl('text', { x: W - padR + 38.5, y: (gy + 3).toFixed(1), 'text-anchor': 'middle', fill: '#040406', 'font-size': 10, 'font-weight': 700, 'font-family': 'ui-monospace,monospace' }, cur.c.toFixed(7)),
-      );
-      if (chartHoverIdx !== null && chartHoverIdx < data.length) {
-        const hx = padL + step * chartHoverIdx + step / 2;
-        nodes.push(sEl('line', { x1: hx.toFixed(1), y1: padT, x2: hx.toFixed(1), y2: H - padB, stroke: 'rgba(255,255,255,0.28)', 'stroke-dasharray': '3 3' }));
-      }
+      nodes.push(sEl('g', { id: 'ohlc-crosshair' }));
       svg.replaceChildren(...nodes);
+      lastChartRender = { candles: data, mode: activeChartMode, W, H, padL, padR, padT, padB, pBot, plotW, step, minP, maxP };
+      renderChartHoverOverlay(chartHoverIdx);
     }
 
     function renderQuotes(projectedState) {
@@ -2120,8 +2253,14 @@
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`, 'err-b'); }
     }
 
-    function getLiveQuotesForNet() {
-      const net = $('htlc-net').value;
+    function parsePositiveIntRate(raw) {
+      const s = String(raw ?? '').trim();
+      if (!s) return { ok: false, empty: true, error: 'Enter a positive integer limit price (sats/I0)' };
+      if (!/^[1-9]\d{0,15}$/.test(s)) return { ok: false, empty: false, error: 'Limit price must be a positive integer (sats/I0)' };
+      return { ok: true, value: BigInt(s) };
+    }
+
+    function getLiveQuotesForNet(net = $('htlc-net').value) {
       const now = Math.floor(Date.now() / 1000);
       const list = [...swapQuotesById.values()].filter((q) => q.network === net && q.expiresAt > now);
       const sellI0 = list.filter((q) => q.side === 'SELL_I0').sort((a, b) => Number(BigInt(a.rateSatsPerI0) - BigInt(b.rateSatsPerI0)));
@@ -2129,11 +2268,86 @@
       return { sellI0, buyI0 };
     }
 
+    function getLiveFillsForNet(net = $('htlc-net').value) {
+      const now = Math.floor(Date.now() / 1000);
+      return [...swapFillsById.values()].filter((f) => f.network === net && f.expiresAt > now).reverse();
+    }
+
+    function findVerifiedFillForHtlc(h, net) {
+      for (const f of swapFillsById.values()) {
+        if (f.network !== net || f.swapId !== h.id || f.hashlock !== h.hashlock) continue;
+        if (BigInt(f.i0Amount) !== h.amount) continue;
+        const partiesOk = (f.side === 'SELL_I0' && f.taker === h.sender && f.maker === h.recipient)
+          || (f.side === 'BUY_I0' && f.maker === h.sender && f.taker === h.recipient);
+        if (!partiesOk) continue;
+        const q = swapQuotesById.get(`${f.network}:${f.maker}:${f.quoteId}`);
+        const quoteVerified = Boolean(q && q.sig === f.quoteSig && q.rateSatsPerI0 === f.rateSatsPerI0);
+        return { fill: f, quoteVerified };
+      }
+      return null;
+    }
+
+    // Shared market quote resolver used by BOTH preview and submit (honors selected row + enforces [minI0, maxI0] + no self-fill).
+    function resolveMarketSwapQuote(dir, amtParsed, net = $('htlc-net').value) {
+      const { sellI0, buyI0 } = getLiveQuotesForNet(net);
+      const list = dir === 'buy_i0' ? sellI0 : buyI0;
+      const eligible = list.filter((q) => q.maker !== activePersona.pk);
+      const pinned = selectedSwapQuoteId ? list.find((q) => quoteMapKey(q) === selectedSwapQuoteId) : null;
+      if (selectedSwapQuoteId && !pinned) selectedSwapQuoteId = null;
+
+      const evalQuote = (q) => {
+        const rate = BigInt(q.rateSatsPerI0);
+        const minI0 = BigInt(q.minI0);
+        const maxI0 = BigInt(q.maxI0);
+        if (!amtParsed.ok) return { ok: false, quote: q, rate, i0Amount: 0n, btcSats: 0n, error: amtParsed.error };
+        const i0Amount = dir === 'buy_i0' ? (amtParsed.value * UNIT) / rate : amtParsed.value;
+        const btcSats = (i0Amount * rate) / UNIT;
+        if (i0Amount <= 0n || btcSats <= 0n) {
+          return { ok: false, quote: q, rate, i0Amount, btcSats, error: 'Amount too small for quote rate' };
+        }
+        if (i0Amount < minI0 || i0Amount > maxI0) {
+          return {
+            ok: false,
+            quote: q,
+            rate,
+            i0Amount,
+            btcSats,
+            error: `Size ${fmtI0(i0Amount)} I0 outside quote limits [${fmtI0(minI0)}..${fmtI0(maxI0)} I0]`,
+          };
+        }
+        return { ok: true, quote: q, rate, i0Amount, btcSats, error: null };
+      };
+
+      if (pinned) {
+        if (pinned.maker === activePersona.pk) {
+          return { ok: false, quote: pinned, rate: BigInt(pinned.rateSatsPerI0), i0Amount: 0n, btcSats: 0n, error: 'Cannot market-fill your own quote - pick another quote or switch signer.' };
+        }
+        return evalQuote(pinned);
+      }
+      if (!eligible.length) {
+        return {
+          ok: false,
+          quote: null,
+          rate: 0n,
+          i0Amount: 0n,
+          btcSats: 0n,
+          error: list.length ? 'Only your own quotes are live - switch signer or post a Limit Order.' : 'No live counterparty quotes on orderbook - switch to LIMIT ORDER.',
+        };
+      }
+      if (amtParsed.ok) {
+        for (const q of eligible) {
+          const res = evalQuote(q);
+          if (res.ok) return res;
+        }
+      }
+      return evalQuote(eligible[0]);
+    }
+
     function renderSwapDesk(s, projectedState) {
       const net = $('htlc-net').value;
       $('swap-net-tag').textContent = net.toUpperCase();
       const canFundEscrow = !isSimulatedView() && ordConfirmationVerified;
-      const { sellI0, buyI0 } = getLiveQuotesForNet();
+      const { sellI0, buyI0 } = getLiveQuotesForNet(net);
       const bestBuyRate = sellI0[0] ? Number(sellI0[0].rateSatsPerI0) : null;
       const bestSellRate = buyI0[0] ? Number(buyI0[0].rateSatsPerI0) : null;
 
@@ -2156,11 +2370,10 @@
       $('swap-limit-rate-wrap').hidden = activeSwapMode !== 'limit';
 
       const amtParsed = tryParseDecimalToBaseUnits($('swap-amount').value);
-      const matchedQuote = activeSwapDir === 'buy_i0' ? sellI0[0] : buyI0[0];
-      const marketRate = matchedQuote ? BigInt(matchedQuote.rateSatsPerI0) : 0n;
-      const limitRateRaw = BigInt(Math.max(1, Math.round(Number($('swap-limit-rate').value || 0)) || Number(marketRate || 1400n)));
-      const useRate = activeSwapMode === 'market' ? marketRate : limitRateRaw;
-      $('swap-market-ref').textContent = `BEST: ${marketRate > 0n ? `${Number(marketRate).toLocaleString()} sats` : 'NONE'}`;
+      const mktRes = resolveMarketSwapQuote(activeSwapDir, amtParsed, net);
+      const limitRateRes = parsePositiveIntRate($('swap-limit-rate').value);
+      const refRate = activeSwapDir === 'buy_i0' ? (sellI0[0] ? Number(sellI0[0].rateSatsPerI0) : 0) : (buyI0[0] ? Number(buyI0[0].rateSatsPerI0) : 0);
+      $('swap-market-ref').textContent = `BEST: ${refRate > 0 ? `${refRate.toLocaleString()} sats` : 'NONE'}`;
 
       const needsLock = activeSwapMode === 'market' && activeSwapDir === 'sell_i0';
       $('htlc-prep-secret-btn').hidden = !needsLock;
@@ -2168,84 +2381,142 @@
         $('htlc-secret-backup').hidden = true;
       }
 
-      if (activeSwapDir === 'buy_i0') {
-        $('swap-in-lbl').textContent = 'YOU PAY (BTC)';
-        $('swap-in-sub').textContent = activeSwapMode === 'market' ? 'AUTO-MATCHED FROM ORDERBOOK' : 'LIMIT BUY ORDER';
-        $('swap-out-lbl').textContent = activeSwapMode === 'market' ? 'YOU RECEIVE (I0 AT BEST PRICE)' : 'TARGET RECEIVE (I0 IF FILLED)';
-        if (amtParsed.ok && useRate > 0n) {
-          // amtParsed.value is satoshis (10^8 per BTC). i0Units = (sats * UNIT) / rateSatsPerI0
-          const i0Out = (amtParsed.value * UNIT) / useRate;
-          $('swap-out-val').textContent = `${fmtI0(i0Out)} I0`;
-          $('swap-rate-lbl').textContent = `${activeSwapMode === 'market' ? 'BEST RATE' : 'LIMIT RATE'}: ${Number(useRate).toLocaleString()} sats/I0`;
-          const makerName = matchedQuote ? (PERSONAS.find((p) => p.pk === matchedQuote.maker)?.name.split(' ')[0] ?? shortId(matchedQuote.maker)) : 'No live maker';
-          $('swap-quote-summary').replaceChildren(el('div', { class: 'kv-list' },
-            el('div', { class: 'kv' }, el('span', null, 'COUNTERPARTY'), el('strong', null, activeSwapMode === 'market' ? `${makerName} (max ${fmtI0(BigInt(matchedQuote?.maxI0 || '0'))} I0)` : 'Signed #i0-swap orderbook')),
-            el('div', { class: 'kv' }, el('span', null, 'SETTLEMENT'), el('strong', { class: 'ok' }, `Taproot HTLC (${PARAMS.htlcSafeMarginBtcBlocks} blk safety)`)),
-            el('div', { class: 'kv' }, el('span', null, 'PROTOCOL FEE'), el('strong', null, '0% (P2P atomic swap)')),
-          ));
-          $('swap-submit-btn').textContent = activeSwapMode === 'market'
-            ? `REQUEST BEST-PRICE SWAP (${formatBaseUnitsExact(amtParsed.value)} BTC -> ${fmtI0(i0Out)} I0)`
-            : `POST LIMIT BUY (${fmtI0(i0Out)} I0 @ ${Number(useRate)} SATS)`;
-          $('swap-submit-btn').disabled = activeSwapMode === 'market' && !matchedQuote;
+      if (activeSwapMode === 'market') {
+        const q = mktRes.quote;
+        const makerName = q ? (PERSONAS.find((p) => p.pk === q.maker)?.name.split(' ')[0] ?? shortId(q.maker)) : 'None';
+        const isPinned = Boolean(q && selectedSwapQuoteId === quoteMapKey(q));
+        if (activeSwapDir === 'buy_i0') {
+          $('swap-in-lbl').textContent = 'YOU PAY (BTC)';
+          $('swap-in-sub').textContent = isPinned ? `PINNED QUOTE ${q.id}` : 'AUTO-MATCHED FROM ORDERBOOK';
+          $('swap-out-lbl').textContent = isPinned ? 'YOU RECEIVE (I0 AT SELECTED QUOTE)' : 'YOU RECEIVE (I0 AT BEST PRICE)';
+          if (mktRes.ok) {
+            $('swap-out-val').textContent = `${fmtI0(mktRes.i0Amount)} I0`;
+            $('swap-rate-lbl').textContent = `${isPinned ? 'SELECTED' : 'BEST RATE'}: ${Number(mktRes.rate).toLocaleString()} sats/I0`;
+            $('swap-quote-summary').replaceChildren(el('div', { class: 'kv-list' },
+              el('div', { class: 'kv' }, el('span', null, 'COUNTERPARTY'), el('strong', null, `${makerName} (${fmtI0(BigInt(q.minI0))}..${fmtI0(BigInt(q.maxI0))} I0)`)),
+              el('div', { class: 'kv' }, el('span', null, 'SIGNED TERMS'), el('strong', { class: 'cyan' }, `${formatBaseUnitsExact(mktRes.btcSats)} BTC (${Number(mktRes.btcSats).toLocaleString()} sats) · ${q.id}`)),
+              el('div', { class: 'kv' }, el('span', null, 'SETTLEMENT'), el('strong', { class: 'ok' }, `Signed #i0-swap fill + Taproot HTLC (${PARAMS.htlcSafeMarginBtcBlocks} blk safety)`)),
+            ));
+            $('swap-submit-btn').textContent = `SIGN FILL (${formatBaseUnitsExact(mktRes.btcSats)} BTC -> ${fmtI0(mktRes.i0Amount)} I0 @ ${Number(mktRes.rate)})`;
+            $('swap-submit-btn').disabled = htlcSubmitInFlight;
+          } else {
+            $('swap-out-val').textContent = '0.00 I0';
+            $('swap-rate-lbl').textContent = mktRes.rate > 0n ? `${Number(mktRes.rate).toLocaleString()} sats/I0` : 'No quotes';
+            $('swap-quote-summary').replaceChildren(el('div', { class: q ? 'bad' : 'dim' }, mktRes.error));
+            $('swap-submit-btn').textContent = 'SWAP AT BEST PRICE';
+            $('swap-submit-btn').disabled = true;
+          }
         } else {
-          $('swap-out-val').textContent = '0.00 I0';
-          $('swap-rate-lbl').textContent = useRate > 0n ? `${Number(useRate).toLocaleString()} sats/I0` : 'No quotes';
-          $('swap-quote-summary').replaceChildren(el('div', { class: 'dim' }, amtParsed.ok ? 'No active quotes on orderbook - switch to LIMIT ORDER to post one.' : amtParsed.error));
-          $('swap-submit-btn').disabled = true;
+          $('swap-in-lbl').textContent = 'YOU SELL (I0)';
+          $('swap-in-sub').textContent = isPinned ? `PINNED QUOTE ${q.id}` : 'LOCKS I0 + SIGNS #i0-swap FILL';
+          $('swap-out-lbl').textContent = isPinned ? 'YOU RECEIVE (BTC AT SELECTED QUOTE)' : 'YOU RECEIVE (BTC AT BEST PRICE)';
+          if (mktRes.ok) {
+            const overBal = mktRes.i0Amount > availI0;
+            $('swap-out-val').textContent = `${formatBaseUnitsExact(mktRes.btcSats)} BTC`;
+            $('swap-rate-lbl').textContent = `${isPinned ? 'SELECTED' : 'BEST RATE'}: ${Number(mktRes.rate).toLocaleString()} sats/I0`;
+            $('swap-quote-summary').replaceChildren(el('div', { class: 'kv-list' },
+              el('div', { class: 'kv' }, el('span', null, 'MATCHED BUYER'), el('strong', null, `${makerName} (${fmtI0(BigInt(q.minI0))}..${fmtI0(BigInt(q.maxI0))} I0)`)),
+              el('div', { class: 'kv' }, el('span', null, 'BOUND BTC TERMS'), el('strong', { class: 'cyan' }, `${Number(mktRes.btcSats).toLocaleString()} sats @ ${Number(mktRes.rate)} sats/I0 · ${q.id}`)),
+              el('div', { class: 'kv' }, el('span', null, 'SETTLEMENT'), el('strong', { class: 'ok' }, 'Step 1: Backup Key S -> Step 2: Lock HTLC + Sign Fill')),
+              overBal ? el('div', { class: 'bad' }, `Exceeds available (${formatBaseUnitsExact(availI0)} I0)`) : null,
+            ));
+            $('swap-submit-btn').textContent = `2. LOCK ${formatBaseUnitsExact(mktRes.i0Amount)} I0 -> ${formatBaseUnitsExact(mktRes.btcSats)} BTC`;
+            $('swap-submit-btn').disabled = htlcSubmitInFlight || overBal || !stagedSwapSecret?.backedUp;
+          } else {
+            $('swap-out-val').textContent = '0 BTC';
+            $('swap-rate-lbl').textContent = mktRes.rate > 0n ? `${Number(mktRes.rate).toLocaleString()} sats/I0` : 'No quotes';
+            $('swap-quote-summary').replaceChildren(el('div', { class: q ? 'bad' : 'dim' }, mktRes.error));
+            $('swap-submit-btn').textContent = '2. LOCK I0 IN HTLC';
+            $('swap-submit-btn').disabled = true;
+          }
         }
       } else {
-        $('swap-in-lbl').textContent = 'YOU SELL (I0)';
-        $('swap-in-sub').textContent = activeSwapMode === 'market' ? 'LOCKS I0 IN TRUSTLESS HTLC' : 'LIMIT SELL ORDER';
-        $('swap-out-lbl').textContent = activeSwapMode === 'market' ? 'YOU RECEIVE (BTC AT BEST PRICE)' : 'TARGET RECEIVE (BTC IF FILLED)';
-        if (amtParsed.ok && useRate > 0n) {
-          const satsOut = (amtParsed.value * useRate) / UNIT;
-          $('swap-out-val').textContent = `${formatBaseUnitsExact(satsOut)} BTC`;
-          $('swap-rate-lbl').textContent = `${activeSwapMode === 'market' ? 'BEST RATE' : 'LIMIT RATE'}: ${Number(useRate).toLocaleString()} sats/I0`;
-          const makerName = matchedQuote ? (PERSONAS.find((p) => p.pk === matchedQuote.maker)?.name.split(' ')[0] ?? shortId(matchedQuote.maker)) : 'No live maker';
+        // LIMIT ORDER mode — strictly requires valid amount AND valid positive integer limit rate!
+        const isBuy = activeSwapDir === 'buy_i0';
+        $('swap-in-lbl').textContent = isBuy ? 'YOU PAY (BTC)' : 'YOU SELL (I0)';
+        $('swap-in-sub').textContent = isBuy ? 'LIMIT BUY ORDER' : 'LIMIT SELL ORDER';
+        $('swap-out-lbl').textContent = isBuy ? 'TARGET RECEIVE (I0 IF FILLED)' : 'TARGET RECEIVE (BTC IF FILLED)';
+        if (amtParsed.ok && limitRateRes.ok) {
+          const rate = limitRateRes.value;
+          const i0Size = isBuy ? (amtParsed.value * UNIT) / rate : amtParsed.value;
+          const satsTotal = (i0Size * rate) / UNIT;
+          const overBal = !isBuy && i0Size > availI0;
+          const sizeOk = i0Size > 0n && satsTotal > 0n;
+          $('swap-out-val').textContent = isBuy ? `${fmtI0(i0Size)} I0` : `${formatBaseUnitsExact(satsTotal)} BTC`;
+          $('swap-rate-lbl').textContent = `LIMIT RATE: ${Number(rate).toLocaleString()} sats/I0`;
           $('swap-quote-summary').replaceChildren(el('div', { class: 'kv-list' },
-            el('div', { class: 'kv' }, el('span', null, 'MATCHED BUYER'), el('strong', null, activeSwapMode === 'market' ? `${makerName} (max ${fmtI0(BigInt(matchedQuote?.maxI0 || '0'))} I0)` : 'Signed #i0-swap orderbook')),
-            el('div', { class: 'kv' }, el('span', null, 'SETTLEMENT'), el('strong', { class: 'ok' }, 'Step 1: Backup Key S -> Step 2: Lock HTLC')),
-            amtParsed.value > availI0 ? el('div', { class: 'bad' }, `Exceeds available (${formatBaseUnitsExact(availI0)} I0)`) : null,
+            el('div', { class: 'kv' }, el('span', null, 'VENUE'), el('strong', null, 'Signed #i0-swap orderbook')),
+            el('div', { class: 'kv' }, el('span', null, 'ORDER RANGE'), el('strong', null, `${fmtI0(i0Size < UNIT ? i0Size : UNIT)}..${fmtI0(i0Size)} I0`)),
+            el('div', { class: 'kv' }, el('span', null, 'PROTOCOL FEE'), el('strong', null, '0% (P2P atomic swap)')),
+            !sizeOk ? el('div', { class: 'bad' }, 'Order size too small for limit price') : null,
+            overBal ? el('div', { class: 'bad' }, `Exceeds available (${formatBaseUnitsExact(availI0)} I0)`) : null,
           ));
-          $('swap-submit-btn').textContent = activeSwapMode === 'market'
-            ? `2. LOCK ${formatBaseUnitsExact(amtParsed.value)} I0 -> ${formatBaseUnitsExact(satsOut)} BTC`
-            : `POST LIMIT SELL (${formatBaseUnitsExact(amtParsed.value)} I0 @ ${Number(useRate)} SATS)`;
-          $('swap-submit-btn').disabled = amtParsed.value > availI0 || (activeSwapMode === 'market' && (!matchedQuote || !stagedSwapSecret?.backedUp));
+          $('swap-submit-btn').textContent = isBuy
+            ? `POST LIMIT BUY (${fmtI0(i0Size)} I0 @ ${Number(rate)} SATS)`
+            : `POST LIMIT SELL (${formatBaseUnitsExact(i0Size)} I0 @ ${Number(rate)} SATS)`;
+          $('swap-submit-btn').disabled = htlcSubmitInFlight || !sizeOk || overBal;
         } else {
-          $('swap-out-val').textContent = '0 BTC';
-          $('swap-rate-lbl').textContent = useRate > 0n ? `${Number(useRate).toLocaleString()} sats/I0` : 'No quotes';
-          $('swap-quote-summary').replaceChildren(el('div', { class: 'dim' }, amtParsed.ok ? 'No active BUY quotes - switch to LIMIT ORDER.' : amtParsed.error));
+          $('swap-out-val').textContent = isBuy ? '0.00 I0' : '0 BTC';
+          $('swap-rate-lbl').textContent = limitRateRes.ok ? `LIMIT RATE: ${Number(limitRateRes.value).toLocaleString()} sats/I0` : 'ENTER LIMIT RATE';
+          const errMsg = !amtParsed.ok ? amtParsed.error : limitRateRes.error;
+          $('swap-quote-summary').replaceChildren(el('div', { class: (!amtParsed.ok && amtParsed.empty) || (!limitRateRes.ok && limitRateRes.empty) ? 'dim' : 'bad' }, errMsg));
+          $('swap-submit-btn').textContent = isBuy ? 'POST LIMIT BUY ORDER' : 'POST LIMIT SELL ORDER';
           $('swap-submit-btn').disabled = true;
         }
       }
 
-      // Render Live Orderbook Table
+      // Render Live Orderbook Table (with exact selected row pinning)
       const bookRows = [...sellI0, ...buyI0];
       $('swap-book-cnt').textContent = `${bookRows.length} QUOTES`;
       $('swap-book-tbody').replaceChildren(...(bookRows.length
         ? bookRows.map((q) => {
             const who = PERSONAS.find((p) => p.pk === q.maker)?.name.split(' ')[0] ?? shortId(q.maker);
             const isSell = q.side === 'SELL_I0';
-            return el('tr', null,
+            const qKey = quoteMapKey(q);
+            const isSelected = activeSwapMode === 'market' && selectedSwapQuoteId === qKey;
+            const minI0 = BigInt(q.minI0);
+            const maxI0 = BigInt(q.maxI0);
+            return el('tr', { class: isSelected ? 'selected' : '', 'data-quote-key': qKey },
               el('td', null, el('span', { class: `tag ${isSell ? 'ok' : 'bad'}` }, isSell ? 'SELL I0' : 'BUY I0')),
               el('td', { class: `r ${isSell ? 'ok' : 'bad'}` }, `${Number(q.rateSatsPerI0).toLocaleString()} sats`),
-              el('td', { class: 'r' }, `${fmtI0(BigInt(q.maxI0))} I0`),
+              el('td', { class: 'r' }, `${fmtI0(minI0)}-${fmtI0(maxI0)} I0`),
               el('td', { class: 'mut' }, who),
               el('td', { class: 'r' }, el('button', {
-                class: 'btn-ghost',
+                class: isSelected ? 'btn-qb' : 'btn-ghost',
                 style: 'height:21px;font-size:10px',
                 onclick: () => {
                   activeSwapMode = 'market';
                   activeSwapDir = isSell ? 'buy_i0' : 'sell_i0';
+                  selectedSwapQuoteId = qKey;
                   for (const b of $('swap-mode-seg').querySelectorAll('[data-swmode]')) b.classList.toggle('active', b.dataset.swmode === activeSwapMode);
                   for (const b of $('swap-dir-seg').querySelectorAll('[data-swdir]')) b.classList.toggle('active', b.dataset.swdir === activeSwapDir);
-                  $('swap-amount').value = isSell ? '0.00142' : '25';
+                  const defI0 = maxI0 < 25n * UNIT ? maxI0 : (minI0 > 25n * UNIT ? minI0 : 25n * UNIT);
+                  $('swap-amount').value = isSell
+                    ? formatBaseUnitsExact((defI0 * BigInt(q.rateSatsPerI0)) / UNIT)
+                    : formatBaseUnitsExact(defI0);
                   renderAll();
                 },
-              }, isSell ? 'BUY I0' : 'SELL I0')),
+              }, isSelected ? 'SELECTED' : isSell ? 'BUY I0' : 'SELL I0')),
             );
           })
         : [el('tr', null, el('td', { colspan: '5', class: 'dim' }, 'No live quotes on #i0-swap yet. Post a Limit Order to make a market.'))]));
+
+      // Render Verified Signed Swap Fills (#i0-swap)
+      const liveFills = getLiveFillsForNet(net);
+      $('swap-fills-cnt').textContent = `${liveFills.length} FILLS`;
+      $('swap-fills-list').replaceChildren(...(liveFills.length
+        ? liveFills.slice(0, 4).map((f) => {
+            const takerName = PERSONAS.find((p) => p.pk === f.taker)?.name.split(' ')[0] ?? shortId(f.taker);
+            const makerName = PERSONAS.find((p) => p.pk === f.maker)?.name.split(' ')[0] ?? shortId(f.maker);
+            return el('div', { class: 'kv num', style: 'padding:4px 0;border-bottom:1px solid var(--line-1)' },
+              el('span', null,
+                el('span', { class: `tag ${f.side === 'BUY_I0' ? 'ok' : 'cyan'}`, style: 'margin-right:6px' }, f.side === 'BUY_I0' ? 'BUY FILL' : 'SELL+HTLC'),
+                `${takerName} -> ${makerName} · ${f.quoteId}`,
+              ),
+              el('strong', null, `${fmtI0(BigInt(f.i0Amount))} I0 = ${Number(f.btcSats).toLocaleString()} sats`),
+            );
+          })
+        : [el('div', { class: 'dim', style: 'font-size:11.5px' }, 'No signed #i0-swap fills yet. Execute a Market swap to bind quoted BTC terms.')]));
 
       // Render Active HTLC Escrows (both mini preview and full tab)
       $('htlc-count-chip').textContent = String(s.htlcs.size);
@@ -2256,9 +2527,10 @@
         const btcTimeout = h.timeoutBtcHeight - PARAMS.htlcSafeMarginBtcBlocks;
         const timeRemainingOk = btcTimeout > ordBtcHeight + 2;
         const statusLabel = isSimulatedView() ? 'SIMULATED DEMO' : ordConfirmationVerified ? 'ORD CONFIRMED' : 'UNVERIFIED';
+        const bound = findVerifiedFillForHtlc(h, net);
         const card = el('div', { class: 'field', style: 'display:flex;flex-direction:column;gap:5px' });
         card.appendChild(el('div', { style: 'display:flex;justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap', class: 'num' },
-          el('div', { style: 'display:flex;align-items:center;gap:6px' },
+          el('div', { style: 'display:flex;align-items:center;gap:6px;flex-wrap:wrap' },
             el('span', { class: `dot ${canFundEscrow ? 'ok' : 'warn'}` }),
             el('strong', null, `${fmtI0(h.amount)} I0`),
             el('span', { class: 'mut' }, `${senderName} -> ${recName}`),
@@ -2266,6 +2538,16 @@
           ),
           el('span', { class: 'dim' }, `I0 EXP #${h.timeoutBtcHeight} · CLTV #${btcTimeout}`),
         ));
+        if (bound) {
+          const f = bound.fill;
+          card.appendChild(el('div', { class: 'num', style: 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11px' },
+            el('span', { class: `tag ${bound.quoteVerified ? 'ok' : 'cyan'}` }, bound.quoteVerified ? 'QUOTE + FILL VERIFIED' : 'TAKER FILL SIGNED'),
+            el('strong', { class: 'cyan' }, `AGREED BTC: ${formatBaseUnitsExact(BigInt(f.btcSats))} BTC (${Number(f.btcSats).toLocaleString()} sats @ ${Number(f.rateSatsPerI0).toLocaleString()} sats/I0)`),
+            el('span', { class: 'dim' }, `· ${f.quoteId}`),
+          ));
+        } else {
+          card.appendChild(el('div', { class: 'warn num', style: 'font-size:10.5px' }, 'UNBOUND ESCROW: No signed BTC amount on #i0-swap - verify BTC terms directly before funding.'));
+        }
         card.appendChild(el('div', { class: 'dim num', style: 'font-size:10.5px' }, `H=${h.hashlock}`));
         const mySecret = activePersona.pk === h.sender ? sessionHtlcSecrets.get(h.id) : null;
         if (mySecret) {
@@ -2338,12 +2620,16 @@
       let totalPoolI0 = 0n;
       let pendFlowI0 = 0n;
       const pendByTok = new Map();
+      const pendCountByTok = new Map();
       for (const t of projectedState.tokens.values()) totalPoolI0 += t.realI0;
       for (const tx of accepted) {
         if (tx.type === 'BUY') {
           const amt = BigInt(tx.i0In || '0');
           pendFlowI0 += amt;
           pendByTok.set(tx.tokenId, (pendByTok.get(tx.tokenId) ?? 0n) + amt);
+          pendCountByTok.set(tx.tokenId, (pendCountByTok.get(tx.tokenId) ?? 0) + 1);
+        } else if (tx.type === 'SELL') {
+          pendCountByTok.set(tx.tokenId, (pendCountByTok.get(tx.tokenId) ?? 0) + 1);
         }
       }
 
@@ -2366,7 +2652,7 @@
       const q = ($('explore-search').value || '').trim().toLowerCase();
       let allToks = [...s.tokens.values()].filter((t) => {
         if (q && !t.ticker.toLowerCase().includes(q) && !t.name.toLowerCase().includes(q) && !t.id.toLowerCase().includes(q)) return false;
-        if (activeExploreFilter === 'pending' && !(pendByTok.get(t.id) > 0n)) return false;
+        if (activeExploreFilter === 'pending' && !(pendCountByTok.get(t.id) > 0)) return false;
         if (activeExploreFilter === 'holdings' && !(E.getBalance(projectedState, activePersona.pk, t.id) > 0n)) return false;
         return true;
       });
@@ -2381,6 +2667,7 @@
         const firstOpen = candles[0]?.o || pNow;
         const pct = firstOpen > 0 ? ((pProj - firstOpen) / firstOpen) * 100 : 0;
         const pendAmt = pendByTok.get(tok.id) ?? 0n;
+        const pendCnt = pendCountByTok.get(tok.id) ?? 0;
         const prog = Math.min(100, Math.round((Number(tok.realI0) / Number(UNIT) / 300) * 100));
         const pProg = Math.min(100 - prog, Math.round((Number(pendAmt) / Number(UNIT) / 300) * 100));
         const ageBlk = Math.max(0, s.height - (launchH.get(tok.id) ?? s.height));
@@ -2396,7 +2683,7 @@
             ),
             el('div', { class: 'num', style: 'display:flex;align-items:center;gap:6px;margin-top:3px;font-size:10.5px' },
               el('span', { class: 'mut' }, `RES ${fmtI0(tok.realI0)}`),
-              el('span', { class: pendAmt > 0n ? 'mag' : 'dim' }, pendAmt > 0n ? `+${fmtI0(pendAmt)} PEND` : 'QUIET'),
+              el('span', { class: pendCnt > 0 ? 'mag' : 'dim' }, pendAmt > 0n ? `+${fmtI0(pendAmt)} PEND` : pendCnt > 0 ? `${pendCnt} SELL PEND` : 'QUIET'),
               el('div', { class: 'pbar', style: 'flex:1;min-width:26px' },
                 el('div', { class: 'pbar-f', style: `width:${prog}%` }),
                 el('div', { class: 'pbar-p', style: `width:${pProg}%` }),
@@ -2457,9 +2744,9 @@
           })
         : [el('tr', null, el('td', { colspan: '7', class: 'dim' }, 'No matching tokens found.'))]));
 
-      // 2. TOKEN DETAIL + OHLC — OPTION A
+      // 2. TOKEN DETAIL + OHLC — OPTION A (skip off-screen chart/table rebuilds when on other pages)
       $('token-batch-chip').textContent = `${accepted.length} QUEUED · BTC #${activeBtcHeight() + 1} · 0% MEV`;
-      if (selTok) {
+      if (activePage === 'token' && selTok) {
         const pTok = projectedState.tokens.get(selTok.id) ?? selTok;
         const pNow = spotPriceOf(selTok), pProj = spotPriceOf(pTok);
         const candles = getTokenCandles(selTok, pTok, accepted);
@@ -2513,14 +2800,14 @@
           el('div', { class: 'kv' }, el('span', null, 'CREATOR PUBKEY'), el('strong', null, selTok.creator)),
           el('div', { class: 'kv' }, el('span', null, 'VIRTUAL CUSHION'), el('strong', null, `${fmtI0(selTok.virtualI0)} I0`)),
           el('div', { class: 'kv' }, el('span', null, 'CURVE TOKENS LEFT'), el('strong', null, fmtTok(pTok.realTok))),
-          el('div', { class: 'kv' }, el('span', null, 'CREATOR ROYALTY'), el('strong', { class: 'ok' }, `${(Number(PARAMS.tradeFeeBps) / Number(PARAMS.bpsDenom)) * 50}% FOREVER`)),
+          el('div', { class: 'kv' }, el('span', null, 'CREATOR ROYALTY'), el('strong', { class: 'ok' }, `${creatorRoyaltyPct()}% FOREVER`)),
         );
 
-        renderInteractiveChart(selTok, pTok, accepted);
+        renderInteractiveChart(selTok, pTok, accepted, candles);
         $('token-ohlc-tbody').replaceChildren(...[...candles].reverse().map((c) => {
           const up = c.c >= c.o;
           return el('tr', null,
-            el('td', { class: c.pending ? 'mag' : '' }, c.blk),
+            el('td', { class: c.pending ? 'mag' : '' }, c.pending ? `${c.blk} (EST.)` : c.blk),
             el('td', { class: 'r' }, c.o.toFixed(7)),
             el('td', { class: 'r ok' }, c.h.toFixed(7)),
             el('td', { class: 'r bad' }, c.l.toFixed(7)),
@@ -2528,10 +2815,10 @@
             el('td', { class: 'r mut' }, `${c.vol.toFixed(2)}`),
           );
         }));
+        renderQuotes(projectedState);
+        $('token-pending-count').textContent = String(accepted.length);
+        $('token-pending-list').replaceChildren(...buildMempoolNodes(s, accepted));
       }
-      renderQuotes(projectedState);
-      $('token-pending-count').textContent = String(accepted.length);
-      $('token-pending-list').replaceChildren(...buildMempoolNodes(s, accepted));
 
       // 3. LAUNCH REVIEW
       renderLaunchReview();
@@ -2708,29 +2995,21 @@
       };
     }
     $('ohlc-svg').addEventListener('mousemove', (ev) => {
-      if (activeChartMode === 'curve' || !activeState() || !selectedTokenId) return;
-      const s = activeState();
-      const tok = s.tokens.get(selectedTokenId);
-      if (!tok) return;
-      const { projectedState, accepted } = getProjected();
-      const data = getTokenCandles(tok, projectedState.tokens.get(tok.id), accepted);
+      if (!lastChartRender || lastChartRender.mode === 'curve' || !lastChartRender.candles.length) return;
+      const { candles: data, W, padL, plotW } = lastChartRender;
       const r = $('ohlc-svg').getBoundingClientRect();
-      const relX = ((ev.clientX - r.left) / r.width) * 760;
-      const idx = Math.max(0, Math.min(data.length - 1, Math.floor(((relX - 10) / (760 - 88)) * data.length)));
+      if (r.width <= 0) return;
+      const relX = ((ev.clientX - r.left) / r.width) * W;
+      const idx = Math.max(0, Math.min(data.length - 1, Math.floor(((relX - padL) / plotW) * data.length)));
       if (idx !== chartHoverIdx) {
         chartHoverIdx = idx;
-        renderInteractiveChart(tok, projectedState.tokens.get(tok.id), accepted);
+        renderChartHoverOverlay(idx);
       }
     });
     $('ohlc-svg').addEventListener('mouseleave', () => {
       if (chartHoverIdx !== null) {
         chartHoverIdx = null;
-        const s = activeState();
-        const tok = s?.tokens.get(selectedTokenId);
-        if (tok) {
-          const { projectedState, accepted } = getProjected();
-          renderInteractiveChart(tok, projectedState.tokens.get(tok.id), accepted);
-        }
+        renderChartHoverOverlay(null);
       }
     });
 
@@ -2741,6 +3020,7 @@
     for (const btn of $('swap-mode-seg').querySelectorAll('[data-swmode]')) {
       btn.onclick = () => {
         activeSwapMode = btn.dataset.swmode;
+        if (activeSwapMode !== 'market') selectedSwapQuoteId = null;
         for (const b of $('swap-mode-seg').querySelectorAll('[data-swmode]')) b.classList.toggle('active', b === btn);
         renderAll();
       };
@@ -2748,6 +3028,7 @@
     for (const btn of $('swap-dir-seg').querySelectorAll('[data-swdir]')) {
       btn.onclick = () => {
         activeSwapDir = btn.dataset.swdir;
+        selectedSwapQuoteId = null;
         for (const b of $('swap-dir-seg').querySelectorAll('[data-swdir]')) b.classList.toggle('active', b === btn);
         $('swap-amount').value = activeSwapDir === 'buy_i0' ? '0.00142' : '25';
         renderAll();
@@ -2797,7 +3078,7 @@
     $('wallet-select-mobile').onchange = () => selectPersonaById($('wallet-select-mobile').value);
     $('htlc-net').onchange = () => {
       if (activeState()) {
-        swapQuotesById.clear();
+        selectedSwapQuoteId = null;
         seedDemoSwapQuotes(activeState());
         renderAll();
       }
@@ -2909,23 +3190,32 @@
     };
 
     $('swap-submit-btn').onclick = async () => {
+      if (htlcSubmitInFlight) return;
       try {
         const s = activeState();
-        const amt = parseDecimalToBaseUnits($('swap-amount').value);
+        const amtParsed = tryParseDecimalToBaseUnits($('swap-amount').value);
+        if (!amtParsed.ok) throw new Error(amtParsed.error);
+        const amt = amtParsed.value;
         const net = $('htlc-net').value;
-        const { sellI0, buyI0 } = getLiveQuotesForNet();
 
         if (activeSwapMode === 'limit') {
           if (typeof E.signSwapQuote !== 'function') throw new Error('Pinned G_rules lacks signSwapQuote');
-          const rate = BigInt(Math.max(1, Math.round(Number($('swap-limit-rate').value || 0))));
+          const rateParsed = parsePositiveIntRate($('swap-limit-rate').value);
+          if (!rateParsed.ok) throw new Error(rateParsed.error);
+          const rate = rateParsed.value;
           const i0Size = activeSwapDir === 'buy_i0' ? (amt * UNIT) / rate : amt;
-          if (i0Size <= 0n) throw new Error('Order size must be positive');
+          if (i0Size <= 0n || (i0Size * rate) / UNIT <= 0n) throw new Error('Order size too small for limit price');
+          if (activeSwapDir === 'sell_i0') {
+            const availI0 = E.getBalance(getProjected().projectedState, activePersona.pk, 0);
+            if (i0Size > availI0) throw new Error(`Insufficient I0 balance (${formatBaseUnitsExact(availI0)} I0 available)`);
+          }
+          const minI0 = i0Size < UNIT ? i0Size : UNIT;
           const q = E.signSwapQuote(s.chainId, {
             id: `q_${randomHex32().slice(0, 12)}`,
             maker: activePersona.pk,
             side: activeSwapDir === 'buy_i0' ? 'BUY_I0' : 'SELL_I0',
             rateSatsPerI0: rate.toString(),
-            minI0: (1n * UNIT).toString(),
+            minI0: minI0.toString(),
             maxI0: i0Size.toString(),
             network: net,
             expiresAt: Math.floor(Date.now() / 1000) + 3600,
@@ -2940,75 +3230,118 @@
           return;
         }
 
-        // MARKET mode
+        // MARKET mode — uses exact same resolveMarketSwapQuote() as preview!
+        const mkt = resolveMarketSwapQuote(activeSwapDir, amtParsed, net);
+        if (!mkt.ok || !mkt.quote) throw new Error(mkt.error || 'No matching quote');
+        const matched = mkt.quote;
+
         if (activeSwapDir === 'sell_i0') {
-          const best = buyI0[0];
-          if (!best) throw new Error('No live BUY_I0 quote available');
           if (!stagedSwapSecret || !stagedSwapSecret.backedUp) throw new Error('Click Step 1 to back up Recovery Key S first');
-          const nonce = nextNonceFor(activePersona.pk);
-          const swapId = E.computeSwapId(s.chainId, activePersona.pk, nonce);
-          const { secretHex, hashlock } = stagedSwapSecret;
-          const tx = E.signTx(s.chainId, {
-            type: 'HTLC_LOCK', from: activePersona.pk, recipient: best.maker, amount: amt.toString(),
-            hashlock, timeoutBtcHeight: activeBtcHeight() + 24, nonce, fee: '0',
-          }, activePersona.sk);
-          const live = await broadcastTx(tx);
-          sessionHtlcSecrets.set(swapId, secretHex);
-          stagedSwapSecret = null;
-          $('htlc-secret-backup').hidden = true;
-          renderAll();
-          showMsg('action-msg', `Locked ${formatBaseUnitsExact(amt)} I0 in trustless HTLC matched @ ${Number(best.rateSatsPerI0)} sats/I0 ${live ? '(Entmoot live)' : '(local)'}`, 'ok-b');
-        } else {
-          const best = sellI0[0];
-          if (!best) throw new Error('No live SELL_I0 quote available');
-          const i0Out = (amt * UNIT) / BigInt(best.rateSatsPerI0);
-          if (i0Out <= 0n) throw new Error('BTC amount too small for quote');
-          if (typeof E.signSwapQuote === 'function') {
-            const reqQuote = E.signSwapQuote(s.chainId, {
-              id: `mkt_${randomHex32().slice(0, 10)}`,
-              maker: activePersona.pk,
-              side: 'BUY_I0',
-              rateSatsPerI0: best.rateSatsPerI0,
-              minI0: i0Out.toString(),
-              maxI0: i0Out.toString(),
-              network: net,
-              expiresAt: Math.floor(Date.now() / 1000) + 900,
+          htlcSubmitInFlight = true;
+          $('swap-submit-btn').disabled = true;
+          try {
+            const nonce = nextNonceFor(activePersona.pk);
+            const swapId = E.computeSwapId(s.chainId, activePersona.pk, nonce);
+            const { secretHex, hashlock } = stagedSwapSecret;
+            const tx = E.signTx(s.chainId, {
+              type: 'HTLC_LOCK', from: activePersona.pk, recipient: matched.maker, amount: mkt.i0Amount.toString(),
+              hashlock, timeoutBtcHeight: activeBtcHeight() + 24, nonce, fee: '0',
             }, activePersona.sk);
-            ingestSwapQuote(reqQuote);
-            if (entmootNet && entmootNet.connected) {
-              try { await entmootNet.publish('i0-swap', JSON.stringify(reqQuote)); } catch {}
+            const fill = typeof E.signSwapFill === 'function'
+              ? E.signSwapFill(s.chainId, {
+                  id: `fill_${randomHex32().slice(0, 10)}`,
+                  quoteId: matched.id,
+                  quoteSig: matched.sig,
+                  maker: matched.maker,
+                  taker: activePersona.pk,
+                  side: 'SELL_I0',
+                  rateSatsPerI0: matched.rateSatsPerI0,
+                  i0Amount: mkt.i0Amount.toString(),
+                  btcSats: mkt.btcSats.toString(),
+                  network: net,
+                  swapId,
+                  hashlock,
+                  expiresAt: Math.floor(Date.now() / 1000) + 3600,
+                }, activePersona.sk)
+              : null;
+            const live = await broadcastTx(tx, {
+              onLocalCommit: () => {
+                sessionHtlcSecrets.set(swapId, secretHex);
+                stagedSwapSecret = null;
+                $('htlc-secret-backup').hidden = true;
+                if (fill) ingestSwapFill(fill);
+              },
+            });
+            if (fill && entmootNet && entmootNet.connected) {
+              try { await entmootNet.publish('i0-swap', JSON.stringify(fill)); } catch {}
             }
+            showMsg('action-msg', `Locked ${formatBaseUnitsExact(mkt.i0Amount)} I0 + bound ${Number(mkt.btcSats).toLocaleString()} sats (${matched.id} @ ${Number(mkt.rate)} sats/I0) ${live ? '(Entmoot live)' : '(local)'}`, 'ok-b');
+          } finally {
+            htlcSubmitInFlight = false;
+            renderAll();
+          }
+        } else {
+          if (typeof E.signSwapFill !== 'function') throw new Error('Pinned G_rules lacks signSwapFill');
+          const fill = E.signSwapFill(s.chainId, {
+            id: `fill_${randomHex32().slice(0, 10)}`,
+            quoteId: matched.id,
+            quoteSig: matched.sig,
+            maker: matched.maker,
+            taker: activePersona.pk,
+            side: 'BUY_I0',
+            rateSatsPerI0: matched.rateSatsPerI0,
+            i0Amount: mkt.i0Amount.toString(),
+            btcSats: mkt.btcSats.toString(),
+            network: net,
+            expiresAt: Math.floor(Date.now() / 1000) + 900,
+          }, activePersona.sk);
+          ingestSwapFill(fill);
+          let live = false;
+          if (entmootNet && entmootNet.connected) {
+            try { await entmootNet.publish('i0-swap', JSON.stringify(fill)); live = true; } catch {}
           }
           renderAll();
-          showMsg('action-msg', `Matched best rate ${Number(best.rateSatsPerI0)} sats/I0 for ${fmtI0(i0Out)} I0 - awaiting maker HTLC lock (check Active HTLC Escrows).`, 'ok-b');
+          showMsg('action-msg', `Signed fill for ${matched.id}: ${fmtI0(mkt.i0Amount)} I0 = ${Number(mkt.btcSats).toLocaleString()} sats @ ${Number(mkt.rate)} sats/I0 ${live ? '-> live on #i0-swap' : '(local)'}`, 'ok-b');
         }
       } catch (e) { showMsg('action-msg', `Swap error: ${e.message}`, 'err-b'); }
     };
 
     $('htlc-adv-prep-btn').onclick = () => {
-      stagedAdvSecret = stageSecretInBox($('htlc-adv-secret-backup'), (st) => { $('submit-htlc').disabled = !st.backedUp; });
+      stagedAdvSecret = stageSecretInBox($('htlc-adv-secret-backup'), (st) => { $('submit-htlc').disabled = htlcSubmitInFlight || !st.backedUp; });
     };
 
     $('submit-htlc').onclick = async () => {
+      if (htlcSubmitInFlight) return;
       try {
         const s = activeState();
         if (!stagedAdvSecret || !stagedAdvSecret.backedUp) throw new Error('Generate and confirm backup of Secret S first');
         const amount = parseDecimalToBaseUnits($('htlc-amount').value);
         const recipient = (DEMO_MODE ? $('htlc-recipient').value : $('htlc-recipient-custom').value).trim().toLowerCase();
         if (!HEX64_RE.test(recipient)) throw new Error('Counterparty pubkey must be 64 lowercase hex chars');
-        const nonce = nextNonceFor(activePersona.pk);
-        const swapId = E.computeSwapId(s.chainId, activePersona.pk, nonce);
-        const { secretHex, hashlock } = stagedAdvSecret;
-        const tx = E.signTx(s.chainId, {
-          type: 'HTLC_LOCK', from: activePersona.pk, recipient, amount: amount.toString(),
-          hashlock, timeoutBtcHeight: activeBtcHeight() + 24, nonce, fee: '0',
-        }, activePersona.sk);
-        const live = await broadcastTx(tx);
-        sessionHtlcSecrets.set(swapId, secretHex);
-        stagedAdvSecret = null;
-        $('htlc-adv-secret-backup').hidden = true;
+        htlcSubmitInFlight = true;
         $('submit-htlc').disabled = true;
-        showMsg('action-msg', `Queued HTLC_LOCK (H=${hashlock.slice(0, 14)}...). Confirm in a real block before funding BTC.${live ? ' (Entmoot live)' : ''}`, 'ok-b');
+        try {
+          const nonce = nextNonceFor(activePersona.pk);
+          const swapId = E.computeSwapId(s.chainId, activePersona.pk, nonce);
+          const { secretHex, hashlock } = stagedAdvSecret;
+          const tx = E.signTx(s.chainId, {
+            type: 'HTLC_LOCK', from: activePersona.pk, recipient, amount: amount.toString(),
+            hashlock, timeoutBtcHeight: activeBtcHeight() + 24, nonce, fee: '0',
+          }, activePersona.sk);
+          const live = await broadcastTx(tx, {
+            onLocalCommit: () => {
+              sessionHtlcSecrets.set(swapId, secretHex);
+              stagedAdvSecret = null;
+              $('htlc-adv-secret-backup').hidden = true;
+              $('submit-htlc').disabled = true;
+            },
+          });
+          showMsg('action-msg', `Queued HTLC_LOCK (H=${hashlock.slice(0, 14)}...). Confirm in a real block before funding BTC.${live ? ' (Entmoot live)' : ''}`, 'ok-b');
+        } finally {
+          htlcSubmitInFlight = false;
+          $('submit-htlc').disabled = !stagedAdvSecret?.backedUp;
+          renderAll();
+        }
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`, 'err-b'); }
     };
 
@@ -3094,13 +3427,28 @@
     $('mev-test-btn').onclick = () => {
       try {
         const blocks = activeBlocks();
-        const targetEntry = [...blocks].reverse().find((e) => e.block.txs.filter((t) => t.type === 'BUY' || t.type === 'SELL').length >= 2) ?? blocks[blocks.length - 1];
-        if (!targetEntry) return;
-        const idx = blocks.indexOf(targetEntry);
         let pre = ordBootState ? E.cloneState(ordBootState) : E.createGenesisState(activeState().genesisId, PARAMS, ordGenesisBtcHeight);
         const startIdx = pre.height > 0 && blocks[0]?.block?.h === pre.height ? 1 : 0;
-        if (idx < startIdx) { showMsg('mev-result', 'Zero-MEV shuffle requires at least one post-checkpoint block.', 'ok-b'); return; }
-        for (let i = startIdx; i < idx; i++) {
+        const hasSameTokenMultiSenderTrades = (b) => {
+          const sendersByTok = new Map();
+          for (const t of b.txs || []) {
+            if (t.type !== 'BUY' && t.type !== 'SELL') continue;
+            if (!sendersByTok.has(t.tokenId)) sendersByTok.set(t.tokenId, new Set());
+            sendersByTok.get(t.tokenId).add(t.from);
+          }
+          for (const set of sendersByTok.values()) if (set.size >= 2) return true;
+          return false;
+        };
+        let targetIdx = -1;
+        for (let i = blocks.length - 1; i >= startIdx; i--) {
+          if (hasSameTokenMultiSenderTrades(blocks[i].block)) { targetIdx = i; break; }
+        }
+        if (targetIdx < startIdx) {
+          showMsg('mev-result', 'No post-checkpoint block with >= 2 trades from distinct senders on the same token yet.', 'ok-b');
+          return;
+        }
+        const targetEntry = blocks[targetIdx];
+        for (let i = startIdx; i < targetIdx; i++) {
           const e = blocks[i];
           pre = E.applyBlock(pre, e.block, { btcHeight: e.meta.height, inscriptionNumber: e.meta.number, getBlockHash: (h) => (h === e.block.btcRef.h ? e.block.btcRef.hash : null) }, PARAMS);
         }

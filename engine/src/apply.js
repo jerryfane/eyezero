@@ -1,7 +1,7 @@
 // Core deterministic transaction canonicalization, BIP-340 signing, mempool cancel/replace,
 // joint-validated batch selection/preview, uniform zero-MEV batch clearing, and applyBlock().
 
-import { I0_TOKEN_ID, V1_MAINNET_PARAMS, blockRewardForHeight } from './constants.js';
+import { I0_TOKEN_ID, UNIT, V1_MAINNET_PARAMS, blockRewardForHeight } from './constants.js';
 import {
   bytesToHex,
   hexToBytes,
@@ -304,6 +304,81 @@ export function verifySwapQuote(chainId, q) {
   try {
     const canon = canonicalizeSwapQuote(q);
     return schnorrVerify(swapQuoteDigest(chainId, canon), canon.maker, canon.sig);
+  } catch {
+    return false;
+  }
+}
+
+// Off-chain signed BIP-340 P2P swap fill binding a taker's agreed BTC satoshis, quoteId, quoteSig,
+// network, and (when I0 is locked by taker) on-chain swapId + hashlock on Entmoot #i0-swap.
+export function canonicalizeSwapFill(f) {
+  if (!f || typeof f !== 'object') throw new Error('Swap fill must be an object');
+  if (f.kind !== undefined && f.kind !== 'SWAP_FILL') throw new Error('Swap fill kind must be SWAP_FILL');
+  if (f.side !== 'BUY_I0' && f.side !== 'SELL_I0') throw new Error('Swap fill side must be BUY_I0 or SELL_I0');
+  if (f.network !== 'signet' && f.network !== 'regtest' && f.network !== 'mainnet') {
+    throw new Error('Invalid swap fill network');
+  }
+  assertPubkey(f.maker, 'fill.maker');
+  assertPubkey(f.taker, 'fill.taker');
+  if (f.maker === f.taker) throw new Error('Swap fill maker and taker must differ');
+  if (typeof f.id !== 'string' || !/^[A-Za-z0-9_-]{4,48}$/.test(f.id)) throw new Error('Invalid fill id');
+  if (typeof f.quoteId !== 'string' || !/^[A-Za-z0-9_-]{4,48}$/.test(f.quoteId)) throw new Error('Invalid fill quoteId');
+  if (typeof f.quoteSig !== 'string' || !HEX128_RE.test(f.quoteSig)) throw new Error('Invalid fill quoteSig');
+  const rate = parseAmount(f.rateSatsPerI0, 'rateSatsPerI0');
+  const i0Amount = parseAmount(f.i0Amount, 'i0Amount');
+  const btcSats = parseAmount(f.btcSats, 'btcSats');
+  const floorSats = (i0Amount * rate) / UNIT;
+  const ceilSats = (i0Amount * rate + UNIT - 1n) / UNIT;
+  if (btcSats < floorSats || btcSats > ceilSats) {
+    throw new Error('Swap fill btcSats does not match i0Amount * rateSatsPerI0');
+  }
+  if (!Number.isInteger(f.expiresAt) || f.expiresAt < 1) throw new Error('Invalid fill expiresAt');
+  const hasSwapId = f.swapId !== undefined && f.swapId !== null && f.swapId !== '';
+  const hasHashlock = f.hashlock !== undefined && f.hashlock !== null && f.hashlock !== '';
+  if (hasSwapId !== hasHashlock) throw new Error('Swap fill swapId and hashlock must be set together');
+  if (hasSwapId && (typeof f.swapId !== 'string' || !HEX64_RE.test(f.swapId))) throw new Error('Invalid fill swapId');
+  if (hasHashlock && (typeof f.hashlock !== 'string' || !HEX64_RE.test(f.hashlock))) throw new Error('Invalid fill hashlock');
+  const out = {
+    v: 1,
+    kind: 'SWAP_FILL',
+    id: f.id,
+    quoteId: f.quoteId,
+    quoteSig: f.quoteSig,
+    maker: f.maker,
+    taker: f.taker,
+    side: f.side,
+    rateSatsPerI0: rate.toString(),
+    i0Amount: i0Amount.toString(),
+    btcSats: btcSats.toString(),
+    network: f.network,
+    expiresAt: f.expiresAt,
+  };
+  if (hasSwapId) {
+    out.swapId = f.swapId;
+    out.hashlock = f.hashlock;
+  }
+  if (f.sig !== undefined) out.sig = f.sig;
+  return out;
+}
+
+export function swapFillDigest(chainId, f) {
+  const canon = canonicalizeSwapFill(f);
+  delete canon.sig;
+  return sha256(`eyezero:v1:swap-fill:${JSON.stringify({ chainId, ...canon })}`);
+}
+
+export function signSwapFill(chainId, f, privKeyBytes, auxRandBytes) {
+  const canon = canonicalizeSwapFill(f);
+  delete canon.sig;
+  const sig = bytesToHex(schnorrSign(swapFillDigest(chainId, canon), privKeyBytes, auxRandBytes));
+  return { ...canon, sig };
+}
+
+export function verifySwapFill(chainId, f) {
+  if (!f || typeof f.sig !== 'string' || !HEX128_RE.test(f.sig)) return false;
+  try {
+    const canon = canonicalizeSwapFill(f);
+    return schnorrVerify(swapFillDigest(chainId, canon), canon.taker, canon.sig);
   } catch {
     return false;
   }
@@ -650,6 +725,74 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
     tok.realI0 = newRealI0;
     tok.realTok = newRealTok;
   }
+}
+
+// Compute exact settled gross turnover and uniform clearing price for each token traded in a batch,
+// matching executeBlockTxs() BigInt rounding bit-for-bit (zero synthetic wicks or closing-spot estimates).
+export function computeBlockTradeStats(prevState, txs, params = V1_MAINNET_PARAMS) {
+  const preTokens = new Map();
+  for (const [tid, tok] of prevState.tokens.entries()) {
+    preTokens.set(tid, { virtualI0: tok.virtualI0, realI0: tok.realI0, realTok: tok.realTok });
+  }
+  const batches = new Map();
+  const getBatch = (tid) => {
+    let b = batches.get(tid);
+    if (!b) {
+      b = { grossBuyI0: 0n, netBuyI0: 0n, sells: [] };
+      batches.set(tid, b);
+    }
+    return b;
+  };
+  for (const tx of txs || []) {
+    if (tx.type === 'LAUNCH') {
+      const tid = computeTokenId(prevState.chainId, tx);
+      if (!preTokens.has(tid)) {
+        preTokens.set(tid, { virtualI0: params.virtualI0, realI0: 0n, realTok: params.initialTokSupply });
+      }
+      const initialBuy = BigInt(tx.initialBuy || '0');
+      if (initialBuy > 0n) {
+        const totalFee = (initialBuy * params.tradeFeeBps) / params.bpsDenom;
+        const b = getBatch(tid);
+        b.grossBuyI0 += initialBuy;
+        b.netBuyI0 += initialBuy - totalFee;
+      }
+    } else if (tx.type === 'BUY' && preTokens.has(tx.tokenId)) {
+      const i0In = BigInt(tx.i0In || '0');
+      if (i0In > 0n) {
+        const totalFee = (i0In * params.tradeFeeBps) / params.bpsDenom;
+        const b = getBatch(tx.tokenId);
+        b.grossBuyI0 += i0In;
+        b.netBuyI0 += i0In - totalFee;
+      }
+    } else if (tx.type === 'SELL' && preTokens.has(tx.tokenId)) {
+      const tokIn = BigInt(tx.tokIn || '0');
+      if (tokIn > 0n) getBatch(tx.tokenId).sells.push(tokIn);
+    }
+  }
+  const stats = new Map();
+  for (const [tid, b] of batches.entries()) {
+    const tok = preTokens.get(tid);
+    if (!tok) continue;
+    const B = b.netBuyI0;
+    let S = 0n;
+    for (const tokIn of b.sells) S += tokIn;
+    if (B === 0n && S === 0n) continue;
+    const X = tok.virtualI0 + tok.realI0;
+    const Y = tok.realTok;
+    const outI0Total = S > 0n ? (S * (X + B)) / (Y + S) : 0n;
+    let settledSellGrossI0 = 0n;
+    for (const tokIn of b.sells) settledSellGrossI0 += (tokIn * outI0Total) / S;
+    stats.set(tid, {
+      grossBuyI0: b.grossBuyI0,
+      netBuyI0: B,
+      sellTok: S,
+      settledSellGrossI0,
+      grossVolI0: b.grossBuyI0 + settledSellGrossI0,
+      openPrice: Number(X) / Number(Y),
+      clearPrice: Number(X + B) / Number(Y + S),
+    });
+  }
+  return stats;
 }
 
 // Helper for miners / tests: construct a complete candidate block payload with exact stateRoot,

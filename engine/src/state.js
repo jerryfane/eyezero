@@ -160,7 +160,7 @@ function collectCanonicalEntries(state) {
   const sortedTokens = [...state.tokens.entries()]
     .sort(([a], [b]) => compareTokenIds(a, b));
   for (const [, t] of sortedTokens) {
-    entries.push([
+    const row = [
       't',
       t.id,
       t.ticker,
@@ -170,7 +170,11 @@ function collectCanonicalEntries(state) {
       t.virtualI0.toString(),
       t.realI0.toString(),
       t.realTok.toString(),
-    ]);
+    ];
+    if (t.desc || t.web || t.x) {
+      row.push(t.desc ?? '', t.web ?? '', t.x ?? '');
+    }
+    entries.push(row);
   }
 
   const sortedHtlcs = [...state.htlcs.entries()]
@@ -328,12 +332,15 @@ export function importCheckpointPages(pages, header = {}) {
         const [, pk, tid, v] = entry;
         ensureAcc(pk).balances.set(tid, BigInt(v));
       } else if (kind === 't') {
-        const [, id, ticker, name, artId, creator, virtualI0, realI0, realTok] = entry;
+        const [, id, ticker, name, artId, creator, virtualI0, realI0, realTok, desc = '', web = '', x = ''] = entry;
         tokens.set(id, {
           id,
           ticker,
           name,
           artId,
+          desc,
+          web,
+          x,
           creator,
           virtualI0: BigInt(virtualI0),
           realI0: BigInt(realI0),

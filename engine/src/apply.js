@@ -37,6 +37,10 @@ const HEX128_RE = /^[0-9a-f]{128}$/;
 const TOKEN_ID_RE = /^t_[0-9a-f]{64}$/;
 const TICKER_RE = /^[A-Za-z0-9._-]{1,12}$/;
 const NAME_SAFE_RE = /^[ -~]{1,32}$/;
+const DESC_SAFE_RE = /^[ -~]{0,160}$/;
+// Canonical bare domain[/path] (no scheme, so block JSON stays offline-scanner clean while UI renders https://).
+const WEB_SAFE_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}(?:\/[A-Za-z0-9._~:/?#[\]@!$&()*+,;=-]*)?$/;
+const X_HANDLE_RE = /^[A-Za-z0-9_]{1,15}$/;
 const HTML_UNSAFE_RE = /[<>&"'`]/;
 const PLACEHOLDER_BLOCK_ID = '0'.repeat(64) + 'i0';
 
@@ -65,7 +69,7 @@ export function isValidTokenId(tokenId) {
   return tokenId === I0_TOKEN_ID || (typeof tokenId === 'string' && TOKEN_ID_RE.test(tokenId));
 }
 
-export function validateLaunchMetadata({ ticker, name, artId = '' }, params = V1_MAINNET_PARAMS) {
+export function validateLaunchMetadata({ ticker, name, artId = '', desc = '', web = '', x = '' }, params = V1_MAINNET_PARAMS) {
   if (
     typeof ticker !== 'string' ||
     ticker.length < 1 ||
@@ -91,12 +95,43 @@ export function validateLaunchMetadata({ ticker, name, artId = '' }, params = V1
   ) {
     throw new Error('Invalid artId (must be empty or a valid inscription ID)');
   }
-  return { ticker, name, artId: normalizedArt };
+  const maxDescLen = params.maxDescLen ?? V1_MAINNET_PARAMS.maxDescLen;
+  const normalizedDesc = desc ?? '';
+  if (
+    typeof normalizedDesc !== 'string' ||
+    normalizedDesc.length > maxDescLen ||
+    !DESC_SAFE_RE.test(normalizedDesc) ||
+    HTML_UNSAFE_RE.test(normalizedDesc)
+  ) {
+    throw new Error(`Invalid description (printable ASCII 0..${maxDescLen} chars, no HTML metacharacters)`);
+  }
+  const maxWebLen = params.maxWebLen ?? V1_MAINNET_PARAMS.maxWebLen;
+  const normalizedWeb = web ?? '';
+  if (
+    typeof normalizedWeb !== 'string' ||
+    normalizedWeb.length > maxWebLen ||
+    (normalizedWeb !== '' && (!WEB_SAFE_RE.test(normalizedWeb) || HTML_UNSAFE_RE.test(normalizedWeb)))
+  ) {
+    throw new Error(`Invalid website domain/path (must be empty or domain.tld[/path] without scheme, up to ${maxWebLen} chars)`);
+  }
+  const maxXLen = params.maxXLen ?? V1_MAINNET_PARAMS.maxXLen;
+  const normalizedX = x ?? '';
+  if (typeof normalizedX !== 'string' || (normalizedX !== '' && (normalizedX.length > maxXLen || !X_HANDLE_RE.test(normalizedX)))) {
+    throw new Error(`Invalid X handle (1..${maxXLen} chars without @: A-Z, a-z, 0-9, _)`);
+  }
+  return {
+    ticker,
+    name,
+    artId: normalizedArt,
+    desc: normalizedDesc,
+    web: normalizedWeb,
+    x: normalizedX,
+  };
 }
 
 // Full 256-bit launch-bound immutable token ID: binds every signed LAUNCH parameter
-// (chainId, from, nonce, ticker, name, artId, initialBuy) so competing launches on
-// forks can never alias the same tokenId.
+// (chainId, from, nonce, ticker, name, artId, initialBuy, plus optional desc/web/x) so competing launches on
+// forks can never alias the same tokenId while remaining 100% identical for launches without extra metadata.
 export function computeTokenId(chainId, launch) {
   if (!launch || typeof launch !== 'object') {
     throw new Error('computeTokenId requires a launch object');
@@ -110,6 +145,9 @@ export function computeTokenId(chainId, launch) {
     artId: launch.artId ?? '',
     initialBuy: String(launch.initialBuy ?? '0'),
   };
+  if (launch.desc) payload.desc = launch.desc;
+  if (launch.web) payload.web = launch.web;
+  if (launch.x) payload.x = launch.x;
   return 't_' + sha256Hex(`eyezero:v1:token:${JSON.stringify(payload)}`);
 }
 
@@ -143,6 +181,9 @@ export function canonicalizeTx(tx) {
       out.ticker = tx.ticker;
       out.name = tx.name;
       out.artId = tx.artId ?? '';
+      if (tx.desc) out.desc = tx.desc;
+      if (tx.web) out.web = tx.web;
+      if (tx.x) out.x = tx.x;
       out.initialBuy = String(tx.initialBuy ?? '0');
       break;
     case 'BUY':
@@ -211,6 +252,58 @@ export function verifyTxSignature(chainId, tx) {
   try {
     const digest = txDigest(chainId, tx);
     return schnorrVerify(digest, tx.from, tx.sig);
+  } catch {
+    return false;
+  }
+}
+
+// Off-chain signed BIP-340 P2P swap quotes for Entmoot #i0-swap Market/Limit orderbook.
+export function canonicalizeSwapQuote(q) {
+  if (!q || typeof q !== 'object') throw new Error('Swap quote must be an object');
+  if (q.side !== 'BUY_I0' && q.side !== 'SELL_I0') throw new Error('Swap quote side must be BUY_I0 or SELL_I0');
+  if (q.network !== 'signet' && q.network !== 'regtest' && q.network !== 'mainnet') {
+    throw new Error('Invalid swap quote network');
+  }
+  assertPubkey(q.maker, 'quote.maker');
+  const rate = parseAmount(q.rateSatsPerI0, 'rateSatsPerI0');
+  const minI0 = parseAmount(q.minI0, 'minI0');
+  const maxI0 = parseAmount(q.maxI0, 'maxI0');
+  if (maxI0 < minI0) throw new Error('Swap quote maxI0 < minI0');
+  if (!Number.isInteger(q.expiresAt) || q.expiresAt < 1) throw new Error('Invalid quote expiresAt');
+  const out = {
+    v: 1,
+    id: typeof q.id === 'string' && /^[A-Za-z0-9_-]{4,48}$/.test(q.id) ? q.id : null,
+    maker: q.maker,
+    side: q.side,
+    rateSatsPerI0: rate.toString(),
+    minI0: minI0.toString(),
+    maxI0: maxI0.toString(),
+    network: q.network,
+    expiresAt: q.expiresAt,
+  };
+  if (!out.id) throw new Error('Invalid quote id');
+  if (q.sig !== undefined) out.sig = q.sig;
+  return out;
+}
+
+export function swapQuoteDigest(chainId, q) {
+  const canon = canonicalizeSwapQuote(q);
+  delete canon.sig;
+  return sha256(`eyezero:v1:swap-quote:${JSON.stringify({ chainId, ...canon })}`);
+}
+
+export function signSwapQuote(chainId, q, privKeyBytes, auxRandBytes) {
+  const canon = canonicalizeSwapQuote(q);
+  delete canon.sig;
+  const sig = bytesToHex(schnorrSign(swapQuoteDigest(chainId, canon), privKeyBytes, auxRandBytes));
+  return { ...canon, sig };
+}
+
+export function verifySwapQuote(chainId, q) {
+  if (!q || typeof q.sig !== 'string' || !HEX128_RE.test(q.sig)) return false;
+  try {
+    const canon = canonicalizeSwapQuote(q);
+    return schnorrVerify(swapQuoteDigest(chainId, canon), canon.maker, canon.sig);
   } catch {
     return false;
   }
@@ -361,8 +454,15 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
       }
 
       case 'LAUNCH': {
-        const { artId } = validateLaunchMetadata(
-          { ticker: tx.ticker, name: tx.name, artId: tx.artId ?? '' },
+        const meta = validateLaunchMetadata(
+          {
+            ticker: tx.ticker,
+            name: tx.name,
+            artId: tx.artId ?? '',
+            desc: tx.desc ?? '',
+            web: tx.web ?? '',
+            x: tx.x ?? '',
+          },
           params,
         );
         subBalance(next, tx.from, I0_TOKEN_ID, params.launchFee);
@@ -372,9 +472,12 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
         const tokenId = computeTokenId(next.chainId, {
           from: tx.from,
           nonce: tx.nonce,
-          ticker: tx.ticker,
-          name: tx.name,
-          artId,
+          ticker: meta.ticker,
+          name: meta.name,
+          artId: meta.artId,
+          ...(meta.desc ? { desc: meta.desc } : {}),
+          ...(meta.web ? { web: meta.web } : {}),
+          ...(meta.x ? { x: meta.x } : {}),
           initialBuy: initialBuy.toString(),
         });
         if (next.tokens.has(tokenId)) {
@@ -382,9 +485,12 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
         }
         next.tokens.set(tokenId, {
           id: tokenId,
-          ticker: tx.ticker,
-          name: tx.name,
-          artId,
+          ticker: meta.ticker,
+          name: meta.name,
+          artId: meta.artId,
+          desc: meta.desc,
+          web: meta.web,
+          x: meta.x,
           creator: tx.from,
           virtualI0: params.virtualI0,
           realI0: 0n,

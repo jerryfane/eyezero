@@ -90,10 +90,11 @@
     /* TOPBAR */
     .topbar {
       position: sticky; top: 0; z-index: 40;
-      height: var(--topbar-h);
-      display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      padding: 0 16px 0 18px;
-      background: rgba(0,0,0,0.82);
+      min-height: var(--topbar-h);
+      display: flex; align-items: center; justify-content: space-between; gap: 10px 12px;
+      flex-wrap: wrap;
+      padding: 8px 16px 8px 18px;
+      background: rgba(0,0,0,0.86);
       backdrop-filter: blur(14px) saturate(160%);
       -webkit-backdrop-filter: blur(14px) saturate(160%);
       border-bottom: 1px solid var(--line-1);
@@ -366,6 +367,9 @@
     }
 
     @media (max-width: 920px) {
+      .topbar { padding: 8px 12px; gap: 8px; }
+      .tb-right { gap: 6px; justify-content: flex-start; }
+      .pill { height: 26px; padding: 0 9px; font-size: 11px; }
       .sidebar { display: none; }
       .mobile-nav { display: flex; }
       .tb-left { min-width: 0; }
@@ -561,10 +565,10 @@
                         <input class="field-in big num" id="buy-amount" type="number" step="any" min="0" value="10" />
                       </div>
                       <div class="pct-row num">
-                        <button class="pct-btn" data-buy-pct="0.1">10%</button>
-                        <button class="pct-btn" data-buy-pct="0.25">25%</button>
-                        <button class="pct-btn" data-buy-pct="0.5">50%</button>
-                        <button class="pct-btn" data-buy-pct="1">Max</button>
+                        <button class="pct-btn" data-buy-pct="10">10%</button>
+                        <button class="pct-btn" data-buy-pct="25">25%</button>
+                        <button class="pct-btn" data-buy-pct="50">50%</button>
+                        <button class="pct-btn" data-buy-pct="100">Max</button>
                       </div>
                       <div class="field" style="margin-bottom:0">
                         <div class="field-t"><span>Max slippage (%)</span></div>
@@ -586,10 +590,10 @@
                         <input class="field-in big num" id="sell-amount" type="number" step="any" min="0" value="1000" />
                       </div>
                       <div class="pct-row num">
-                        <button class="pct-btn" data-sell-pct="0.25">25%</button>
-                        <button class="pct-btn" data-sell-pct="0.5">50%</button>
-                        <button class="pct-btn" data-sell-pct="0.75">75%</button>
-                        <button class="pct-btn" data-sell-pct="1">Max</button>
+                        <button class="pct-btn" data-sell-pct="25">25%</button>
+                        <button class="pct-btn" data-sell-pct="50">50%</button>
+                        <button class="pct-btn" data-sell-pct="75">75%</button>
+                        <button class="pct-btn" data-sell-pct="100">Max</button>
                       </div>
                       <div class="field" style="margin-bottom:0">
                         <div class="field-t"><span>Max slippage (%)</span></div>
@@ -717,6 +721,7 @@
               <div class="field" style="margin-bottom:0">
                 <div class="field-t"><span>Counterparty (recipient)</span></div>
                 <select class="field-sel" id="htlc-recipient"></select>
+                <input class="field-in num" id="htlc-recipient-custom" placeholder="64-hex BIP-340 x-only pubkey…" hidden />
               </div>
               <div class="field" style="margin-bottom:0">
                 <div class="field-t"><span>Amount to lock (I0)</span></div>
@@ -753,7 +758,8 @@
                 <div class="num" style="font-size:28px;font-weight:650;letter-spacing:-0.03em" id="wallet-total-i0">0.00 I0</div>
                 <div class="dim num" style="font-size:11.5px;margin-top:2px;word-break:break-all" id="wallet-pk-box">—</div>
               </div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <select class="signer-sel" id="wallet-select-mobile" aria-label="Active Signer" style="width:auto;min-width:155px"></select>
                 <button class="btn-primary sm" id="wallet-go-swap">Swap BTC &harr; i0</button>
                 <button class="btn-ghost" id="wallet-go-keys">Keys &amp; Backup</button>
               </div>
@@ -900,11 +906,18 @@
     </main>
   </div>
 
+  <script id="eyezero-boot" type="application/json">{"network":"demo","demoMode":true,"genesisId":null,"initialTipId":null,"trustedCheckpoint":null,"tipConfigPath":"/content/local:blocks/tip.json","entmootConfigPath":"/content/local:entmoot-config.json"}</script>
   <script type="module">
     import * as E from '/content/local:g-rules.js';
     import { join as entmootJoin } from '/content/local:entmoot-lite.js';
 
-    const PARAMS = E.V1_DEMO_PARAMS;
+    const BOOT = JSON.parse(document.getElementById('eyezero-boot')?.textContent || '{}');
+    const DEMO_MODE = BOOT.demoMode !== false;
+    const PARAMS = BOOT.network === 'mainnet'
+      ? E.V1_MAINNET_PARAMS
+      : BOOT.network === 'signet'
+        ? E.V1_SIGNET_PARAMS
+        : E.V1_DEMO_PARAMS;
     const UNIT = E.UNIT;
     const MAX_MEMPOOL_SLOTS = 200;
     const MAX_SEEN_SIGS = 1000;
@@ -926,7 +939,38 @@
       const frac = ((a % UNIT) * 100n) / UNIT;
       return `${neg}${whole.toLocaleString()}.${frac.toString().padStart(2, '0')}`;
     };
-    const fmtTok = (v) => (v / UNIT).toLocaleString();
+    const fmtTok = (v) => {
+      const neg = v < 0n ? '-' : '';
+      const a = v < 0n ? -v : v;
+      const whole = a / UNIT;
+      const rem = a % UNIT;
+      if (rem === 0n) return `${neg}${whole.toLocaleString()}`;
+      const frac = rem.toString().padStart(8, '0').replace(/0+$/, '');
+      return `${neg}${whole.toLocaleString()}.${frac}`;
+    };
+    const formatBaseUnitsExact = (v) => {
+      const a = v < 0n ? 0n : v;
+      const whole = a / UNIT;
+      const frac = (a % UNIT).toString().padStart(8, '0').replace(/0+$/, '');
+      return frac ? `${whole}.${frac}` : `${whole}`;
+    };
+    function tryParseDecimalToBaseUnits(raw, { allowZero = false } = {}) {
+      const s = String(raw ?? '').trim();
+      if (s === '') return { ok: false, empty: true, error: 'Enter an amount' };
+      const m = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))$/.exec(s);
+      if (!m) return { ok: false, empty: false, error: 'Enter a valid non-negative decimal number' };
+      const wholeStr = m[1] ?? '0';
+      const fracStr = m[2] ?? m[3] ?? '';
+      if (fracStr.length > 8) return { ok: false, empty: false, error: 'Maximum 8 decimal places (1 base unit = 0.00000001)' };
+      const units = BigInt(wholeStr) * UNIT + BigInt(fracStr.padEnd(8, '0'));
+      if (!allowZero && units <= 0n) return { ok: false, empty: false, error: 'Amount must be greater than 0' };
+      return { ok: true, value: units };
+    }
+    function parseDecimalToBaseUnits(raw, opts = {}) {
+      const res = tryParseDecimalToBaseUnits(raw, opts);
+      if (!res.ok) throw new Error(res.error);
+      return res.value;
+    }
     const shortId = (id) => (id ? `${id.slice(0, 10)}…${id.slice(-6)}` : '—');
 
     function el(tag, props = null, ...children) {
@@ -1029,13 +1073,15 @@
     }
 
     let localWallet = createSessionWallet();
-    const PERSONAS = [
-      { id: 'alice', name: 'Alice (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000c' },
-      { id: 'bob', name: 'Bob (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000d' },
-      { id: 'creator', name: 'Creator (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000b' },
-      { id: 'miner', name: 'Miner (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000a' },
-      localWallet,
-    ];
+    const PERSONAS = DEMO_MODE
+      ? [
+          { id: 'alice', name: 'Alice (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000c' },
+          { id: 'bob', name: 'Bob (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000d' },
+          { id: 'creator', name: 'Creator (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000b' },
+          { id: 'miner', name: 'Miner (Demo)', demo: true, sk: '000000000000000000000000000000000000000000000000000000000000000a' },
+          localWallet,
+        ]
+      : [localWallet];
     for (const p of PERSONAS) p.pk = E.getPublicKeyHex(p.sk);
 
     let activePersona = PERSONAS[0];
@@ -1177,7 +1223,29 @@
     }
 
     async function broadcastTx(tx) {
-      ingestPendingTx(tx);
+      const s = activeState();
+      const curNonce = s?.accounts.get(tx.from)?.nonce ?? 0;
+      if (tx.nonce > curNonce + 8) {
+        throw new Error('Max 8 pending orders per account — cancel an existing order or wait for the next block.');
+      }
+      const slot = `${tx.from}:${tx.nonce}`;
+      const prevSlot = pendingBySlot.get(slot);
+      const admitted = ingestPendingTx(tx);
+      if (!admitted) {
+        throw new Error('Order rejected by mempool admission (invalid nonce, fee, or account state)');
+      }
+      const { accepted, dropped } = getProjected();
+      if (!accepted.some((a) => a.sig === tx.sig)) {
+        if (prevSlot) pendingBySlot.set(slot, prevSlot);
+        else pendingBySlot.delete(slot);
+        seenTxSigs.delete(tx.sig);
+        const s = activeState();
+        if (s) verifiedSigs.delete(`${E.bytesToHex(E.txDigest(s.chainId, tx))}:${tx.sig}`);
+        invalidateProjection();
+        renderAll();
+        const rej = Array.isArray(dropped) ? dropped.find((d) => d.tx?.sig === tx.sig) : null;
+        throw new Error(rej?.reason || 'Order rejected by projected batch execution');
+      }
       renderAll();
       if (entmootNet && entmootNet.connected) {
         try {
@@ -1419,10 +1487,10 @@
 
     function updateSyncPill() {
       if (!ordState) return;
-      if (ordConfirmationVerified) {
-        setPill('sync-pill', 'ok', `Verified ${ordState.height} blocks`);
-      } else if (isSimulatedSeed) {
+      if (isSimulatedView()) {
         setPill('sync-pill', 'warn', `Demo seed · ${ordState.height} blk (unverified)`);
+      } else if (ordConfirmationVerified) {
+        setPill('sync-pill', 'ok', `Verified ${ordState.height} blocks`);
       } else {
         setPill('sync-pill', 'warn', `Unverified · ${ordState.height} blk`);
       }
@@ -1504,7 +1572,7 @@
 
     async function connectEntmoot() {
       try {
-        const cfg = await fetchJson('/content/local:entmoot-config.json');
+        const cfg = await fetchJson(BOOT.entmootConfigPath || '/content/local:entmoot-config.json');
         const keyBytes = new Uint8Array(32);
         crypto.getRandomValues(keyBytes);
 
@@ -1537,7 +1605,7 @@
         });
 
         try {
-          const blkHist = await net.history('i0-blk', 16);
+          const blkHist = await net.history('i0-blk', 32);
           for (const msg of blkHist) {
             try {
               if (typeof msg.text === 'string' && msg.text.length <= 1024) {
@@ -1566,10 +1634,29 @@
 
     async function syncFromOrd() {
       try {
-        const [tipInfo, btcH] = await Promise.all([
-          fetchJson('/content/local:blocks/tip.json'),
-          fetchJson('/r/blockheight'),
-        ]);
+        let tipInfo;
+        let btcH;
+        if (DEMO_MODE && BOOT.tipConfigPath) {
+          [tipInfo, btcH] = await Promise.all([
+            fetchJson(BOOT.tipConfigPath),
+            fetchJson('/r/blockheight'),
+          ]);
+        } else {
+          btcH = await fetchJson('/r/blockheight');
+          if (!BOOT.genesisId || !E.isValidInscriptionId(BOOT.genesisId)) {
+            ordBtcHeight = Number(btcH);
+            isSimulatedSeed = false;
+            setPill('sync-pill', 'warn', `Signet (${BOOT.network}) · awaiting Genesis pin`);
+            connectEntmoot();
+            return;
+          }
+          tipInfo = {
+            genesisId: BOOT.genesisId,
+            tipId: BOOT.initialTipId || BOOT.genesisId,
+            trustedCheckpoint: BOOT.trustedCheckpoint ?? null,
+            simulated: false,
+          };
+        }
         ordBtcHeight = Number(btcH);
         simBtcHeight = ordBtcHeight;
         genesisIdPinned = tipInfo.genesisId;
@@ -1628,6 +1715,46 @@
       }
     }
 
+    function resolveLaunchArtId(s) {
+      const rawArt = $('launch-art').value.trim();
+      if (!rawArt) return { ok: true, artId: s.genesisId, defaulted: true };
+      if (!E.isValidInscriptionId(rawArt)) {
+        return {
+          ok: false,
+          error: 'Invalid Art Inscription ID: enter a valid <64-hex>i<index> ID or leave blank to default to Genesis.',
+        };
+      }
+      return { ok: true, artId: rawArt, defaulted: false };
+    }
+
+    function renderLaunchReview() {
+      const s = activeState();
+      const ticker = $('launch-ticker').value.trim().toUpperCase();
+      const name = $('launch-name').value.trim();
+      const artRes = s ? resolveLaunchArtId(s) : { ok: false, error: 'Chain not synced yet' };
+      const initRaw = $('launch-init').value.trim();
+      const initRes = tryParseDecimalToBaseUnits(initRaw === '' ? '0' : initRaw, { allowZero: true });
+      const rows = [
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Ticker'), el('strong', { class: 'num' }, ticker ? `$${ticker}` : '—')),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Name'), el('strong', null, name || '—')),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Launch fee'), el('strong', { class: 'num' }, '10.00 I0')),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Initial buy'), initRes.ok
+          ? el('strong', { class: 'num' }, `${formatBaseUnitsExact(initRes.value)} I0`)
+          : el('strong', { class: 'bad' }, initRes.error)),
+        el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Creator royalty'), el('strong', { class: 'num ok' }, '0.5% forever')),
+      ];
+      if (artRes.ok) {
+        rows.push(
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, artRes.defaulted ? 'Art Inscription ID (default: Genesis)' : 'Art Inscription ID')),
+          el('span', { class: 'code-inline', id: 'launch-review-art' }, artRes.artId),
+        );
+      } else {
+        rows.push(el('div', { class: 'bad', id: 'launch-review-art-err', style: 'margin-top:4px;font-size:12px' }, artRes.error));
+      }
+      $('launch-review-box').replaceChildren(...rows);
+      $('submit-launch').disabled = !artRes.ok || !initRes.ok || !ticker || !name;
+    }
+
     function setLaunchStep(step) {
       activeLaunchStep = step;
       for (const btn of $('launch-steps').querySelectorAll('[data-lstep]')) {
@@ -1636,18 +1763,7 @@
         btn.classList.toggle('done', n < step);
       }
       for (const n of [1, 2, 3]) $(`lstep-${n}`).hidden = n !== step;
-      if (step === 3) {
-        const ticker = $('launch-ticker').value.trim().toUpperCase() || '—';
-        const name = $('launch-name').value.trim() || '—';
-        const initBuy = Number($('launch-init').value || 0);
-        $('launch-review-box').replaceChildren(
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Ticker'), el('strong', { class: 'num' }, `$${ticker}`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Name'), el('strong', null, name)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Launch fee'), el('strong', { class: 'num' }, '10.00 I0')),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Initial buy'), el('strong', { class: 'num' }, `${initBuy.toFixed(2)} I0`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Creator royalty'), el('strong', { class: 'num ok' }, '0.5% forever')),
-        );
-      }
+      if (step === 3) renderLaunchReview();
     }
 
     function parseSlippagePct(raw) {
@@ -1728,36 +1844,44 @@
       const tok = projectedState.tokens.get(selectedTokenId);
       const availI0 = E.getBalance(projectedState, activePersona.pk, 0);
       const availTok = tok ? E.getBalance(projectedState, activePersona.pk, tok.id) : 0n;
-      $('buy-avail').textContent = `Avail: ${fmtI0(availI0)} I0`;
+      $('buy-avail').textContent = `Avail: ${formatBaseUnitsExact(availI0)} I0`;
       $('sell-avail').textContent = `Avail: ${fmtTok(availTok)} ${tok ? tok.ticker : ''}`;
       $('trade-avail-lbl').textContent = activeTradeSide === 'buy'
-        ? `Avail: ${fmtI0(availI0)} I0`
+        ? `Avail: ${formatBaseUnitsExact(availI0)} I0`
         : `Avail: ${fmtTok(availTok)} ${tok ? tok.ticker : ''}`;
 
       if (!tok) return;
-      const buyVal = Number($('buy-amount').value || 0);
-      if (buyVal > 0) {
-        const i0In = BigInt(Math.round(buyVal * 1e8));
+      const buyParsed = tryParseDecimalToBaseUnits($('buy-amount').value);
+      if (buyParsed.ok) {
+        const i0In = buyParsed.value;
         const q = computeBuyQuote(tok, i0In, $('buy-slip').value);
-        $('buy-quote').replaceChildren(
+        const rows = [
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. output (projected batch)'), el('strong', { class: 'num' }, `${fmtTok(q.estOut)} ${tok.ticker}`)),
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minTokOut'), el('span', { class: 'num' }, `${fmtTok(q.minTokOut)} ${tok.ticker}`)),
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% fee (0.5% cr / 0.5% mn)'), el('span', { class: 'num' }, `${fmtI0(q.fee)} I0`)),
-        );
+        ];
+        if (i0In > availI0) {
+          rows.push(el('div', { class: 'bad', style: 'font-size:11.5px' }, `Exceeds available balance (${formatBaseUnitsExact(availI0)} I0)`));
+        }
+        $('buy-quote').replaceChildren(...rows);
       } else {
-        $('buy-quote').replaceChildren(el('div', { class: 'dim' }, 'Enter an I0 amount to preview uniform batch fill.'));
+        $('buy-quote').replaceChildren(el('div', { class: buyParsed.empty ? 'dim' : 'bad' }, buyParsed.empty ? 'Enter an I0 amount to preview uniform batch fill.' : buyParsed.error));
       }
-      const sellVal = Number($('sell-amount').value || 0);
-      if (sellVal > 0) {
-        const tokIn = BigInt(Math.round(sellVal)) * UNIT;
+      const sellParsed = tryParseDecimalToBaseUnits($('sell-amount').value);
+      if (sellParsed.ok) {
+        const tokIn = sellParsed.value;
         const q = computeSellQuote(tok, tokIn, $('sell-slip').value);
-        $('sell-quote').replaceChildren(
+        const rows = [
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. net payout'), el('strong', { class: 'num' }, `${fmtI0(q.netI0)} I0`)),
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minI0Out'), el('span', { class: 'num' }, `${fmtI0(q.minI0Out)} I0`)),
           el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% I0 fee (0.5% cr / 0.5% mn)'), el('span', { class: 'num' }, `${fmtI0(q.fee)} I0`)),
-        );
+        ];
+        if (tokIn > availTok) {
+          rows.push(el('div', { class: 'bad', style: 'font-size:11.5px' }, `Exceeds available balance (${fmtTok(availTok)} ${tok.ticker})`));
+        }
+        $('sell-quote').replaceChildren(...rows);
       } else {
-        $('sell-quote').replaceChildren(el('div', { class: 'dim' }, 'Enter a token amount to preview sell payout.'));
+        $('sell-quote').replaceChildren(el('div', { class: sellParsed.empty ? 'dim' : 'bad' }, sellParsed.empty ? 'Enter a token amount to preview sell payout.' : sellParsed.error));
       }
     }
 
@@ -1829,11 +1953,14 @@
       // 1. EXPLORE (Option A: KPI Strip + Dense Market Table)
       let totalPoolI0 = 0n;
       for (const t of projectedState.tokens.values()) totalPoolI0 += t.realI0;
-      $('chain-mode-chip').textContent = isSimulatedView() ? 'Simulated Demo' : ordConfirmationVerified ? 'Active-Block Verified' : 'Unverified Host';
-      $('chain-mode-chip').className = `chip ${!isSimulatedView() && ordConfirmationVerified ? 'ok' : 'warn'}`;
-      $('chain-mode-sub').textContent = isSimulatedView()
-        ? 'Simulated local demo seed — not Bitcoin mainnet'
-        : `Confirmed on Bitcoin · Block #${s.height} (BTC #${activeBtcHeight()})`;
+      const chainMode = isSimulatedView()
+        ? { chip: 'Simulated Demo', cls: 'warn', sub: 'Simulated local demo seed — not Bitcoin mainnet' }
+        : ordConfirmationVerified
+          ? { chip: 'Active-Block Verified', cls: 'ok', sub: `Active-block verified on Bitcoin · Block #${s.height} (BTC #${activeBtcHeight()})` }
+          : { chip: 'Unverified Host', cls: 'warn', sub: `Unverified host replay · Block #${s.height} (host lacks raw active-block proof)` };
+      $('chain-mode-chip').textContent = chainMode.chip;
+      $('chain-mode-chip').className = `chip ${chainMode.cls}`;
+      $('chain-mode-sub').textContent = chainMode.sub;
 
       $('explore-kpis').replaceChildren(
         el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Active pools'), el('div', { class: 'kpi-v num' }, `${s.tokens.size} tokens`), el('div', { class: 'kpi-s' }, 'Uniform 0% MEV'), makeSpark('M0 20 L45 16 L90 14 L135 9 L180 4', '#ed4abf')),
@@ -2044,7 +2171,7 @@
       $('tip-pill').textContent = `${simActive ? 'Sim ' : ''}Block #${s.height} · ${shortId(s.tipId)}`;
       const lastBlk = activeBlocks()[activeBlocks().length - 1]?.block;
       $('verify-kpis').replaceChildren(
-        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Verification'), el('div', { class: `kpi-v ${!isSimulatedView() && ordConfirmationVerified ? 'ok' : 'warn'}` }, ordConfirmationVerified && !isSimulatedView() ? 'Merkle OK' : 'Unverified'), el('div', { class: 'kpi-s' }, ordConfirmationVerified ? 'Raw block proof' : 'Host lacks proof')),
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Verification'), el('div', { class: `kpi-v ${!isSimulatedView() && ordConfirmationVerified ? 'ok' : 'warn'}` }, ordConfirmationVerified && !isSimulatedView() ? 'Merkle OK' : 'Unverified'), el('div', { class: 'kpi-s' }, ordConfirmationVerified && !isSimulatedView() ? 'Raw block proof' : isSimulatedView() ? 'Demo sandbox' : 'Host lacks proof')),
         el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Eyezero tip'), el('div', { class: 'kpi-v num' }, `#${s.height}`), el('div', { class: 'kpi-s num' }, `BTC #${activeBtcHeight()}`)),
         el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'State root'), el('div', { class: 'kpi-v num' }, lastBlk ? `${lastBlk.stateRoot.slice(0, 10)}…` : '—'), el('div', { class: 'kpi-s' }, 'Conservation OK')),
         el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Entmoot P2P'), el('div', { class: 'kpi-v num' }, entmootNet?.connected ? 'Live' : 'Local'), el('div', { class: 'kpi-s num' }, `${accepted.length} pending`)),
@@ -2082,16 +2209,34 @@
 
     function refreshWalletSelects() {
       const wSel = $('wallet-select');
+      const wMob = $('wallet-select-mobile');
       const rSel = $('htlc-recipient');
+      const rCustom = $('htlc-recipient-custom');
       const curW = activePersona.id;
       wSel.replaceChildren();
+      wMob.replaceChildren();
       rSel.replaceChildren();
       for (const p of PERSONAS) {
         wSel.add(new Option(p.name, p.id));
+        wMob.add(new Option(p.name, p.id));
         rSel.add(new Option(p.name, p.pk));
       }
       wSel.value = curW;
-      rSel.value = PERSONAS[1].pk;
+      wMob.value = curW;
+      rSel.value = (PERSONAS[1] ?? PERSONAS[0]).pk;
+      rSel.hidden = !DEMO_MODE;
+      rCustom.hidden = DEMO_MODE;
+      if (!DEMO_MODE) {
+        $('wallet-faucet-btn').hidden = true;
+        $('mine-btn').hidden = true;
+        if (BOOT.network === 'signet') {
+          const htlcNet = $('htlc-net');
+          htlcNet.value = 'signet';
+          for (const opt of [...htlcNet.options]) {
+            if (opt.value !== 'signet') opt.remove();
+          }
+        }
+      }
     }
     refreshWalletSelects();
 
@@ -2133,9 +2278,9 @@
       btn.onclick = () => {
         if (!activeState()) return;
         const avail = E.getBalance(getProjected().projectedState, activePersona.pk, 0);
-        const pct = Number(btn.dataset.buyPct);
-        const val = (Number(avail) / 1e8) * pct;
-        $('buy-amount').value = val > 0 ? val.toFixed(2) : '0';
+        const pct = BigInt(btn.dataset.buyPct);
+        const val = (avail * pct) / 100n;
+        $('buy-amount').value = formatBaseUnitsExact(val);
         renderQuotes(getProjected().projectedState);
       };
     }
@@ -2143,9 +2288,9 @@
       btn.onclick = () => {
         if (!activeState() || !selectedTokenId) return;
         const avail = E.getBalance(getProjected().projectedState, activePersona.pk, selectedTokenId);
-        const pct = Number(btn.dataset.sellPct);
-        const val = Math.floor((Number(avail) / 1e8) * pct);
-        $('sell-amount').value = String(val);
+        const pct = BigInt(btn.dataset.sellPct);
+        const val = (avail * pct) / 100n;
+        $('sell-amount').value = formatBaseUnitsExact(val);
         renderQuotes(getProjected().projectedState);
       };
     }
@@ -2157,16 +2302,36 @@
     for (const btn of $('launch-steps').querySelectorAll('[data-lstep]')) {
       btn.onclick = () => setLaunchStep(Number(btn.dataset.lstep));
     }
-    $('launch-next-1').onclick = () => setLaunchStep(2);
+    $('launch-next-1').onclick = () => {
+      const s = activeState();
+      if (s) {
+        const artRes = resolveLaunchArtId(s);
+        if (!artRes.ok) {
+          showMsg('action-msg', `Error: ${artRes.error}`);
+          return;
+        }
+      }
+      setLaunchStep(2);
+    };
     $('launch-prev-2').onclick = () => setLaunchStep(1);
     $('launch-next-2').onclick = () => setLaunchStep(3);
     $('launch-prev-3').onclick = () => setLaunchStep(2);
-    $('launch-ticker').oninput = () => $('launch-art-preview').replaceChildren(makeTokenArtSvg($('launch-ticker').value || 'SAT0', 38));
-
-    $('wallet-select').onchange = () => {
-      activePersona = PERSONAS.find((p) => p.id === $('wallet-select').value) ?? PERSONAS[0];
-      renderAll();
+    $('launch-ticker').oninput = () => {
+      $('launch-art-preview').replaceChildren(makeTokenArtSvg($('launch-ticker').value || 'SAT0', 38));
+      if (activeLaunchStep === 3) renderLaunchReview();
     };
+    $('launch-name').oninput = () => { if (activeLaunchStep === 3) renderLaunchReview(); };
+    $('launch-art').oninput = () => { if (activeLaunchStep === 3) renderLaunchReview(); };
+    $('launch-init').oninput = () => { if (activeLaunchStep === 3) renderLaunchReview(); };
+
+    function selectPersonaById(id) {
+      activePersona = PERSONAS.find((p) => p.id === id) ?? PERSONAS[0];
+      $('wallet-select').value = activePersona.id;
+      $('wallet-select-mobile').value = activePersona.id;
+      renderAll();
+    }
+    $('wallet-select').onchange = () => selectPersonaById($('wallet-select').value);
+    $('wallet-select-mobile').onchange = () => selectPersonaById($('wallet-select-mobile').value);
     $('htlc-net').onchange = () => activeState() && renderAll();
     $('wallet-reveal-btn').onclick = () => { revealSecretVisible = !revealSecretVisible; renderAll(); };
     $('buy-amount').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
@@ -2178,8 +2343,11 @@
     $('submit-buy').onclick = async () => {
       try {
         const s = activeState();
-        const i0In = BigInt(Math.round(Number($('buy-amount').value) * 1e8));
-        const tok = getProjected().projectedState.tokens.get(selectedTokenId);
+        const i0In = parseDecimalToBaseUnits($('buy-amount').value);
+        const { projectedState } = getProjected();
+        const availI0 = E.getBalance(projectedState, activePersona.pk, 0);
+        if (i0In > availI0) throw new Error(`Insufficient I0 balance (${formatBaseUnitsExact(availI0)} I0 available)`);
+        const tok = projectedState.tokens.get(selectedTokenId);
         if (!tok) throw new Error('Select a token first');
         const q = computeBuyQuote(tok, i0In, $('buy-slip').value);
         const tx = E.signTx(s.chainId, {
@@ -2188,16 +2356,19 @@
           nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
         const live = await broadcastTx(tx);
-        showMsg('action-msg', `Signed BIP-340 BUY (${fmtI0(i0In)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
+        showMsg('action-msg', `Signed BIP-340 BUY (${formatBaseUnitsExact(i0In)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
     $('submit-sell').onclick = async () => {
       try {
         const s = activeState();
-        const tokIn = BigInt(Math.round(Number($('sell-amount').value))) * UNIT;
-        const tok = getProjected().projectedState.tokens.get(selectedTokenId);
+        const tokIn = parseDecimalToBaseUnits($('sell-amount').value);
+        const { projectedState } = getProjected();
+        const tok = projectedState.tokens.get(selectedTokenId);
         if (!tok) throw new Error('Select a token first');
+        const availTok = E.getBalance(projectedState, activePersona.pk, tok.id);
+        if (tokIn > availTok) throw new Error(`Insufficient $${tok.ticker} balance (${fmtTok(availTok)} available)`);
         const q = computeSellQuote(tok, tokIn, $('sell-slip').value);
         const tx = E.signTx(s.chainId, {
           type: 'SELL', from: activePersona.pk, tokenId: selectedTokenId,
@@ -2214,15 +2385,16 @@
         const s = activeState();
         const ticker = $('launch-ticker').value.trim().toUpperCase();
         const name = $('launch-name').value.trim();
-        const rawArt = $('launch-art').value.trim();
-        const artId = rawArt && E.isValidInscriptionId(rawArt) ? rawArt : s.genesisId;
-        const initialBuy = BigInt(Math.round(Number($('launch-init').value || 0) * 1e8));
+        const artRes = resolveLaunchArtId(s);
+        if (!artRes.ok) throw new Error(artRes.error);
+        const initRaw = $('launch-init').value.trim();
+        const initialBuy = parseDecimalToBaseUnits(initRaw === '' ? '0' : initRaw, { allowZero: true });
         const tx = E.signTx(s.chainId, {
-          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId,
+          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId: artRes.artId,
           initialBuy: initialBuy.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
         const live = await broadcastTx(tx);
-        showMsg('action-msg', `Signed LAUNCH $${ticker} ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
+        showMsg('action-msg', `Signed LAUNCH $${ticker} (art ${shortId(artRes.artId)}) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
         setPage('explore');
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
@@ -2232,14 +2404,13 @@
         const s = activeState();
         const to = $('transfer-to').value.trim().toLowerCase();
         if (!HEX64_RE.test(to)) throw new Error('Recipient pubkey must be 64 lowercase hex chars');
-        const amount = BigInt(Math.round(Number($('transfer-amount').value) * 1e8));
-        if (amount <= 0n) throw new Error('Transfer amount must be positive');
+        const amount = parseDecimalToBaseUnits($('transfer-amount').value);
         const tx = E.signTx(s.chainId, {
           type: 'TRANSFER', from: activePersona.pk, to, tokenId: 0,
           amount: amount.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
         const live = await broadcastTx(tx);
-        showMsg('action-msg', `Signed TRANSFER (${fmtI0(amount)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
+        showMsg('action-msg', `Signed TRANSFER (${formatBaseUnitsExact(amount)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
@@ -2272,8 +2443,9 @@
       try {
         const s = activeState();
         if (!stagedSwapSecret || !stagedSwapSecret.backedUp) throw new Error('Generate and confirm backup of Secret S first');
-        const amount = BigInt(Math.round(Number($('htlc-amount').value) * 1e8));
-        const recipient = $('htlc-recipient').value;
+        const amount = parseDecimalToBaseUnits($('htlc-amount').value);
+        const recipient = (DEMO_MODE ? $('htlc-recipient').value : $('htlc-recipient-custom').value).trim().toLowerCase();
+        if (!HEX64_RE.test(recipient)) throw new Error('Counterparty pubkey must be 64 lowercase hex chars');
         const nonce = nextNonceFor(activePersona.pk);
         const swapId = E.computeSwapId(s.chainId, activePersona.pk, nonce);
         const { secretHex, hashlock } = stagedSwapSecret;
@@ -2282,12 +2454,11 @@
           type: 'HTLC_LOCK', from: activePersona.pk, recipient, amount: amount.toString(),
           hashlock, timeoutBtcHeight: activeBtcHeight() + 24, nonce, fee: '0',
         }, activePersona.sk);
+        const live = await broadcastTx(tx);
         sessionHtlcSecrets.set(swapId, secretHex);
         stagedSwapSecret = null;
         $('htlc-secret-backup').hidden = true;
         $('submit-htlc').disabled = true;
-
-        const live = await broadcastTx(tx);
         showMsg(
           'action-msg',
           `Queued HTLC_LOCK (H=${hashlock.slice(0, 14)}…). Secret S retained in session memory; confirm in a real block before funding BTC.${live ? ' (Entmoot live)' : ''}`,

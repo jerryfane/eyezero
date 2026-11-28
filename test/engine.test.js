@@ -1,9 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import vm from 'node:vm';
 import {
   I0_TOKEN_ID,
   UNIT,
+  V1_MAINNET_PARAMS,
+  V1_SIGNET_PARAMS,
   V1_TEST_PARAMS,
   applyBlock,
   assertStateConservation,
@@ -38,6 +41,7 @@ import {
   signTx,
 } from '../engine/src/index.js';
 import { syncChainFromOrd } from '../miner/src/cli.mjs';
+import { minifyCss, minifyHtml, minifyJs } from '../scripts/minify.mjs';
 
 const GENESIS_ID = '0000000000000000000000000000000000000000000000000000000000000001i0';
 const GENESIS_BTC_H = 900_000;
@@ -747,5 +751,107 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
     const badMerkle = Uint8Array.from(rawBlock);
     badMerkle[36] ^= 0xff;
     assert.throws(() => extractBitcoinBlockTxids(bytesToHex(badMerkle)), /Merkle root/);
+  });
+});
+
+describe('Signet production parameters and inscription minifier', () => {
+  it('V1_SIGNET_PARAMS inherits mainnet monetary safety with Signet PoW/checkpoint cadence', () => {
+    assert.equal(V1_SIGNET_PARAMS.powMinBits, 16);
+    assert.equal(V1_SIGNET_PARAMS.retargetInterval, 18);
+    assert.equal(V1_SIGNET_PARAMS.checkpointInterval, 24);
+    assert.equal(V1_SIGNET_PARAMS.initialBlockReward, V1_MAINNET_PARAMS.initialBlockReward);
+    assert.equal(V1_SIGNET_PARAMS.halvingInterval, V1_MAINNET_PARAMS.halvingInterval);
+    assert.equal(V1_SIGNET_PARAMS.maxSupply, V1_MAINNET_PARAMS.maxSupply);
+    assert.equal(V1_SIGNET_PARAMS.launchFee, V1_MAINNET_PARAMS.launchFee);
+    assert.equal(V1_SIGNET_PARAMS.tradeFeeBps, V1_MAINNET_PARAMS.tradeFeeBps);
+    assert.equal(V1_SIGNET_PARAMS.htlcSafeMarginBtcBlocks, V1_MAINNET_PARAMS.htlcSafeMarginBtcBlocks);
+
+    const g = createGenesisState(GENESIS_ID, V1_SIGNET_PARAMS, 250_000);
+    assert.equal(nextTarget(g, V1_SIGNET_PARAMS), bitsToTarget(16));
+  });
+
+  it('minifyJs, minifyCss, and minifyHtml preserve semantics across 250 seeded combinations', () => {
+    // Deterministic PRNG (Mulberry32)
+    let seed = 0x10e2e0;
+    const rand = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = (arr) => arr[Math.floor(rand() * arr.length)];
+
+    const strParts = [
+      '"hello // not a comment /* nope */"',
+      "'single \\' quote /not-regex/'",
+      '`tpl ${"a // b"} and ${((x) => x.replace(/foo}/g, "bar"))("foo}")}`',
+    ];
+    const exprParts = [
+      '((a) => a++ / 2)(8)',
+      '((s) => /^\\d+(?:\\.\\d+)?$/.test(s))("12.34")',
+      '((a, b) => (a + b) / 2)(10, 6)',
+      'return /abc\\/def/i.test("ABC/DEF")',
+    ];
+
+    const t0 = performance.now();
+    for (let i = 0; i < 250; i++) {
+      const s1 = pick(strParts);
+      const s2 = pick(strParts);
+      const e1 = pick(exprParts.slice(0, 3));
+      const src = `
+        // leading line comment ${i}
+        function run_${i}() {
+          const a = ${s1} /* inline block comment */
+          const b = ${s2}
+          const c = ${e1}
+          const ok = /x[\\/]y/.test("x/y") // trailing comment
+          return [a, b, c, ok, (() => { ${exprParts[3]} })()]
+        }
+        run_${i}()
+      `;
+      const min = minifyJs(src);
+      assert.ok(min.length < src.length, `Expected JS minification to shrink case ${i}`);
+      const ctx = vm.createContext({});
+      const origRes = vm.runInContext(src, ctx);
+      const minRes = vm.runInContext(min, ctx);
+      assert.deepEqual(minRes, origRes, `Semantic mismatch on seeded JS case ${i}`);
+    }
+    assert.ok(performance.now() - t0 < 5000, 'Seeded minifyJs pass must stay fast and linear');
+
+    const cssIn = `
+      /* Header rule */
+      .badge::after { content: "a : b ; { } /* keep */"; color: #5ad8e6; }
+      .a > .b { margin: 0 12px; }
+    `;
+    const cssOut = minifyCss(cssIn);
+    assert.ok(cssOut.includes('content:"a : b ; { } /* keep */"'));
+    assert.ok(!cssOut.includes('Header rule'));
+    assert.ok(cssOut.includes('.a>.b{margin:0 12px}'));
+
+    const htmlIn = `<!DOCTYPE html>
+<html>
+<head>
+  <!-- remove me -->
+  <style>
+    /* css */
+    body { color: #fff; }
+  </style>
+</head>
+<body>
+  <p>Hello
+  world</p>
+  <script id="cfg" type="application/json">{ "net": "signet", "demoMode": false }</script>
+  <script>
+    // comment
+    const x = 1 + 2;
+  </script>
+</body>
+</html>`;
+    const htmlOut = minifyHtml(htmlIn);
+    assert.ok(!htmlOut.includes('remove me'));
+    assert.ok(htmlOut.includes('<p>Hello world</p>'));
+    assert.ok(htmlOut.includes('{"net":"signet","demoMode":false}'));
+    assert.ok(htmlOut.includes('<style>body{color:#fff}</style>'));
+    assert.ok(htmlOut.length < htmlIn.length);
   });
 });

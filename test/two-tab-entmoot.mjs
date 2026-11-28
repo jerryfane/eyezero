@@ -52,19 +52,35 @@ try {
   ]);
   console.log('[2-tab] Both browser tabs connected to Entmoot P2P live inside ord sandbox!');
 
-  // Pick a distinctive amount (13.37 I0) on Bob in Tab 1 following the real Explore -> Token Detail user journey!
-  await f1.locator('#wallet-select').selectOption('bob');
+  // Pick a demo signer with pending-nonce headroom (< 8 pending orders) and a fresh unique amount
+  // so we strictly prove THIS order propagates live over WebRTC-direct (not stale Entmoot history).
   await f1.locator('#explore-tbody tr').first().click();
-  await f1.locator('#buy-amount').fill('13.37');
+  await f2.locator('#explore-tbody tr').first().click();
+
+  let chosenSigner = null;
+  for (const cand of ['alice', 'creator', 'miner', 'bob']) {
+    await f1.locator('#wallet-select').selectOption(cand);
+    const pendingCount = await f1.locator('#token-pending-list button', { hasText: 'Cancel (RBF)' }).count();
+    if (pendingCount < 8) {
+      chosenSigner = cand;
+      break;
+    }
+  }
+  assert.ok(chosenSigner, 'No demo signer has pending-nonce headroom (< 8 pending txs)');
+
+  const uniqueAmt = `${2 + (Date.now() % 7)}.${String(11 + (Math.floor(Date.now() / 10) % 88)).padStart(2, '0')}`;
+  const beforeTab2 = await f2.locator('#token-pending-list').textContent();
+  assert.ok(!beforeTab2.includes(`${uniqueAmt} I0`), `Tab 2 already contained test amount ${uniqueAmt} I0`);
+
+  await f1.locator('#buy-amount').fill(uniqueAmt);
   await f1.locator('#submit-buy').click();
 
   await f1.locator('#action-msg').filter({ hasText: 'gossiped live over Entmoot' }).waitFor({ timeout: 10_000 });
-  console.log('[2-tab] Tab 1 signed & published BUY 13.37 I0 over Entmoot.');
+  console.log(`[2-tab] Tab 1 (${chosenSigner}) signed & published BUY ${uniqueAmt} I0 over Entmoot.`);
 
-  // Assert Tab 2 opens Token Detail (or Wallet -> Pending Orders) and receives the exact 13.37 I0 order live over Entmoot WebRTC-direct!
-  await f2.locator('#explore-tbody tr').first().click();
-  await f2.locator('#token-pending-list').filter({ hasText: '13.37 I0' }).waitFor({ timeout: 15_000 });
-  console.log('[2-tab] PASS: Tab 2 received Bob BUY 13.37 I0 live over Entmoot P2P!');
+  // Assert Tab 2 receives the exact fresh order live over Entmoot WebRTC-direct without refreshing!
+  await f2.locator('#token-pending-list').filter({ hasText: `${uniqueAmt} I0` }).waitFor({ timeout: 15_000 });
+  console.log(`[2-tab] PASS: Tab 2 received ${chosenSigner} BUY ${uniqueAmt} I0 live over Entmoot P2P!`);
 
   assert.equal(errs.length, 0, `Page errors: ${errs.join('; ')}`);
 } finally {

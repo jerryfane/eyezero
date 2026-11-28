@@ -548,7 +548,15 @@
         for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
         rawText = new TextDecoder().decode(merged);
       }
-      return JSON.parse(rawText);
+      try {
+        return JSON.parse(rawText);
+      } catch (jsonErr) {
+        // Malformed HTTP 200 JSON on /r/* host endpoints (e.g., HTML proxy/error page) is inconclusive, never proof of invalidity.
+        if (typeof url === 'string' && url.startsWith('/r/')) {
+          jsonErr.isTransient = true;
+        }
+        throw jsonErr;
+      }
     }
 
     // Validated ID-based replay tied strictly to live ord (100% stateless across replays so fork choice
@@ -597,6 +605,7 @@
               confirmationVerified = false;
               return;
             }
+            blkErr.isTransient = true;
             throw blkErr;
           }
           try {
@@ -755,12 +764,17 @@
             let incumbentValid = false;
             if (ordTipId) {
               try {
+                const prevConfirmationVerified = ordConfirmationVerified;
                 const rechecked = await replayVerifiedChainFromOrd(genesisIdPinned, ordTipId);
                 ordState = rechecked.state;
                 ordBootState = rechecked.bootState;
                 ordVerifiedBlocks = rechecked.blocks;
                 ordConfirmationVerified = rechecked.confirmationVerified;
                 incumbentValid = true;
+                if (ordConfirmationVerified !== prevConfirmationVerified) {
+                  updateSyncPill();
+                  renderAll();
+                }
               } catch (incErr) {
                 if (incErr?.isTransient) {
                   continue;
@@ -1120,11 +1134,16 @@
         const btcTimeout = h.timeoutBtcHeight - PARAMS.htlcSafeMarginBtcBlocks;
         const timeRemainingOk = btcTimeout > ordBtcHeight + 2;
 
+        const canFundEscrow = !isSimulatedView() && ordConfirmationVerified;
         const card = el('div', { class: 'quote' });
-        const statusLabel = isSimulatedView() ? 'Simulated Demo Escrow (NOT on Bitcoin)' : 'Ord-Confirmed I0 Escrow';
+        const statusLabel = isSimulatedView()
+          ? 'Simulated Demo Escrow (NOT on Bitcoin)'
+          : ordConfirmationVerified
+            ? 'Ord-Confirmed I0 Escrow'
+            : 'Unverified I0 Escrow (no active-block proof)';
         card.appendChild(
           el('div', { class: 'q-line' },
-            el('span', null, el('span', { class: `dot ${isSimulatedView() ? 'warn' : 'ok'}` }), `${statusLabel}: ${fmtI0(h.amount)} I0 → ${recName}`),
+            el('span', null, el('span', { class: `dot ${canFundEscrow ? 'ok' : 'warn'}` }), `${statusLabel}: ${fmtI0(h.amount)} I0 → ${recName}`),
             el('span', { class: 'mono mut' }, `I0 exp #${h.timeoutBtcHeight}`),
           ),
         );
@@ -1137,8 +1156,8 @@
           card.appendChild(el('span', { class: 'code-inline' }, mySecret));
         }
 
-        // Only derive & show a Taproot BTC HTLC address when NOT simulated and deadline has sufficient margin!
-        if (!isSimulatedView() && timeRemainingOk && (netName === 'signet' || netName === 'regtest')) {
+        // Only derive & show a Taproot BTC HTLC address when NOT simulated, active-block confirmation is verified, and deadline has sufficient margin!
+        if (canFundEscrow && timeRemainingOk && (netName === 'signet' || netName === 'regtest')) {
           try {
             const btcHtlc = E.deriveTaprootHtlc({
               alicePubkey: h.sender,
@@ -1153,7 +1172,9 @@
         } else {
           const reason = isSimulatedView()
             ? 'BTC funding address hidden in simulated demo mode.'
-            : `Escrow deadline too close to BTC tip #${ordBtcHeight} — funding locked.`;
+            : !ordConfirmationVerified
+              ? 'BTC funding address hidden until active-block confirmation is verified.'
+              : `Escrow deadline too close to BTC tip #${ordBtcHeight} — funding locked.`;
           card.appendChild(el('div', { class: 'mut', style: 'font-size:11px;margin-top:5px' }, reason));
         }
 

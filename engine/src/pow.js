@@ -196,24 +196,15 @@ function sha256d(bytes) {
 // Returns { blockHash, txids: Set<64-hex> }.
 export function extractBitcoinBlockTxids(rawBlockHex, expectedBlockHash) {
   if (typeof rawBlockHex !== 'string' || rawBlockHex.length < 162 || rawBlockHex.length % 2 !== 0) {
-    const err = new Error('Malformed raw Bitcoin block hex');
-    err.isBlockHashMismatch = true;
-    throw err;
+    throw new Error('Malformed raw Bitcoin block hex');
   }
   const bytes = hexToBytes(rawBlockHex);
-  if (bytes.length < 81) {
-    const err = new Error('Bitcoin block shorter than 81 bytes');
-    err.isBlockHashMismatch = true;
-    throw err;
-  }
 
   const headerHash = bytesToHex(rev32Bytes(sha256d(bytes.subarray(0, 80))));
   if (expectedBlockHash !== undefined) {
     const want = String(expectedBlockHash).toLowerCase();
     if (!POW_HEX64_RE.test(want) || headerHash !== want) {
-      const err = new Error(`Raw Bitcoin block header hash (${headerHash}) does not match expected (${want})`);
-      err.isBlockHashMismatch = true;
-      throw err;
+      throw new Error(`Raw Bitcoin block header hash (${headerHash}) does not match expected (${want})`);
     }
   }
 

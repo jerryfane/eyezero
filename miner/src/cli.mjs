@@ -641,6 +641,34 @@ export async function runMinerOnce(opts) {
     ...(cpInterval !== undefined ? { checkpointInterval: cpInterval } : {}),
   };
 
+  const hasCpFlag =
+    'trusted-checkpoint-id' in opts ||
+    'trusted-checkpoint-root' in opts ||
+    'trusted-checkpoint-pages' in opts;
+  let trustedCheckpoint = null;
+  if (hasCpFlag) {
+    const cpId = typeof opts['trusted-checkpoint-id'] === 'string' ? opts['trusted-checkpoint-id'].trim() : '';
+    const cpRoot = typeof opts['trusted-checkpoint-root'] === 'string' ? opts['trusted-checkpoint-root'].trim().toLowerCase() : '';
+    if (!cpId || !cpRoot) {
+      throw new Error(
+        'Partial trusted checkpoint options: --trusted-checkpoint-id and --trusted-checkpoint-root must both be non-empty',
+      );
+    }
+    if (!isValidBlockInscriptionId(cpId) || !HEX64_RE.test(cpRoot)) {
+      throw new Error('trustedCheckpoint requires valid blockId and 64-hex stateRoot');
+    }
+    let pageIds;
+    if ('trusted-checkpoint-pages' in opts) {
+      const rawPages = String(opts['trusted-checkpoint-pages'] ?? '').trim();
+      if (!rawPages) throw new Error('--trusted-checkpoint-pages cannot be empty');
+      pageIds = rawPages.split(',').map((s) => s.trim()).filter(Boolean);
+      if (pageIds.length === 0 || pageIds.some((pid) => !isValidInscriptionId(pid))) {
+        throw new Error('--trusted-checkpoint-pages contains an invalid inscription ID');
+      }
+    }
+    trustedCheckpoint = { blockId: cpId, stateRoot: cpRoot, ...(pageIds ? { pageIds } : {}) };
+  }
+
   const ordUrl = opts['ord-url'];
   const genesisId = opts.genesis;
   const candidateTips = [opts.tip ?? genesisId];
@@ -666,24 +694,6 @@ export async function runMinerOnce(opts) {
       }
     } catch {}
   }
-
-  const hasCpFlag = Boolean(
-    opts['trusted-checkpoint-id'] || opts['trusted-checkpoint-root'] || opts['trusted-checkpoint-pages'],
-  );
-  if (hasCpFlag && (!opts['trusted-checkpoint-id'] || !opts['trusted-checkpoint-root'])) {
-    throw new Error(
-      'Partial trusted checkpoint options: --trusted-checkpoint-id and --trusted-checkpoint-root must both be provided',
-    );
-  }
-  const trustedCheckpoint = hasCpFlag
-    ? {
-        blockId: opts['trusted-checkpoint-id'],
-        stateRoot: opts['trusted-checkpoint-root'],
-        ...(opts['trusted-checkpoint-pages']
-          ? { pageIds: String(opts['trusted-checkpoint-pages']).split(',').map((s) => s.trim()).filter(Boolean) }
-          : {}),
-      }
-    : null;
 
   // 1. Cold-sync best verified canonical chain using fork-choice comparator!
   const { state, blockCount, genesisBtcHeight, trustModel } = await syncBestTipFromOrd({
@@ -946,11 +956,20 @@ export async function runMinerOnce(opts) {
 
     // Only announce #i0-blk to Entmoot after ord confirms the inscription (--wait-confirm)!
     if (opts['entmoot-group'] && opts['wait-confirm']) {
-      let lastWaitErr = null;
+      let lastPollErr = null;
+      let publishErr = null;
       for (let i = 0; i < 120; i++) {
+        let meta;
         try {
-          const meta = await ordJson(ordUrl, `/r/inscription/${mined.inscriptionId}`);
-          if (Number.isInteger(meta?.height) && meta.height >= 1) {
+          meta = await ordJson(ordUrl, `/r/inscription/${mined.inscriptionId}`);
+          lastPollErr = null;
+        } catch (err) {
+          lastPollErr = err?.message || String(err);
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
+        }
+        if (Number.isInteger(meta?.height) && meta.height >= 1) {
+          try {
             publishEntmootBlock({
               entmootBin: opts['entmoot-bin'] ?? '/root/.entmoot/bin/entmootd',
               entmootData: opts['entmoot-data'],
@@ -958,16 +977,21 @@ export async function runMinerOnce(opts) {
               announcement,
             });
             result.announced = true;
-            lastWaitErr = null;
+            publishErr = null;
             break;
+          } catch (err) {
+            publishErr = err?.message || String(err);
           }
-        } catch (err) {
-          lastWaitErr = err?.message || String(err);
         }
         await new Promise((r) => setTimeout(r, 5000));
       }
       if (!result.announced) {
-        result.announceError = lastWaitErr ?? 'Timed out waiting for ord confirmation before announcing #i0-blk';
+        result.announceError =
+          publishErr
+            ? `Failed to publish #i0-blk after confirmation: ${publishErr}`
+            : lastPollErr
+              ? `Timed out waiting for ord confirmation (last poll error: ${lastPollErr})`
+              : 'Timed out waiting for ord confirmation before announcing #i0-blk';
       }
     }
   }

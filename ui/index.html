@@ -338,9 +338,6 @@
     let ordBtcHeight = 924_103;
     let ordTipId = null;
     let pinnedTrustedCheckpoint = null; // optional out-of-band pinned { blockId, stateRoot, pageIds? }
-    // Session-wide map of blockId -> first observed active /r/blockhash/<meta.height>.
-    // Applied symmetrically to EVERY replay (incumbent and candidate) so fork choice is order-independent.
-    const observedBlockConfHashes = new Map();
     // Cache ONLY immutable inscription content bodies (/content/:id), NEVER mutable confirmation metadata!
     const contentBodyCache = new Map();
 
@@ -549,10 +546,13 @@
       return JSON.parse(rawText);
     }
 
-    // Validated ID-based replay tied strictly to live ord:
+    // Validated ID-based replay tied strictly to live ord (100% stateless across replays so fork choice
+    // never depends on tab session history or arrival order):
     //   - Always replays from Genesis unless an EXPLICIT out-of-band pinned trustedCheckpoint matches (never self-certified!).
     //   - Supports BOTH inline and multi-page pinned checkpoints (fetches & Merkle-verifies companion pages).
-    //   - Always fetches /r/inscription/:id and active-chain /r/blockhash/:h fresh and enforces observedBlockConfHashes symmetrically on every replay.
+    //   - Always fetches /r/inscription/:id, /r/blockhash/:h, and (when exposed) /r/blockinfo/:h fresh to verify
+    //     active-chain confirmation and catch stale/torn metadata without rejecting valid same-height re-inclusions.
+    //     (Note: ord's /r/ sandbox exposes no tx-in-block Merkle proof; full tx containment uses bitcoind RPC in miner/src/cli.mjs.)
     async function replayVerifiedChainFromOrd(genesisId, tipId) {
       if (!E.isValidInscriptionId(genesisId)) throw new Error('Invalid genesis ID');
       if (!E.isValidInscriptionId(tipId)) throw new Error('Invalid tip ID');
@@ -563,7 +563,7 @@
       }
 
       const freshHashes = new Map();
-      const observedConfHashes = new Map();
+      const freshBlockInfo = new Map();
       const rawChain = [];
       const visited = new Set([genesisId]);
       let cursor = tipId;
@@ -607,12 +607,42 @@
           freshHashes.set(meta.height, confHash.toLowerCase());
         }
         const activeConfHash = freshHashes.get(meta.height);
-        // Symmetric reorg check applied to EVERY replay (incumbent and candidate alike):
-        // once a validated block is observed at a confirmation block hash, a later hash change at that height rejects it.
-        if (observedBlockConfHashes.has(cursor) && observedBlockConfHashes.get(cursor) !== activeConfHash) {
-          throw new Error(`Block ${cursor} confirmation block #${meta.height} hash changed (reorg detected)`);
+        // Stateless confirmation consistency checks against live ord:
+        //   1. If ord metadata exposes meta.blockhash, require exact match with active /r/blockhash/<meta.height>.
+        //   2. If ord exposes /r/blockinfo/<meta.height>, verify hash, height, and confirming-block timestamp match
+        //      meta.timestamp (catches torn reads / stale inscription metadata after a reorg without blacklisting valid re-inclusions!).
+        if (typeof meta.blockhash === 'string') {
+          if (!HEX64_RE.test(meta.blockhash.toLowerCase()) || meta.blockhash.toLowerCase() !== activeConfHash) {
+            throw new Error(`Block ${cursor} meta.blockhash disagrees with active /r/blockhash/${meta.height}`);
+          }
         }
-        observedConfHashes.set(cursor, activeConfHash);
+        if (Number.isInteger(meta.timestamp)) {
+          let binfo = freshBlockInfo.get(meta.height);
+          if (binfo === undefined) {
+            try {
+              binfo = await fetchJson(`/r/blockinfo/${meta.height}`);
+              freshBlockInfo.set(meta.height, binfo);
+            } catch (biErr) {
+              if (biErr?.status === 404) {
+                freshBlockInfo.set(meta.height, null);
+                binfo = null;
+              } else {
+                throw biErr;
+              }
+            }
+          }
+          if (binfo) {
+            if (typeof binfo.hash === 'string' && binfo.hash.toLowerCase() !== activeConfHash) {
+              throw new Error(`Block #${meta.height} hash mismatch between blockhash and blockinfo`);
+            }
+            if (Number.isInteger(binfo.height) && binfo.height !== meta.height) {
+              throw new Error(`Block #${meta.height} height mismatch in blockinfo`);
+            }
+            if (Number.isInteger(binfo.timestamp) && binfo.timestamp !== meta.timestamp) {
+              throw new Error(`Block ${cursor} timestamp (${meta.timestamp}) disagrees with active blockinfo #${meta.height} (${binfo.timestamp})`);
+            }
+          }
+        }
 
         const blk = { ...blkBody, id: cursor };
         // ONLY boot from a checkpoint whose (blockId, stateRoot) was EXPLICITLY pinned out-of-band!
@@ -672,9 +702,6 @@
         s = E.applyBlock(s, blk, ctx, PARAMS);
         contentBodyCache.set(blk.id, blkBody);
         blocks.push({ block: blk, meta });
-      }
-      for (const [id, hash] of observedConfHashes) {
-        if (!observedBlockConfHashes.has(id)) observedBlockConfHashes.set(id, hash);
       }
       return {
         state: s,

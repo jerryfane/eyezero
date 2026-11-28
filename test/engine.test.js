@@ -12,14 +12,17 @@ import {
   buildAndSignHtlcClaimTx,
   buildAndSignHtlcRefundTx,
   buildCandidateBlock,
+  bytesToHex,
   compareChainTips,
   computeStateRoot,
   computeSwapId,
   computeTokenId,
+  concatBytes,
   createGenesisState,
   decodeSegwitAddress,
   deriveTaprootHtlc,
   exportCheckpointPages,
+  extractBitcoinBlockTxids,
   getBalance,
   getBip341NumsXOnly,
   getPublicKeyHex,
@@ -30,6 +33,7 @@ import {
   nextTarget,
   previewPending,
   resolvePendingMempool,
+  sha256,
   sha256Hex,
   signTx,
 } from '../engine/src/index.js';
@@ -682,5 +686,66 @@ describe('HTLC atomic swaps, strict Taproot validation, and cancel/replace', () 
     } finally {
       server.close();
     }
+  });
+
+  it('extractBitcoinBlockTxids verifies header hash, Merkle root, and SegWit/legacy tx membership', () => {
+    const rev32 = (b) => Uint8Array.from(b).reverse();
+    const sha256d = (b) => sha256(sha256(b));
+    // Legacy coinbase tx (1 input, 1 output)
+    const coinbase = concatBytes(
+      new Uint8Array([1, 0, 0, 0]),
+      new Uint8Array([1]),
+      new Uint8Array(32),
+      new Uint8Array([0xff, 0xff, 0xff, 0xff]),
+      new Uint8Array([2, 0x51, 0x01]),
+      new Uint8Array([0xff, 0xff, 0xff, 0xff]),
+      new Uint8Array([1]),
+      new Uint8Array([0x00, 0xe1, 0xf5, 0x05, 0, 0, 0, 0]),
+      new Uint8Array([1, 0x51]),
+      new Uint8Array([0, 0, 0, 0]),
+    );
+    // BIP-144 SegWit/Taproot tx (witness stripped for txid!)
+    const swVersion = new Uint8Array([2, 0, 0, 0]);
+    const swFlag = new Uint8Array([0x00, 0x01]);
+    const swBody = concatBytes(
+      new Uint8Array([1]),
+      new Uint8Array(32).fill(0x22),
+      new Uint8Array([0, 0, 0, 0]),
+      new Uint8Array([0]),
+      new Uint8Array([0xfd, 0xff, 0xff, 0xff]),
+      new Uint8Array([1]),
+      new Uint8Array([0x22, 0x02, 0, 0, 0, 0, 0, 0]),
+      new Uint8Array([2, 0x51, 0x20]),
+    );
+    const swWitness = new Uint8Array([1, 4, 0xde, 0xad, 0xbe, 0xef]);
+    const swLock = new Uint8Array([0, 0, 0, 0]);
+    const swFull = concatBytes(swVersion, swFlag, swBody, swWitness, swLock);
+    const swStripped = concatBytes(swVersion, swBody, swLock);
+
+    const cbHash = sha256d(coinbase);
+    const swHash = sha256d(swStripped);
+    const merkle = sha256d(concatBytes(cbHash, swHash));
+    const header = concatBytes(
+      new Uint8Array([0, 0, 0, 0x20]),
+      new Uint8Array(32).fill(0x11),
+      merkle,
+      new Uint8Array([0x10, 0x20, 0x30, 0x65]),
+      new Uint8Array([0xff, 0xff, 0x7f, 0x20]),
+      new Uint8Array([1, 2, 3, 4]),
+    );
+    const blockHash = bytesToHex(rev32(sha256d(header)));
+    const rawBlock = concatBytes(header, new Uint8Array([2]), coinbase, swFull);
+    const rawBlockHex = bytesToHex(rawBlock);
+
+    const parsed = extractBitcoinBlockTxids(rawBlockHex, blockHash);
+    assert.equal(parsed.blockHash, blockHash);
+    assert.equal(parsed.txids.has(bytesToHex(rev32(cbHash))), true);
+    assert.equal(parsed.txids.has(bytesToHex(rev32(swHash))), true);
+    assert.equal(parsed.txids.has('00'.repeat(32)), false);
+
+    assert.throws(() => extractBitcoinBlockTxids(rawBlockHex, 'ff'.repeat(32)), /does not match expected/);
+    const badMerkle = Uint8Array.from(rawBlock);
+    badMerkle[36] ^= 0xff;
+    assert.throws(() => extractBitcoinBlockTxids(bytesToHex(badMerkle)), /Merkle root/);
   });
 });

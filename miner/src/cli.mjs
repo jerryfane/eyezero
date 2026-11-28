@@ -354,6 +354,25 @@ export async function verifyRevealOnBitcoind(
   return true;
 }
 
+function validateTrustedCheckpointPin(pin) {
+  if (!pin || typeof pin !== 'object') {
+    throw new Error('trustedCheckpoint must be an object with blockId and 64-hex stateRoot');
+  }
+  const blockId = typeof pin.blockId === 'string' ? pin.blockId.trim() : '';
+  const stateRoot = typeof pin.stateRoot === 'string' ? pin.stateRoot.trim().toLowerCase() : '';
+  if (!isValidBlockInscriptionId(blockId) || !HEX64_RE.test(stateRoot)) {
+    throw new Error('trustedCheckpoint requires valid blockId and 64-hex stateRoot');
+  }
+  let pageIds;
+  if (pin.pageIds !== undefined) {
+    if (!Array.isArray(pin.pageIds) || pin.pageIds.length === 0 || pin.pageIds.some((pid) => !isValidInscriptionId(pid))) {
+      throw new Error('trustedCheckpoint.pageIds must be a non-empty array of valid inscription IDs');
+    }
+    pageIds = pin.pageIds.slice();
+  }
+  return { blockId, stateRoot, ...(pageIds ? { pageIds } : {}) };
+}
+
 export async function syncChainFromOrd({
   ordUrl,
   genesisId,
@@ -375,13 +394,7 @@ export async function syncChainFromOrd({
     throw new Error(`Invalid tip inscription ID: ${tipId}`);
   }
   if (trustedCheckpoint) {
-    if (
-      !isValidBlockInscriptionId(trustedCheckpoint.blockId) ||
-      typeof trustedCheckpoint.stateRoot !== 'string' ||
-      !HEX64_RE.test(trustedCheckpoint.stateRoot.toLowerCase())
-    ) {
-      throw new Error('trustedCheckpoint requires valid blockId and 64-hex stateRoot');
-    }
+    trustedCheckpoint = validateTrustedCheckpointPin(trustedCheckpoint);
   }
 
   const genesisMeta = await ordJson(ordUrl, `/r/inscription/${genesisId}`);
@@ -654,19 +667,17 @@ export async function runMinerOnce(opts) {
         'Partial trusted checkpoint options: --trusted-checkpoint-id and --trusted-checkpoint-root must both be non-empty',
       );
     }
-    if (!isValidBlockInscriptionId(cpId) || !HEX64_RE.test(cpRoot)) {
-      throw new Error('trustedCheckpoint requires valid blockId and 64-hex stateRoot');
-    }
     let pageIds;
     if ('trusted-checkpoint-pages' in opts) {
       const rawPages = String(opts['trusted-checkpoint-pages'] ?? '').trim();
       if (!rawPages) throw new Error('--trusted-checkpoint-pages cannot be empty');
       pageIds = rawPages.split(',').map((s) => s.trim()).filter(Boolean);
-      if (pageIds.length === 0 || pageIds.some((pid) => !isValidInscriptionId(pid))) {
-        throw new Error('--trusted-checkpoint-pages contains an invalid inscription ID');
-      }
     }
-    trustedCheckpoint = { blockId: cpId, stateRoot: cpRoot, ...(pageIds ? { pageIds } : {}) };
+    trustedCheckpoint = validateTrustedCheckpointPin({
+      blockId: cpId,
+      stateRoot: cpRoot,
+      ...(pageIds !== undefined ? { pageIds } : {}),
+    });
   }
 
   const ordUrl = opts['ord-url'];

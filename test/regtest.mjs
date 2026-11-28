@@ -27,6 +27,7 @@ import {
   computeSwapId,
   computeTokenId,
   createGenesisState,
+  extractBitcoinBlockTxids,
   getBalance,
   getPublicKeyHex,
   importCheckpoint,
@@ -306,6 +307,15 @@ assert.equal(
   computeStateRoot(importCheckpoint(tipBlock.checkpoint, { expectedStateRoot: tipBlock.stateRoot }), REGTEST_PARAMS),
   tipBlock.stateRoot,
 );
+
+// 7. Verify raw Bitcoin block membership via ord 0.29.1's /r/block/<hash> (same path ui/index.html uses!)
+const tipMeta = await ordJson(`/r/inscription/${tipId}`);
+const tipBtcHash = await ordJson(`/r/blockhash/${tipMeta.height}`);
+const rawBlockHex = await ordJson(`/r/block/${tipBtcHash}`);
+const parsedBlk = extractBitcoinBlockTxids(rawBlockHex, tipBtcHash);
+assert.equal(parsedBlk.blockHash, tipBtcHash);
+assert.equal(parsedBlk.txids.has(tipId.slice(0, 64)), true, 'Real Taproot reveal txid must be verified in /r/block/<hash>');
+assert.equal(parsedBlk.txids.has('00'.repeat(32)), false, 'Absent txid must not be in /r/block/<hash>');
 
 console.log(`[regtest] PASS: All 3 real dual-PoW 0000...i0 Taproot inscriptions synced & verified via ord 0.29.1 + bitcoind 31.3!`);
 

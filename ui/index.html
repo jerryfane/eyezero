@@ -272,6 +272,8 @@
     const MAX_SEEN_SIGS = 1000;
     const MAX_SYNC_DEPTH = 500_000;
     const MAX_ORD_BODY_BYTES = 512 * 1024;
+    const MAX_RAW_BLOCK_BYTES = 9 * 1024 * 1024;
+    const MAX_VERIFIED_BLOCKS_CACHE = 256;
     const FETCH_TIMEOUT_MS = 12_000;
     const MAX_PENDING_HINTS = 8;
     const HEX64_RE = /^[0-9a-f]{64}$/;
@@ -337,9 +339,12 @@
     let ordGenesisBtcHeight = 0;
     let ordBtcHeight = 924_103;
     let ordTipId = null;
+    let ordConfirmationVerified = false;
     let pinnedTrustedCheckpoint = null; // optional out-of-band pinned { blockId, stateRoot, pageIds? }
-    // Cache ONLY immutable inscription content bodies (/content/:id), NEVER mutable confirmation metadata!
+    // Cache ONLY immutable inscription content bodies (/content/:id) and hash-verified raw Bitcoin block txid sets!
+    // NEVER cache mutable confirmation metadata (/r/inscription/:id or /r/blockhash/:h).
     const contentBodyCache = new Map();
+    const verifiedBlockTxidsCache = new Map();
 
     let simActive = false;
     let simState = null;
@@ -550,20 +555,76 @@
     // never depends on tab session history or arrival order):
     //   - Always replays from Genesis unless an EXPLICIT out-of-band pinned trustedCheckpoint matches (never self-certified!).
     //   - Supports BOTH inline and multi-page pinned checkpoints (fetches & Merkle-verifies companion pages).
-    //   - Always fetches /r/inscription/:id, /r/blockhash/:h, and (when exposed) /r/blockinfo/:h fresh to verify
-    //     active-chain confirmation and catch stale/torn metadata without rejecting valid same-height re-inclusions.
-    //     (Note: ord's /r/ sandbox exposes no tx-in-block Merkle proof; full tx containment uses bitcoind RPC in miner/src/cli.mjs.)
+    //   - Always fetches /r/inscription/:id and /r/blockhash/:h fresh, and cryptographically verifies reveal-tx
+    //     membership in the raw active Bitcoin block via /r/block/:hash (header hash + Merkle root + txid set).
+    //   - If the host does not expose raw blocks (404), marks confirmationVerified = false instead of falsely claiming verified.
+    //   - Any torn/inconsistent host observation (e.g. mismatched block header hash or meta.blockhash) is tagged isTransient = true
+    //     so a higher-work incumbent is never demoted on an incoherent observation.
     async function replayVerifiedChainFromOrd(genesisId, tipId) {
       if (!E.isValidInscriptionId(genesisId)) throw new Error('Invalid genesis ID');
       if (!E.isValidInscriptionId(tipId)) throw new Error('Invalid tip ID');
+
+      const freshHashes = new Map();
+      let confirmationVerified = true;
+
+      async function getFreshBlockHash(height) {
+        if (freshHashes.has(height)) return freshHashes.get(height);
+        const h = await fetchJson(`/r/blockhash/${height}`);
+        if (typeof h !== 'string' || !HEX64_RE.test(h.toLowerCase())) {
+          throw new Error(`Invalid active blockhash at height ${height}`);
+        }
+        const norm = h.toLowerCase();
+        freshHashes.set(height, norm);
+        return norm;
+      }
+
+      async function verifyMembershipInActiveBlock(inscriptionId, meta) {
+        const activeConfHash = await getFreshBlockHash(meta.height);
+        if (typeof meta.blockhash === 'string') {
+          if (!HEX64_RE.test(meta.blockhash.toLowerCase()) || meta.blockhash.toLowerCase() !== activeConfHash) {
+            const tornErr = new Error(`Inconsistent host view: meta.blockhash disagrees with active hash at #${meta.height}`);
+            tornErr.isTransient = true;
+            throw tornErr;
+          }
+        }
+        let txids = verifiedBlockTxidsCache.get(activeConfHash);
+        if (!txids) {
+          let rawBlockHex;
+          try {
+            rawBlockHex = await fetchJson(`/r/block/${activeConfHash}`, MAX_RAW_BLOCK_BYTES);
+          } catch (blkErr) {
+            if (blkErr?.status === 404) {
+              confirmationVerified = false;
+              return;
+            }
+            throw blkErr;
+          }
+          try {
+            const parsed = E.extractBitcoinBlockTxids(rawBlockHex, activeConfHash);
+            txids = parsed.txids;
+          } catch (parseErr) {
+            // Host returned a block whose header hash doesn't match the requested active hash or malformed data -> incoherent observation.
+            parseErr.isTransient = true;
+            throw parseErr;
+          }
+          if (verifiedBlockTxidsCache.size >= MAX_VERIFIED_BLOCKS_CACHE) {
+            const oldest = verifiedBlockTxidsCache.keys().next().value;
+            verifiedBlockTxidsCache.delete(oldest);
+          }
+          verifiedBlockTxidsCache.set(activeConfHash, txids);
+        }
+        const revealTxid = inscriptionId.slice(0, 64).toLowerCase();
+        if (!txids.has(revealTxid)) {
+          throw new Error(`Inscription ${inscriptionId} reveal tx is not included in active Bitcoin block #${meta.height}`);
+        }
+      }
 
       const genesisMeta = await fetchJson(`/r/inscription/${genesisId}`);
       if (!Number.isInteger(genesisMeta?.height) || genesisMeta.height < 1) {
         throw new Error('Genesis inscription unconfirmed on ord');
       }
+      await verifyMembershipInActiveBlock(genesisId, genesisMeta);
 
-      const freshHashes = new Map();
-      const freshBlockInfo = new Map();
       const rawChain = [];
       const visited = new Set([genesisId]);
       let cursor = tipId;
@@ -591,58 +652,8 @@
         if (typeof blkBody?.prev !== 'string' || !E.isValidInscriptionId(blkBody.prev)) {
           throw new Error(`Invalid prev in ${cursor}`);
         }
-        const refH = blkBody.btcRef.h;
-        if (!freshHashes.has(refH)) {
-          const refHash = await fetchJson(`/r/blockhash/${refH}`);
-          if (typeof refHash !== 'string' || !HEX64_RE.test(refHash.toLowerCase())) {
-            throw new Error(`Invalid blockhash at height ${refH}`);
-          }
-          freshHashes.set(refH, refHash.toLowerCase());
-        }
-        if (!freshHashes.has(meta.height)) {
-          const confHash = await fetchJson(`/r/blockhash/${meta.height}`);
-          if (typeof confHash !== 'string' || !HEX64_RE.test(confHash.toLowerCase())) {
-            throw new Error(`Confirmation block #${meta.height} missing on active chain`);
-          }
-          freshHashes.set(meta.height, confHash.toLowerCase());
-        }
-        const activeConfHash = freshHashes.get(meta.height);
-        // Stateless confirmation consistency checks against live ord:
-        //   1. If ord metadata exposes meta.blockhash, require exact match with active /r/blockhash/<meta.height>.
-        //   2. If ord exposes /r/blockinfo/<meta.height>, verify hash, height, and confirming-block timestamp match
-        //      meta.timestamp (catches torn reads / stale inscription metadata after a reorg without blacklisting valid re-inclusions!).
-        if (typeof meta.blockhash === 'string') {
-          if (!HEX64_RE.test(meta.blockhash.toLowerCase()) || meta.blockhash.toLowerCase() !== activeConfHash) {
-            throw new Error(`Block ${cursor} meta.blockhash disagrees with active /r/blockhash/${meta.height}`);
-          }
-        }
-        if (Number.isInteger(meta.timestamp)) {
-          let binfo = freshBlockInfo.get(meta.height);
-          if (binfo === undefined) {
-            try {
-              binfo = await fetchJson(`/r/blockinfo/${meta.height}`);
-              freshBlockInfo.set(meta.height, binfo);
-            } catch (biErr) {
-              if (biErr?.status === 404) {
-                freshBlockInfo.set(meta.height, null);
-                binfo = null;
-              } else {
-                throw biErr;
-              }
-            }
-          }
-          if (binfo) {
-            if (typeof binfo.hash === 'string' && binfo.hash.toLowerCase() !== activeConfHash) {
-              throw new Error(`Block #${meta.height} hash mismatch between blockhash and blockinfo`);
-            }
-            if (Number.isInteger(binfo.height) && binfo.height !== meta.height) {
-              throw new Error(`Block #${meta.height} height mismatch in blockinfo`);
-            }
-            if (Number.isInteger(binfo.timestamp) && binfo.timestamp !== meta.timestamp) {
-              throw new Error(`Block ${cursor} timestamp (${meta.timestamp}) disagrees with active blockinfo #${meta.height} (${binfo.timestamp})`);
-            }
-          }
-        }
+        await getFreshBlockHash(blkBody.btcRef.h);
+        await verifyMembershipInActiveBlock(cursor, meta);
 
         const blk = { ...blkBody, id: cursor };
         // ONLY boot from a checkpoint whose (blockId, stateRoot) was EXPLICITLY pinned out-of-band!
@@ -708,7 +719,19 @@
         bootState,
         blocks,
         genesisBtcHeight: genesisMeta.height,
+        confirmationVerified,
       };
+    }
+
+    function updateSyncPill() {
+      if (!ordState) return;
+      if (ordConfirmationVerified) {
+        setPill('sync-pill', 'ok', `Verified ${ordState.height} blocks on chain`);
+      } else if (isSimulatedSeed) {
+        setPill('sync-pill', 'warn', `Demo seed: ${ordState.height} blocks (confirmation unverified)`);
+      } else {
+        setPill('sync-pill', 'warn', `Unverified confirmation · ${ordState.height} blocks (host lacks active-block proof)`);
+      }
     }
 
     function enqueueTipHint(tipId) {
@@ -736,6 +759,7 @@
                 ordState = rechecked.state;
                 ordBootState = rechecked.bootState;
                 ordVerifiedBlocks = rechecked.blocks;
+                ordConfirmationVerified = rechecked.confirmationVerified;
                 incumbentValid = true;
               } catch (incErr) {
                 if (incErr?.isTransient) {
@@ -744,17 +768,22 @@
                 incumbentValid = false;
               }
             }
+            // Never let a candidate lacking active-block membership proof displace an active-block-verified incumbent!
+            if (incumbentValid && ordConfirmationVerified && !candidate.confirmationVerified) {
+              continue;
+            }
             if (!incumbentValid || !ordState || E.compareChainTips(candidate.state, ordState) > 0) {
               ordState = candidate.state;
               ordBootState = candidate.bootState;
               ordVerifiedBlocks = candidate.blocks;
               ordGenesisBtcHeight = candidate.genesisBtcHeight;
+              ordConfirmationVerified = candidate.confirmationVerified;
               ordTipId = tipId;
               simActive = false;
               ordBtcHeight = Math.max(ordBtcHeight, ordState.tipBtcHeight);
               pruneConfirmedMempool(ordState);
               invalidateProjection();
-              setPill('sync-pill', 'ok', `Verified ${ordState.height} blocks on chain`);
+              updateSyncPill();
               renderAll();
             }
             retryHints.delete(tipId);
@@ -860,15 +889,16 @@
         isSimulatedSeed = Boolean(tipInfo.simulated);
         pinnedTrustedCheckpoint = tipInfo.trustedCheckpoint ?? null;
 
-        const { state, bootState, blocks, genesisBtcHeight } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
+        const { state, bootState, blocks, genesisBtcHeight, confirmationVerified } = await replayVerifiedChainFromOrd(tipInfo.genesisId, tipInfo.tipId);
         ordState = state;
         ordBootState = bootState;
         ordVerifiedBlocks = blocks;
         ordGenesisBtcHeight = genesisBtcHeight;
+        ordConfirmationVerified = confirmationVerified;
         ordTipId = tipInfo.tipId;
         inspectedHeight = state.height;
         invalidateProjection();
-        setPill('sync-pill', 'ok', isSimulatedSeed ? `Demo seed: ${blocks.length} blocks` : `Verified ${blocks.length} blocks on chain`);
+        updateSyncPill();
         renderAll();
         connectEntmoot();
       } catch (err) {

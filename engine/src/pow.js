@@ -2,7 +2,7 @@
 // exact-interval continuous retargeting, strict anti-premine anchor checks, and fork choice.
 
 import { V1_MAINNET_PARAMS } from './constants.js';
-import { sha256Hex } from './crypto.js';
+import { bytesToHex, concatBytes, hexToBytes, sha256, sha256Hex } from './crypto.js';
 
 const MAX_UINT256 = (1n << 256n) - 1n;
 const TWO_256 = 1n << 256n;
@@ -177,4 +177,157 @@ export function compareChainTips(a, b) {
     return a.tipInscriptionNumber < b.tipInscriptionNumber ? 1 : -1;
   }
   return 0;
+}
+
+function rev32Bytes(b) {
+  const out = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) out[i] = b[31 - i];
+  return out;
+}
+
+function sha256d(bytes) {
+  return sha256(sha256(bytes));
+}
+
+// Pure-JS raw Bitcoin block parser & cryptographic membership verifier (works inside ord iframe sandbox & Node):
+//   1. Verifies 80-byte header double-SHA256 equals expectedBlockHash (when supplied).
+//   2. Parses every legacy & BIP-144 SegWit/Taproot transaction and computes non-witness txids.
+//   3. Verifies computed Bitcoin Merkle root matches header bytes [36..68] exactly.
+// Returns { blockHash, txids: Set<64-hex> }.
+export function extractBitcoinBlockTxids(rawBlockHex, expectedBlockHash) {
+  if (typeof rawBlockHex !== 'string' || rawBlockHex.length < 162 || rawBlockHex.length % 2 !== 0) {
+    const err = new Error('Malformed raw Bitcoin block hex');
+    err.isBlockHashMismatch = true;
+    throw err;
+  }
+  const bytes = hexToBytes(rawBlockHex);
+  if (bytes.length < 81) {
+    const err = new Error('Bitcoin block shorter than 81 bytes');
+    err.isBlockHashMismatch = true;
+    throw err;
+  }
+
+  const headerHash = bytesToHex(rev32Bytes(sha256d(bytes.subarray(0, 80))));
+  if (expectedBlockHash !== undefined) {
+    const want = String(expectedBlockHash).toLowerCase();
+    if (!POW_HEX64_RE.test(want) || headerHash !== want) {
+      const err = new Error(`Raw Bitcoin block header hash (${headerHash}) does not match expected (${want})`);
+      err.isBlockHashMismatch = true;
+      throw err;
+    }
+  }
+
+  let pos = 80;
+  const readVarInt = () => {
+    if (pos >= bytes.length) throw new Error('Unexpected EOF reading Bitcoin varint');
+    const b = bytes[pos++];
+    if (b < 0xfd) return b;
+    if (b === 0xfd) {
+      if (pos + 2 > bytes.length) throw new Error('Unexpected EOF reading uint16 varint');
+      const v = bytes[pos] | (bytes[pos + 1] << 8);
+      pos += 2;
+      return v;
+    }
+    if (b === 0xfe) {
+      if (pos + 4 > bytes.length) throw new Error('Unexpected EOF reading uint32 varint');
+      const v = (bytes[pos] | (bytes[pos + 1] << 8) | (bytes[pos + 2] << 16) | (bytes[pos + 3] << 24)) >>> 0;
+      pos += 4;
+      return v;
+    }
+    if (pos + 8 > bytes.length) throw new Error('Unexpected EOF reading uint64 varint');
+    let v = 0n;
+    for (let i = 0; i < 8; i++) v |= BigInt(bytes[pos + i]) << BigInt(8 * i);
+    pos += 8;
+    if (v > BigInt(bytes.length - pos)) throw new Error('Bitcoin varint exceeds remaining block bytes');
+    return Number(v);
+  };
+
+  const txCount = readVarInt();
+  if (txCount < 1 || txCount > 100_000) throw new Error(`Invalid Bitcoin block txCount: ${txCount}`);
+
+  const merkleLeaves = [];
+  const txids = new Set();
+
+  for (let t = 0; t < txCount; t++) {
+    const txStart = pos;
+    if (pos + 4 > bytes.length) throw new Error('Unexpected EOF reading tx version');
+    const versionEnd = (pos += 4);
+
+    let segwit = false;
+    if (pos + 2 <= bytes.length && bytes[pos] === 0x00 && bytes[pos + 1] === 0x01) {
+      segwit = true;
+      pos += 2;
+    }
+
+    const bodyStart = pos;
+    const vinCount = readVarInt();
+    if (vinCount < 1) throw new Error('Bitcoin transaction has zero inputs');
+    for (let i = 0; i < vinCount; i++) {
+      if (pos + 36 > bytes.length) throw new Error('Unexpected EOF reading tx input outpoint');
+      pos += 36;
+      const scriptLen = readVarInt();
+      if (pos + scriptLen + 4 > bytes.length) throw new Error('Unexpected EOF reading tx input scriptSig/sequence');
+      pos += scriptLen + 4;
+    }
+
+    const voutCount = readVarInt();
+    for (let o = 0; o < voutCount; o++) {
+      if (pos + 8 > bytes.length) throw new Error('Unexpected EOF reading tx output value');
+      pos += 8;
+      const pkLen = readVarInt();
+      if (pos + pkLen > bytes.length) throw new Error('Unexpected EOF reading tx output scriptPubKey');
+      pos += pkLen;
+    }
+    const bodyEnd = pos;
+
+    if (segwit) {
+      for (let i = 0; i < vinCount; i++) {
+        const itemCount = readVarInt();
+        for (let k = 0; k < itemCount; k++) {
+          const itemLen = readVarInt();
+          if (pos + itemLen > bytes.length) throw new Error('Unexpected EOF reading witness item');
+          pos += itemLen;
+        }
+      }
+    }
+
+    if (pos + 4 > bytes.length) throw new Error('Unexpected EOF reading tx locktime');
+    const lockStart = pos;
+    pos += 4;
+
+    const txForId = segwit
+      ? concatBytes(
+          bytes.subarray(txStart, versionEnd),
+          bytes.subarray(bodyStart, bodyEnd),
+          bytes.subarray(lockStart, pos),
+        )
+      : bytes.subarray(txStart, pos);
+    const txHashInternal = sha256d(txForId);
+    merkleLeaves.push(txHashInternal);
+    txids.add(bytesToHex(rev32Bytes(txHashInternal)));
+  }
+
+  if (pos !== bytes.length) {
+    throw new Error(`Bitcoin block has ${bytes.length - pos} trailing unparsed bytes`);
+  }
+
+  let level = merkleLeaves;
+  while (level.length > 1) {
+    const next = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const left = level[i];
+      const right = i + 1 < level.length ? level[i + 1] : left;
+      next.push(sha256d(concatBytes(left, right)));
+    }
+    level = next;
+  }
+
+  const headerMerkle = bytes.subarray(36, 68);
+  for (let i = 0; i < 32; i++) {
+    if (level[0][i] !== headerMerkle[i]) {
+      throw new Error('Bitcoin block Merkle root does not match header');
+    }
+  }
+
+  return { blockHash: headerHash, txids };
 }

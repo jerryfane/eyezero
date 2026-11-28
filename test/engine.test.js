@@ -1042,7 +1042,7 @@ describe('Signet production parameters and inscription build CLI', () => {
     assert.throws(() => signSwapFill(chainId, { ...fill, btcSats: '999999' }, taker.sk), /does not match/);
     assert.throws(() => signSwapFill(chainId, { ...fill, hashlock: undefined }, taker.sk), /set together/);
 
-    // BUY_I0 fill (no swapId/hashlock yet) also verifies cleanly
+    // BUY_I0 fill (no swapId/hashlock yet) + maker completion bind (signedBy: 'maker') both verify cleanly
     const buyFill = signSwapFill(chainId, {
       id: 'fill_buy_1',
       quoteId: q.id,
@@ -1057,6 +1057,30 @@ describe('Signet production parameters and inscription build CLI', () => {
       expiresAt: 2_000_000_000,
     }, taker.sk);
     assert.equal(verifySwapFill(chainId, buyFill), true);
+
+    const makerSwapId = computeSwapId(chainId, maker.pk, 1);
+    const makerBind = signSwapFill(chainId, {
+      id: 'bind_maker_1',
+      signedBy: 'maker',
+      quoteId: q.id,
+      quoteSig: q.sig,
+      takerFillId: buyFill.id,
+      takerFillSig: buyFill.sig,
+      maker: maker.pk,
+      taker: taker.pk,
+      side: 'BUY_I0',
+      rateSatsPerI0: q.rateSatsPerI0,
+      i0Amount: i0Amount.toString(),
+      btcSats: btcSats.toString(),
+      network: 'signet',
+      swapId: makerSwapId,
+      hashlock,
+      expiresAt: 2_000_000_000,
+    }, maker.sk);
+    assert.equal(verifySwapFill(chainId, makerBind), true);
+    assert.equal(verifySwapFill(chainId, { ...makerBind, takerFillSig: '00'.repeat(64) }), false);
+    assert.equal(verifySwapFill(chainId, { ...makerBind, sig: buyFill.sig }), false);
+    assert.throws(() => signSwapFill(chainId, { ...makerBind, swapId: undefined, hashlock: undefined }, maker.sk), /requires swapId and hashlock/);
   });
 
   it('computeBlockTradeStats matches exact settled gross turnover and uniform clearing price', () => {

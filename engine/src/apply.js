@@ -318,6 +318,8 @@ export function canonicalizeSwapFill(f) {
   if (f.network !== 'signet' && f.network !== 'regtest' && f.network !== 'mainnet') {
     throw new Error('Invalid swap fill network');
   }
+  const signedBy = f.signedBy ?? 'taker';
+  if (signedBy !== 'taker' && signedBy !== 'maker') throw new Error('Swap fill signedBy must be taker or maker');
   assertPubkey(f.maker, 'fill.maker');
   assertPubkey(f.taker, 'fill.taker');
   if (f.maker === f.taker) throw new Error('Swap fill maker and taker must differ');
@@ -338,12 +340,20 @@ export function canonicalizeSwapFill(f) {
   if (hasSwapId !== hasHashlock) throw new Error('Swap fill swapId and hashlock must be set together');
   if (hasSwapId && (typeof f.swapId !== 'string' || !HEX64_RE.test(f.swapId))) throw new Error('Invalid fill swapId');
   if (hasHashlock && (typeof f.hashlock !== 'string' || !HEX64_RE.test(f.hashlock))) throw new Error('Invalid fill hashlock');
+  if (signedBy === 'maker') {
+    if (f.side !== 'BUY_I0') throw new Error('Maker-bound swap fill must be for BUY_I0');
+    if (!hasSwapId || !hasHashlock) throw new Error('Maker-bound swap fill requires swapId and hashlock');
+    if (typeof f.takerFillId !== 'string' || !/^[A-Za-z0-9_-]{4,48}$/.test(f.takerFillId)) throw new Error('Invalid takerFillId');
+    if (typeof f.takerFillSig !== 'string' || !HEX128_RE.test(f.takerFillSig)) throw new Error('Invalid takerFillSig');
+  }
   const out = {
     v: 1,
     kind: 'SWAP_FILL',
+    ...(signedBy === 'maker' ? { signedBy: 'maker' } : {}),
     id: f.id,
     quoteId: f.quoteId,
     quoteSig: f.quoteSig,
+    ...(signedBy === 'maker' ? { takerFillId: f.takerFillId, takerFillSig: f.takerFillSig } : {}),
     maker: f.maker,
     taker: f.taker,
     side: f.side,
@@ -378,7 +388,8 @@ export function verifySwapFill(chainId, f) {
   if (!f || typeof f.sig !== 'string' || !HEX128_RE.test(f.sig)) return false;
   try {
     const canon = canonicalizeSwapFill(f);
-    return schnorrVerify(swapFillDigest(chainId, canon), canon.taker, canon.sig);
+    const signer = canon.signedBy === 'maker' ? canon.maker : canon.taker;
+    return schnorrVerify(swapFillDigest(chainId, canon), signer, canon.sig);
   } catch {
     return false;
   }
@@ -456,7 +467,7 @@ export function resolvePendingMempool(state, pendingTxs, { verifiedSigs = null }
 // Execute deterministic state transition for a list of transactions inside a block.
 // `skipSigVerify` is strictly internal for pre-verified batches inside previewPending/selectCandidateTxs;
 // consensus applyBlock() ALWAYS passes skipSigVerify=false.
-function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = false } = {}) {
+function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = false, tradeStats = null } = {}) {
   if (txs.length > params.maxTxsPerBlock) {
     throw new Error(`Block exceeds maxTxsPerBlock (${txs.length} > ${params.maxTxsPerBlock})`);
   }
@@ -574,14 +585,11 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
 
         if (initialBuy > 0n) {
           subBalance(next, tx.from, I0_TOKEN_ID, initialBuy);
-          const totalFee = (initialBuy * params.tradeFeeBps) / params.bpsDenom;
-          const creatorFee = totalFee / 2n;
-          const minerFee = totalFee - creatorFee;
+          const { creatorFee, minerFee, netI0: netB } = splitTradeFee(initialBuy, params);
           addBalance(next, tx.from, I0_TOKEN_ID, creatorFee);
           addBalance(next, miner, I0_TOKEN_ID, minerFee);
-          const netB = initialBuy - totalFee;
           if (netB <= 0n) throw new Error('initialBuy too small after fee');
-          getBatch(tokenId).buys.push({ from: tx.from, netB, minTokOut: 0n });
+          getBatch(tokenId).buys.push({ from: tx.from, grossI0: initialBuy, netB, minTokOut: 0n });
         }
         break;
       }
@@ -642,14 +650,11 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
         const minTokOut = parseAmount(tx.minTokOut ?? '0', 'minTokOut', true);
         const tok = next.tokens.get(tx.tokenId);
         subBalance(next, tx.from, I0_TOKEN_ID, i0In);
-        const totalFee = (i0In * params.tradeFeeBps) / params.bpsDenom;
-        const creatorFee = totalFee / 2n;
-        const minerFee = totalFee - creatorFee;
+        const { creatorFee, minerFee, netI0: netB } = splitTradeFee(i0In, params);
         addBalance(next, tok.creator, I0_TOKEN_ID, creatorFee);
         addBalance(next, miner, I0_TOKEN_ID, minerFee);
-        const netB = i0In - totalFee;
         if (netB <= 0n) throw new Error('BUY amount too small after fee');
-        getBatch(tx.tokenId).buys.push({ from: tx.from, netB, minTokOut });
+        getBatch(tx.tokenId).buys.push({ from: tx.from, grossI0: i0In, netB, minTokOut });
         break;
       }
 
@@ -675,21 +680,20 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
     const { buys, sells } = batches.get(tokenId);
 
     let B = 0n;
-    for (const o of buys) B += o.netB;
-    let S = 0n;
-    for (const o of sells) S += o.tokIn;
-    if (B === 0n && S === 0n) continue;
-
+    let grossBuyI0 = 0n;
+    for (const o of buys) {
+      B += o.netB;
+      grossBuyI0 += o.grossI0 ?? 0n;
+    }
     const X = tok.virtualI0 + tok.realI0;
     const Y = tok.realTok;
     const kBefore = X * Y;
-
-    const outTokTotal = B > 0n ? (B * (Y + S)) / (X + B) : 0n;
-    const outI0Total = S > 0n ? (S * (X + B)) / (Y + S) : 0n;
+    const clear = computeUniformBatchClear(X, Y, B, sells.map((o) => o.tokIn));
+    if (B === 0n && clear.S === 0n) continue;
 
     let actualPaidTok = 0n;
     for (const o of buys) {
-      const tokOut = (o.netB * outTokTotal) / B;
+      const tokOut = (o.netB * clear.outTokTotal) / B;
       if (tokOut < o.minTokOut) {
         throw new Error(`BUY slippage exceeded on token ${tokenId}: got ${tokOut} < min ${o.minTokOut}`);
       }
@@ -697,24 +701,20 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
       actualPaidTok += tokOut;
     }
 
-    let actualPaidI0 = 0n;
-    for (const o of sells) {
-      const grossI0 = (o.tokIn * outI0Total) / S;
-      const totalFee = (grossI0 * params.tradeFeeBps) / params.bpsDenom;
-      const creatorFee = totalFee / 2n;
-      const minerFee = totalFee - creatorFee;
-      const netI0 = grossI0 - totalFee;
+    for (let i = 0; i < sells.length; i++) {
+      const o = sells[i];
+      const grossI0 = clear.sellGrossI0s[i];
+      const { creatorFee, minerFee, netI0 } = splitTradeFee(grossI0, params);
       if (netI0 < o.minI0Out) {
         throw new Error(`SELL slippage exceeded on token ${tokenId}: got ${netI0} < min ${o.minI0Out}`);
       }
       addBalance(next, o.from, I0_TOKEN_ID, netI0);
       addBalance(next, tok.creator, I0_TOKEN_ID, creatorFee);
       addBalance(next, miner, I0_TOKEN_ID, minerFee);
-      actualPaidI0 += grossI0;
     }
 
-    const newRealI0 = tok.realI0 + B - actualPaidI0;
-    const newRealTok = tok.realTok + S - actualPaidTok;
+    const newRealI0 = tok.realI0 + B - clear.actualPaidI0;
+    const newRealTok = tok.realTok + clear.S - actualPaidTok;
     if (newRealI0 < 0n || newRealTok < 0n) {
       throw new Error(`Solvency violation on token ${tokenId}: realI0=${newRealI0}, realTok=${newRealTok}`);
     }
@@ -724,11 +724,45 @@ function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = 
     }
     tok.realI0 = newRealI0;
     tok.realTok = newRealTok;
+    if (tradeStats) {
+      tradeStats.set(tokenId, {
+        grossBuyI0,
+        netBuyI0: B,
+        sellTok: clear.S,
+        settledSellGrossI0: clear.actualPaidI0,
+        grossVolI0: grossBuyI0 + clear.actualPaidI0,
+        openPrice: Number(X) / Number(Y),
+        clearPrice: clear.clearPrice,
+      });
+    }
   }
 }
 
-// Compute exact settled gross turnover and uniform clearing price for each token traded in a batch,
-// matching executeBlockTxs() BigInt rounding bit-for-bit (zero synthetic wicks or closing-spot estimates).
+// Shared fee split & uniform batch clearing arithmetic (single source of truth for both settlement and OHLC stats).
+export function splitTradeFee(grossI0, params = V1_MAINNET_PARAMS) {
+  const totalFee = (grossI0 * params.tradeFeeBps) / params.bpsDenom;
+  const creatorFee = (totalFee * (params.creatorFeeNum ?? 1n)) / (params.creatorFeeDen ?? 2n);
+  const minerFee = totalFee - creatorFee;
+  return { totalFee, creatorFee, minerFee, netI0: grossI0 - totalFee };
+}
+
+function computeUniformBatchClear(X, Y, B, sellTokAmounts) {
+  let S = 0n;
+  for (const tokIn of sellTokAmounts) S += tokIn;
+  const outTokTotal = B > 0n ? (B * (Y + S)) / (X + B) : 0n;
+  const outI0Total = S > 0n ? (S * (X + B)) / (Y + S) : 0n;
+  const sellGrossI0s = [];
+  let actualPaidI0 = 0n;
+  for (const tokIn of sellTokAmounts) {
+    const grossI0 = (tokIn * outI0Total) / S;
+    sellGrossI0s.push(grossI0);
+    actualPaidI0 += grossI0;
+  }
+  return { S, outTokTotal, outI0Total, sellGrossI0s, actualPaidI0, clearPrice: Number(X + B) / Number(Y + S) };
+}
+
+// Compute exact settled gross turnover and uniform clearing price using the exact same shared
+// splitTradeFee() and computeUniformBatchClear() helpers as executeBlockTxs().
 export function computeBlockTradeStats(prevState, txs, params = V1_MAINNET_PARAMS) {
   const preTokens = new Map();
   for (const [tid, tok] of prevState.tokens.entries()) {
@@ -751,18 +785,18 @@ export function computeBlockTradeStats(prevState, txs, params = V1_MAINNET_PARAM
       }
       const initialBuy = BigInt(tx.initialBuy || '0');
       if (initialBuy > 0n) {
-        const totalFee = (initialBuy * params.tradeFeeBps) / params.bpsDenom;
+        const { netI0: netB } = splitTradeFee(initialBuy, params);
         const b = getBatch(tid);
         b.grossBuyI0 += initialBuy;
-        b.netBuyI0 += initialBuy - totalFee;
+        b.netBuyI0 += netB;
       }
     } else if (tx.type === 'BUY' && preTokens.has(tx.tokenId)) {
       const i0In = BigInt(tx.i0In || '0');
       if (i0In > 0n) {
-        const totalFee = (i0In * params.tradeFeeBps) / params.bpsDenom;
+        const { netI0: netB } = splitTradeFee(i0In, params);
         const b = getBatch(tx.tokenId);
         b.grossBuyI0 += i0In;
-        b.netBuyI0 += i0In - totalFee;
+        b.netBuyI0 += netB;
       }
     } else if (tx.type === 'SELL' && preTokens.has(tx.tokenId)) {
       const tokIn = BigInt(tx.tokIn || '0');
@@ -773,23 +807,18 @@ export function computeBlockTradeStats(prevState, txs, params = V1_MAINNET_PARAM
   for (const [tid, b] of batches.entries()) {
     const tok = preTokens.get(tid);
     if (!tok) continue;
-    const B = b.netBuyI0;
-    let S = 0n;
-    for (const tokIn of b.sells) S += tokIn;
-    if (B === 0n && S === 0n) continue;
     const X = tok.virtualI0 + tok.realI0;
     const Y = tok.realTok;
-    const outI0Total = S > 0n ? (S * (X + B)) / (Y + S) : 0n;
-    let settledSellGrossI0 = 0n;
-    for (const tokIn of b.sells) settledSellGrossI0 += (tokIn * outI0Total) / S;
+    const clear = computeUniformBatchClear(X, Y, b.netBuyI0, b.sells);
+    if (b.netBuyI0 === 0n && clear.S === 0n) continue;
     stats.set(tid, {
       grossBuyI0: b.grossBuyI0,
-      netBuyI0: B,
-      sellTok: S,
-      settledSellGrossI0,
-      grossVolI0: b.grossBuyI0 + settledSellGrossI0,
+      netBuyI0: b.netBuyI0,
+      sellTok: clear.S,
+      settledSellGrossI0: clear.actualPaidI0,
+      grossVolI0: b.grossBuyI0 + clear.actualPaidI0,
       openPrice: Number(X) / Number(Y),
-      clearPrice: Number(X + B) / Number(Y + S),
+      clearPrice: clear.clearPrice,
     });
   }
   return stats;

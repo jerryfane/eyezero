@@ -28,6 +28,8 @@ export const V1_MAINNET_PARAMS = Object.freeze({
   // 1.0% trading fee (100 bps) on the I0 side, split 50/50 between miner and token creator.
   tradeFeeBps: 100n,
   bpsDenom: 10_000n,
+  creatorFeeNum: 1n,
+  creatorFeeDen: 2n,
   // Flat launch fee paid in I0 (100% to block miner).
   launchFee: 10n * UNIT,
   // Permanent bonding-curve virtual I0 cushion and total token supply per launched token.

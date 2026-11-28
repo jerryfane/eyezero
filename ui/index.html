@@ -962,8 +962,8 @@
       const intPart = m[1] ?? '';
       const fracPart = m[2] ?? m[3] ?? '';
       const exp = m[4] ? Number(m[4]) : 0;
-      if (!Number.isSafeInteger(exp) || Math.abs(exp) > 100) {
-        return { ok: false, empty: false, error: 'Exponent out of supported range' };
+      if (!Number.isSafeInteger(exp)) {
+        return { ok: false, empty: false, error: 'Amount out of supported range' };
       }
       const digits = (intPart + fracPart).replace(/^0+/, '') || '0';
       if (digits === '0') {
@@ -971,6 +971,9 @@
         return { ok: true, value: 0n };
       }
       const shift = 8 + exp - fracPart.length;
+      if (digits.length + shift > 30) {
+        return { ok: false, empty: false, error: 'Amount exceeds maximum supported range' };
+      }
       let scaled;
       if (shift >= 0) {
         scaled = digits + '0'.repeat(shift);
@@ -1229,13 +1232,18 @@
       return { ok: true, tx, fee, slot, cacheKey };
     }
 
+    function insertSlotWithEviction(map, adm) {
+      map.set(adm.slot, { tx: adm.tx, fee: adm.fee });
+      if (map.size > MAX_MEMPOOL_SLOTS) map.delete(map.keys().next().value);
+      return map;
+    }
+
     function commitPendingTx(adm) {
       seenTxSigs.add(adm.tx.sig);
       verifiedSigs.add(adm.cacheKey);
       if (seenTxSigs.size > MAX_SEEN_SIGS) seenTxSigs.delete(seenTxSigs.values().next().value);
       if (verifiedSigs.size > MAX_SEEN_SIGS) verifiedSigs.delete(verifiedSigs.values().next().value);
-      pendingBySlot.set(adm.slot, { tx: adm.tx, fee: adm.fee });
-      if (pendingBySlot.size > MAX_MEMPOOL_SLOTS) pendingBySlot.delete(pendingBySlot.keys().next().value);
+      insertSlotWithEviction(pendingBySlot, adm);
       invalidateProjection();
     }
 
@@ -1260,14 +1268,10 @@
       if (!adm.ok) {
         throw new Error(adm.reason);
       }
-      // Project against the EXACT post-commit pool (including MAX_MEMPOOL_SLOTS eviction) BEFORE
-      // mutating pendingBySlot/seenTxSigs/verifiedSigs so a rejected submission can never evict
-      // unrelated orders and an accepted submission is guaranteed to survive its own commit.
-      const tentativeMap = new Map(pendingBySlot);
-      tentativeMap.set(adm.slot, { tx: adm.tx, fee: adm.fee });
-      if (tentativeMap.size > MAX_MEMPOOL_SLOTS) {
-        tentativeMap.delete(tentativeMap.keys().next().value);
-      }
+      // Project against the EXACT post-commit pool (using the shared insertSlotWithEviction helper) BEFORE
+      // mutating pendingBySlot/seenTxSigs/verifiedSigs so a rejected submission can never evict unrelated
+      // orders and an accepted submission is guaranteed to survive its own commit.
+      const tentativeMap = insertSlotWithEviction(new Map(pendingBySlot), adm);
       const tentativeList = [...tentativeMap.values()].map((entry) => entry.tx);
       const trialSigs = new Set(verifiedSigs);
       trialSigs.add(adm.cacheKey);
@@ -1751,16 +1755,35 @@
       }
     }
 
+    function validateLaunchMetaCompat({ ticker, name, artId }, params) {
+      if (typeof E.validateLaunchMetadata === 'function') {
+        return E.validateLaunchMetadata({ ticker, name, artId }, params);
+      }
+      // Backwards-compatible fallback when UI is pinned to an earlier v1 G_rules inscription without validateLaunchMetadata.
+      if (typeof ticker !== 'string' || ticker.length < 1 || ticker.length > params.maxTickerLen || !/^[A-Za-z0-9._-]+$/.test(ticker)) {
+        throw new Error(`Invalid ticker (must match ^[A-Za-z0-9._-]{1,${params.maxTickerLen}}$)`);
+      }
+      if (typeof name !== 'string' || name.length < 1 || name.length > params.maxNameLen || !/^[ -~]+$/.test(name) || /[<>&"'`]/.test(name)) {
+        throw new Error(`Invalid token name (printable ASCII 1..${params.maxNameLen} chars, no HTML metacharacters)`);
+      }
+      if (typeof artId !== 'string' || artId.length > params.maxArtIdLen || (artId !== '' && !E.isValidInscriptionId(artId))) {
+        throw new Error('Invalid Art Inscription ID: enter a valid <64-hex>i<index> ID or leave blank to default to Genesis.');
+      }
+      return { ticker, name, artId };
+    }
+
     function resolveLaunchArtId(s) {
       const rawArt = $('launch-art').value.trim();
       if (!rawArt) return { ok: true, artId: s.genesisId, defaulted: true };
-      if (rawArt.length > PARAMS.maxArtIdLen || !E.isValidInscriptionId(rawArt)) {
+      try {
+        validateLaunchMetaCompat({ ticker: 'A', name: 'A', artId: rawArt }, PARAMS);
+        return { ok: true, artId: rawArt, defaulted: false };
+      } catch {
         return {
           ok: false,
           error: 'Invalid Art Inscription ID: enter a valid <64-hex>i<index> ID or leave blank to default to Genesis.',
         };
       }
-      return { ok: true, artId: rawArt, defaulted: false };
     }
 
     function buildLaunchDraft(s) {
@@ -1773,7 +1796,7 @@
       if (!artRes.ok) errors.push(artRes.error);
       if (!initRes.ok) errors.push(initRes.error);
       try {
-        E.validateLaunchMetadata({ ticker, name, artId: artRes.ok ? artRes.artId : '' }, PARAMS);
+        validateLaunchMetaCompat({ ticker, name, artId: artRes.ok ? artRes.artId : '' }, PARAMS);
       } catch (metaErr) {
         errors.push(metaErr.message);
       }

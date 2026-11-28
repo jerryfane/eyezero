@@ -86,8 +86,8 @@ try {
   await f1.locator('#submit-buy').click();
 
   await f1.locator('#action-msg').filter({ hasText: 'gossiped live over Entmoot' }).waitFor({ timeout: 10_000 });
-  // Extract the exact signature & nonce of the newly admitted order from Tab 1's structured pending DOM!
-  const newRows = await f1.locator(`#token-pending-list [data-tx-from="${chosenPk}"][data-tx-token="${targetTokenId}"]`).evaluateAll(
+  // Extract the exact signature & nonce of the newly admitted order matching our uniqueAmt from Tab 1's DOM!
+  const newRows = await f1.locator(`#token-pending-list [data-tx-from="${chosenPk}"][data-tx-token="${targetTokenId}"]`, { hasText: `${uniqueAmt} I0` }).evaluateAll(
     (els) => els.map((e) => ({ sig: e.getAttribute('data-tx-sig'), nonce: e.getAttribute('data-tx-nonce') })),
   );
   const created = newRows.find((r) => r.sig && !priorSigs.has(r.sig));

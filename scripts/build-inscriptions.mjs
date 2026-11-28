@@ -144,7 +144,7 @@ const entmootOut = readFileSync(join(ROOT, 'ui', 'entmoot-lite.js'), 'utf8');
 checkJsSyntax(entmootOut, 'entmoot-lite.js');
 writeFileSync(join(OUT, 'entmoot-lite.js'), entmootOut, 'utf8');
 
-const emitLocalEntmootCfg = isDemo ? !opts['entmoot-cfg-id'] : Boolean(opts['entmoot-config']);
+const emitLocalEntmootCfg = !opts.offline && (isDemo ? !opts['entmoot-cfg-id'] : Boolean(opts['entmoot-config']));
 let entmootCfgOut = null;
 if (emitLocalEntmootCfg) {
   const entmootSrcPath = opts['entmoot-config']

@@ -1,266 +1,904 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>eyezero (i0) — Genesis Inscription</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>eyezero (i0) — Zero-MEV Bitcoin Token Protocol</title>
   <style>
-    :root {
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html {
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+      background: #000;
       color-scheme: dark;
-      --bg: #0f1012;
-      --panel: #141518;
-      --raise: #1b1d22;
-      --line: #23252a;
-      --line2: #31343c;
-      --ink: #ededef;
-      --ink2: #b8bbc4;
-      --mut: #838793;
-      --ok: #30a46c;
-      --warn: #e2a336;
-      --err: #e5484d;
-      --acc: #ededef;
-      --acc-ink: #111214;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
-      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 13px; line-height: 1.45; }
+    :root {
+      --font-sans: "Inter var", "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+      --bg: #000000;
+      --panel: #09090a;
+      --card: #0e0e10;
+      --raised: #17171a;
+      --hover: rgba(255,255,255,0.035);
+      --selected: rgba(255,255,255,0.075);
+
+      --line-1: rgba(255,255,255,0.06);
+      --line-2: rgba(255,255,255,0.095);
+      --line-3: rgba(255,255,255,0.145);
+      --line-4: rgba(255,255,255,0.24);
+
+      --ink-1: #ededef;
+      --ink-2: #a0a0a8;
+      --ink-3: #6c6c74;
+      --ink-4: #46464c;
+      --ink-inv: #0a0a0b;
+
+      --accent-a: #5ad8e6;
+      --accent-b: #ed4abf;
+      --accent: #f068c8;
+      --accent-soft: rgba(237,74,191,0.14);
+      --accent-line: rgba(237,74,191,0.35);
+      --accent-grad: linear-gradient(100deg, #5ad8e6, #ed4abf);
+
+      --ok: #3ecf8e;
+      --ok-soft: rgba(62,207,142,0.13);
+      --warn: #f5a524;
+      --warn-soft: rgba(245,165,36,0.13);
+      --bad: #ff6166;
+      --bad-soft: rgba(255,97,102,0.13);
+
+      --shadow-1: 0 1px 0 rgba(255,255,255,0.03) inset, 0 1px 2px rgba(0,0,0,0.55);
+      --r-chip: 6px;
+      --r-ctrl: 8px;
+      --r-card: 12px;
+      --r-panel: 16px;
+      --r-pill: 999px;
+      --sidebar-w: 220px;
+      --topbar-h: 52px;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--ink-1);
+      font-size: 13.5px;
+      line-height: 1.5;
+      min-height: 100dvh;
+      overflow-x: hidden;
+    }
     button, input, select { font: inherit; color: inherit; }
-    button { cursor: pointer; background: var(--raise); border: 1px solid var(--line2); border-radius: 6px; padding: 6px 11px; font-weight: 500; }
-    button:hover { background: #24272f; }
-    button.primary { background: var(--acc); color: var(--acc-ink); border-color: var(--acc); }
-    button.primary:hover { opacity: 0.92; }
-    button.sm { padding: 3px 8px; font-size: 12px; }
-    button:disabled { opacity: 0.45; cursor: not-allowed; }
-    input, select { background: var(--bg); border: 1px solid var(--line2); border-radius: 6px; padding: 6px 9px; width: 100%; }
-    input:focus, select:focus { outline: none; border-color: #6b707d; }
-    .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-    .mut { color: var(--mut); }
-    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-    .dot.ok { background: var(--ok); }
+    button { cursor: pointer; background: none; border: none; }
+    button:disabled { opacity: 0.42; cursor: not-allowed; }
+    svg { display: block; flex-shrink: 0; }
+    [hidden] { display: none !important; }
+    .num, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; font-size: 0.92em; }
+    .mut { color: var(--ink-2); }
+    .dim { color: var(--ink-3); }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+
+    .ambient {
+      position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background:
+        radial-gradient(56rem 24rem at 14% -8%, rgba(90,216,230,0.07), transparent 70%),
+        radial-gradient(48rem 24rem at 92% -10%, rgba(237,74,191,0.06), transparent 70%);
+    }
+
+    /* TOPBAR */
+    .topbar {
+      position: sticky; top: 0; z-index: 40;
+      height: var(--topbar-h);
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 0 16px 0 18px;
+      background: rgba(0,0,0,0.82);
+      backdrop-filter: blur(14px) saturate(160%);
+      -webkit-backdrop-filter: blur(14px) saturate(160%);
+      border-bottom: 1px solid var(--line-1);
+    }
+    .tb-left {
+      display: flex; align-items: center; gap: 10px;
+      min-width: calc(var(--sidebar-w) - 18px);
+    }
+    .brand-mark {
+      width: 22px; height: 22px; border-radius: 6px;
+      background: var(--accent-grad); color: #050507;
+      display: grid; place-items: center;
+      font-family: var(--font-mono); font-weight: 800; font-size: 11px;
+    }
+    .crumb { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13.5px; letter-spacing: -0.01em; }
+    .crumb .sep { color: var(--ink-4); font-weight: 400; }
+    .crumb .sub { color: var(--ink-2); font-weight: 500; }
+
+    .tb-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 7px;
+      height: 30px; padding: 0 11px;
+      border-radius: var(--r-pill);
+      background: var(--card); border: 1px solid var(--line-2);
+      font-size: 12px; font-weight: 500; color: var(--ink-1);
+      white-space: nowrap;
+      transition: border-color 0.14s ease, background 0.14s ease;
+    }
+    .pill:hover { border-color: var(--line-3); background: var(--raised); }
+    .dot { width: 6.5px; height: 6.5px; border-radius: 50%; background: var(--ink-3); flex-shrink: 0; }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
     .dot.warn { background: var(--warn); }
-    .dot.err { background: var(--err); }
+    .dot.err { background: var(--bad); }
 
-    header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 10; }
-    .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; letter-spacing: -0.01em; flex-wrap: wrap; }
-    .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line2); background: var(--bg); font-size: 11.5px; color: var(--ink2); }
-    .hdr-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .hdr-right select { width: auto; padding: 4px 8px; font-size: 12px; }
+    /* MOBILE HORIZONTAL NAV */
+    .mobile-nav {
+      display: none; gap: 6px; overflow-x: auto;
+      padding: 8px 12px; border-bottom: 1px solid var(--line-1); background: #000;
+      scrollbar-width: none;
+    }
+    .mobile-nav::-webkit-scrollbar { display: none; }
+    .m-item {
+      padding: 5px 11px; border-radius: var(--r-chip);
+      font-size: 12px; color: var(--ink-2); white-space: nowrap; flex-shrink: 0;
+      background: var(--card); border: 1px solid var(--line-1);
+    }
+    .m-item.active { background: var(--raised); color: var(--ink-1); border-color: var(--line-3); font-weight: 600; }
 
-    .grid { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.95fr); gap: 14px; max-width: 1260px; margin: 0 auto; padding: 14px 16px 28px; }
-    @media (max-width: 880px) { .grid { grid-template-columns: 1fr; } }
+    /* APP SHELL: SIDEBAR (#000) + INSET PANEL (#09090a) */
+    .shell { position: relative; z-index: 1; display: flex; min-height: calc(100dvh - var(--topbar-h)); }
+    .sidebar {
+      width: var(--sidebar-w); flex-shrink: 0;
+      padding: 12px 10px 16px;
+      display: flex; flex-direction: column; gap: 18px;
+    }
+    .nav-group { display: flex; flex-direction: column; gap: 2px; }
+    .nav-heading { padding: 0 10px 5px; font-size: 11px; font-weight: 550; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.04em; }
+    .nav-row {
+      display: flex; align-items: center; gap: 10px;
+      height: 33px; padding: 0 10px; border-radius: var(--r-ctrl);
+      font-size: 13px; color: var(--ink-2); text-align: left; width: 100%;
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+    .nav-row:hover { background: var(--hover); color: var(--ink-1); }
+    .nav-row.active { background: var(--selected); color: var(--ink-1); font-weight: 550; }
+    .nav-row svg { width: 15px; height: 15px; color: var(--ink-3); }
+    .nav-row.active svg { color: var(--accent-a); }
+    .nav-count { margin-left: auto; font-size: 11px; color: var(--ink-3); }
 
-    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
-    .card + .card { margin-top: 14px; }
-    .card-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 11px; }
-    .card-t { font-weight: 600; font-size: 13.5px; }
+    .signer-card {
+      margin-top: auto;
+      padding: 10px;
+      border-radius: var(--r-card);
+      border: 1px solid var(--line-1);
+      background: rgba(14,14,16,0.75);
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .signer-lbl { font-size: 11px; color: var(--ink-3); display: flex; justify-content: space-between; }
+    .signer-sel {
+      width: 100%; height: 30px; padding: 0 8px;
+      border-radius: var(--r-chip);
+      background: var(--panel); border: 1px solid var(--line-2);
+      font-size: 12px; color: var(--ink-1); outline: none;
+    }
 
-    .tokens { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
-    .tok { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 10px; cursor: pointer; text-align: left; }
-    .tok.on { border-color: var(--ink); background: var(--raise); }
-    .tok-sym { font-weight: 600; font-size: 13.5px; display: flex; justify-content: space-between; gap: 6px; }
-    .tok-sub { font-size: 11.5px; color: var(--mut); margin-top: 2px; }
-    .tok-stat { margin-top: 8px; font-size: 11.5px; color: var(--ink2); display: flex; justify-content: space-between; }
+    .main {
+      flex: 1; min-width: 0;
+      background: var(--panel);
+      border-top: 1px solid var(--line-1);
+      border-left: 1px solid var(--line-1);
+      border-top-left-radius: var(--r-panel);
+      padding: 22px 26px 48px;
+    }
+    .main-inner { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
 
-    .chart-box { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 10px; margin-top: 10px; }
-    .chart-box svg { width: 100%; height: 155px; display: block; }
-    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
-    @media (max-width: 600px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    .m-item { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 9px; }
-    .m-k { font-size: 11px; color: var(--mut); }
-    .m-v { font-size: 12.5px; font-weight: 600; margin-top: 2px; }
+    /* ACTION BANNER */
+    .msg-banner {
+      padding: 10px 14px; border-radius: var(--r-ctrl);
+      background: var(--card); border: 1px solid var(--line-3);
+      font-size: 12.5px; color: var(--ink-1);
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    }
+    .msg-banner.ok-b { border-color: rgba(62,207,142,0.38); background: rgba(62,207,142,0.08); }
+    .msg-banner.warn-b { border-color: rgba(245,165,36,0.38); background: rgba(245,165,36,0.08); }
 
-    .tabs { display: flex; gap: 4px; margin-bottom: 11px; border-bottom: 1px solid var(--line); padding-bottom: 8px; flex-wrap: wrap; }
-    .tabs button { background: transparent; border-color: transparent; color: var(--mut); padding: 5px 10px; }
-    .tabs button.on { background: var(--raise); border-color: var(--line2); color: var(--ink); }
+    /* OMP PRIMITIVES */
+    .card {
+      position: relative; border-radius: var(--r-card);
+      background:
+        linear-gradient(var(--card), var(--card)) padding-box,
+        linear-gradient(180deg, var(--line-3), var(--line-1) 42%) border-box;
+      border: 1px solid transparent; box-shadow: var(--shadow-1); min-width: 0;
+    }
+    .card-h {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      gap: 12px; padding: 15px 18px 0; flex-wrap: wrap;
+    }
+    .card-t { font-size: 14px; font-weight: 550; letter-spacing: -0.005em; }
+    .card-d { font-size: 12px; color: var(--ink-3); margin-top: 1px; }
+    .card-b { padding: 14px 18px 18px; }
 
-    .field { margin-bottom: 9px; }
-    .field label { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--mut); margin-bottom: 4px; }
-    .row { display: flex; gap: 8px; align-items: center; }
-    .row > * { flex: 1; }
-    .quote { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 12px; margin: 9px 0; }
-    .q-line { display: flex; justify-content: space-between; padding: 2px 0; gap: 8px; }
+    .h-row { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .h-sub { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
 
-    .list { display: flex; flex-direction: column; gap: 6px; }
-    .item { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 12px; }
-    .item-l { min-width: 0; word-break: break-all; }
-    .item-r { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 2px 7px; border-radius: var(--r-chip);
+      background: var(--raised); border: 1px solid var(--line-2);
+      font-size: 11px; font-weight: 500; color: var(--ink-2);
+    }
+    .chip.ok { background: var(--ok-soft); border-color: rgba(62,207,142,0.3); color: var(--ok); }
+    .chip.warn { background: var(--warn-soft); border-color: rgba(245,165,36,0.3); color: var(--warn); }
+    .chip.acc { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent); }
 
-    .blk-row { cursor: pointer; }
-    .blk-row.on { border-color: var(--ink); }
-    pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 9px; overflow: auto; max-height: 220px; font-size: 11px; margin: 8px 0 0; }
-    .toast { font-size: 12px; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--line2); background: var(--raise); margin-top: 8px; word-break: break-word; }
-    .warn-box { font-size: 11.5px; padding: 7px 9px; border-radius: 6px; border: 1px solid #4a3a18; background: #1e1910; color: #e2b857; margin-bottom: 9px; }
-    .code-inline { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px; font-family: var(--mono); font-size: 11px; display: block; overflow-x: auto; margin-top: 4px; word-break: break-all; }
+    .seg {
+      display: inline-flex; align-items: center; padding: 2px; max-width: 100%; overflow-x: auto; scrollbar-width: none;
+      border-radius: var(--r-ctrl); background: var(--panel); border: 1px solid var(--line-2); gap: 1px;
+    }
+    .seg::-webkit-scrollbar { display: none; }
+    .seg-opt {
+      height: 28px; padding: 0 11px; border-radius: 6px;
+      font-size: 12px; font-weight: 500; color: var(--ink-3);
+      display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+      white-space: nowrap; transition: all 0.12s ease;
+    }
+    .seg-opt:hover { color: var(--ink-2); }
+    .seg-opt.active {
+      background: var(--raised); color: var(--ink-1);
+      border: 1px solid var(--line-3); box-shadow: 0 1px 2px rgba(0,0,0,0.45);
+    }
+
+    /* Unified KPI Strip */
+    .kpi-strip { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); overflow: hidden; }
+    .kpi { padding: 14px 17px 12px; border-right: 1px solid var(--line-1); display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .kpi:last-child { border-right: none; }
+    .kpi-k { font-size: 12px; color: var(--ink-2); }
+    .kpi-v { font-size: 21px; font-weight: 600; letter-spacing: -0.025em; margin-top: 2px; }
+    .kpi-s { font-size: 11.5px; color: var(--ink-3); }
+    .spark { width: 100%; height: 24px; margin-top: 7px; }
+
+    /* Grids */
+    .g2-rev { display: grid; grid-template-columns: minmax(280px, 0.88fr) minmax(0, 1.55fr); gap: 16px; align-items: start; }
+    .g2-eq { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
+    .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    .center-narrow { max-width: 560px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+
+    /* Tables */
+    .tbl-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th { text-align: left; font-size: 11px; font-weight: 500; color: var(--ink-3); padding: 8px 12px; border-bottom: 1px solid var(--line-1); white-space: nowrap; }
+    th:first-child, td:first-child { padding-left: 18px; }
+    th:last-child, td:last-child { padding-right: 18px; }
+    td { padding: 10px 12px; border-bottom: 1px solid var(--line-1); white-space: nowrap; }
+    tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: var(--hover); }
+    tbody tr.clickable { cursor: pointer; }
+    tbody tr.selected { background: var(--selected); }
+    .r { text-align: right; }
+
+    /* Inputs & Buttons */
+    .field {
+      background: var(--panel); border: 1px solid var(--line-2);
+      border-radius: var(--r-ctrl); padding: 10px 12px; margin-bottom: 10px;
+      transition: border-color 0.12s ease;
+    }
+    .field:focus-within { border-color: var(--line-4); }
+    .field-t { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink-3); margin-bottom: 4px; gap: 8px; }
+    .field-in {
+      width: 100%; background: transparent; border: none; outline: none;
+      font-size: 14px; color: var(--ink-1);
+    }
+    .field-in.big { font-size: 20px; font-weight: 600; }
+    .field-sel {
+      width: 100%; background: var(--panel); border: 1px solid var(--line-2);
+      border-radius: var(--r-chip); height: 32px; padding: 0 9px;
+      font-size: 12.5px; color: var(--ink-1); outline: none;
+    }
+    .btn-primary {
+      width: 100%; height: 37px; border-radius: var(--r-ctrl);
+      background: var(--ink-1); color: var(--ink-inv);
+      font-size: 13px; font-weight: 600;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      transition: opacity 0.12s ease;
+    }
+    .btn-primary:hover:not(:disabled) { opacity: 0.9; }
+    .btn-primary.sm { width: auto; height: 30px; padding: 0 12px; font-size: 12px; }
+    .btn-primary.sell { background: var(--bad); color: #fff; }
+    .btn-ghost {
+      height: 30px; padding: 0 11px; border-radius: var(--r-chip);
+      background: var(--panel); border: 1px solid var(--line-2);
+      font-size: 12px; font-weight: 500; color: var(--ink-2);
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      transition: all 0.12s ease;
+    }
+    .btn-ghost:hover:not(:disabled) { background: var(--raised); color: var(--ink-1); border-color: var(--line-3); }
+
+    .kv-list { display: flex; flex-direction: column; gap: 7px; font-size: 12.5px; }
+    .kv { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: var(--ink-2); }
+    .kv strong { color: var(--ink-1); font-weight: 550; }
+    .div-line { height: 1px; background: var(--line-1); margin: 12px 0; }
+
+    .code-inline {
+      display: block; padding: 8px 10px; margin-top: 5px;
+      border-radius: var(--r-chip);
+      background: var(--panel); border: 1px solid var(--line-2);
+      font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-1);
+      word-break: break-all;
+    }
+    .quote-box {
+      padding: 11px 13px; border-radius: var(--r-ctrl);
+      background: var(--panel); border: 1px solid var(--line-2);
+      display: flex; flex-direction: column; gap: 6px; font-size: 12px;
+      margin-bottom: 12px;
+    }
+    .q-line { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+
+    .art-sq {
+      width: 34px; height: 34px; border-radius: 8px;
+      background: var(--panel); border: 1px solid var(--line-2);
+      display: grid; place-items: center; flex-shrink: 0; overflow: hidden;
+    }
+    .art-sq.xl { width: 126px; height: 126px; border-radius: 14px; border-color: var(--line-3); }
+    .art-sq.lg { width: 64px; height: 64px; border-radius: 11px; }
+
+    .step-bar { display: flex; align-items: center; justify-content: center; gap: 12px; font-size: 12px; flex-wrap: wrap; }
+    .step-pill { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); padding: 4px 8px; border-radius: var(--r-chip); }
+    .step-pill.active { color: var(--ink-1); font-weight: 600; background: var(--card); border: 1px solid var(--line-2); }
+    .step-num {
+      width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center;
+      font-size: 11px; font-weight: 700;
+      background: var(--raised); border: 1px solid var(--line-2); color: var(--ink-2);
+    }
+    .step-pill.active .step-num { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent); }
+    .step-pill.done .step-num { background: var(--ok-soft); border-color: rgba(62,207,142,0.4); color: var(--ok); }
+
+    .pct-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 12px; }
+    .pct-btn {
+      height: 27px; border-radius: var(--r-chip);
+      background: var(--panel); border: 1px solid var(--line-2);
+      font-size: 11.5px; color: var(--ink-2);
+    }
+    .pct-btn:hover { background: var(--raised); color: var(--ink-1); border-color: var(--line-3); }
+
+    pre.json-box {
+      padding: 12px 14px; border-radius: var(--r-ctrl);
+      background: var(--panel); border: 1px solid var(--line-2);
+      font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-2);
+      overflow-x: auto; max-height: 320px; white-space: pre-wrap; word-break: break-word;
+    }
+
+    @media (max-width: 920px) {
+      .sidebar { display: none; }
+      .mobile-nav { display: flex; }
+      .tb-left { min-width: 0; }
+      .main { border-left: none; border-top-left-radius: 0; padding: 14px 12px 36px; }
+      .kpi-strip { grid-template-columns: repeat(2, 1fr); }
+      .kpi:nth-child(2) { border-right: none; }
+      .kpi:nth-child(1), .kpi:nth-child(2) { border-bottom: 1px solid var(--line-1); }
+      .g2-rev, .g2-eq { grid-template-columns: 1fr; }
+      .hide-sm { display: none; }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <span>eyezero <span class="mono mut">i0</span></span>
-      <span class="pill" id="sync-pill"><span class="dot warn"></span>Syncing chain…</span>
-      <span class="pill" id="net-pill"><span class="dot warn"></span>Entmoot connecting…</span>
-      <span class="pill mono" id="tip-pill">Block #0</span>
+  <div class="ambient"></div>
+
+  <!-- TOPBAR -->
+  <header class="topbar">
+    <div class="tb-left">
+      <div class="brand-mark">i0</div>
+      <div class="crumb">
+        <span>eyezero</span>
+        <span class="sep">/</span>
+        <span class="sub" id="topbar-crumb">Explore</span>
+      </div>
     </div>
-    <div class="hdr-right">
-      <span class="pill mono" id="bal-pill">0 I0</span>
-      <select id="wallet-select" aria-label="Active wallet"></select>
-      <button class="primary sm" id="mine-btn">Simulate Local Block</button>
+    <div class="tb-right">
+      <button class="pill" id="sync-pill" title="Click to open Verify Proofs">
+        <span class="dot warn"></span>Syncing…
+      </button>
+      <div class="pill" id="net-pill">
+        <span class="dot warn"></span>Entmoot connecting…
+      </div>
+      <button class="pill num" id="bal-pill" title="Open Wallet">0.00 I0</button>
     </div>
   </header>
 
-  <main class="grid">
-    <section>
-      <div class="card">
-        <div class="card-h">
-          <span class="card-t">Launchpad Curves <span class="mut" style="font-weight:400">(Permanent x·y=k · 0.5% Miner / 0.5% Creator)</span></span>
-          <button class="sm" id="show-launch-btn">+ Launch Token</button>
-        </div>
-        <div class="tokens" id="token-grid"></div>
-        <div class="chart-box">
-          <div class="card-h" style="margin-bottom:4px">
-            <span class="mono" id="chart-title">—</span>
-            <span class="mut" style="font-size:11.5px" id="chart-sub">Select a token</span>
-          </div>
-          <svg id="curve-svg" viewBox="0 0 560 155"></svg>
-        </div>
-        <div class="metrics" id="token-metrics"></div>
+  <!-- MOBILE HORIZONTAL NAV -->
+  <nav class="mobile-nav" id="mobile-nav">
+    <button class="m-item active" data-page="explore">Explore</button>
+    <button class="m-item" data-page="token">Token</button>
+    <button class="m-item" data-page="launch">Launch</button>
+    <button class="m-item" data-page="swap">Swap BTC</button>
+    <button class="m-item" data-page="wallet">Wallet</button>
+    <button class="m-item" data-page="verify">Verify</button>
+  </nav>
+
+  <!-- SHELL -->
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="nav-group">
+        <div class="nav-heading">Markets</div>
+        <button class="nav-row active" data-page="explore">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>
+          Explore
+          <span class="nav-count num" id="nav-tok-count">0</span>
+        </button>
+        <button class="nav-row" data-page="token">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 8c2.2-3.2 4-4.5 6-4.5S11.8 4.8 14 8c-2.2 3.2-4 4.5-6 4.5S4.2 11.2 2 8z"/><circle cx="8" cy="8" r="2"/></svg>
+          <span id="nav-token-label">Token Detail</span>
+        </button>
+        <button class="nav-row" data-page="launch">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10"/></svg>
+          Launch token
+        </button>
       </div>
 
-      <div class="card">
-        <div class="card-h">
-          <span class="card-t">Verified eyezero Chain <span class="mut" id="chain-mode-sub" style="font-weight:400">(Ord Inscriptions)</span></span>
-          <button class="sm" id="mev-test-btn">Verify Zero-MEV Shuffle</button>
-        </div>
-        <div class="list" id="block-list"></div>
-        <pre class="mono" id="block-json" hidden></pre>
-        <div class="toast" id="mev-result" hidden></div>
-      </div>
-    </section>
-
-    <aside>
-      <div class="card">
-        <div class="tabs" id="action-tabs">
-          <button class="on" data-tab="buy">Buy</button>
-          <button data-tab="sell">Sell</button>
-          <button data-tab="launch">Launch</button>
-          <button data-tab="htlc">BTC HTLC</button>
-          <button data-tab="wallet">Wallet</button>
-        </div>
-
-        <div id="tab-buy">
-          <div class="field">
-            <label><span>Amount (I0)</span><span class="mono" id="buy-avail">Avail: 0</span></label>
-            <input id="buy-amount" type="number" min="0.01" step="1" value="25">
-          </div>
-          <div class="field">
-            <label><span>Max slippage (%)</span><span class="mut">Protects minTokOut</span></label>
-            <input id="buy-slip" type="number" min="0" max="99" step="1" value="15">
-          </div>
-          <div class="quote" id="buy-quote"></div>
-          <button class="primary" style="width:100%" id="submit-buy">Sign &amp; Broadcast Buy (#i0-tx)</button>
-        </div>
-
-        <div id="tab-sell" hidden>
-          <div class="field">
-            <label><span>Amount (Tokens)</span><span class="mono" id="sell-avail">Avail: 0</span></label>
-            <input id="sell-amount" type="number" min="1" step="1000" value="100000">
-          </div>
-          <div class="field">
-            <label><span>Max slippage (%)</span><span class="mut">Protects minI0Out</span></label>
-            <input id="sell-slip" type="number" min="0" max="99" step="1" value="15">
-          </div>
-          <div class="quote" id="sell-quote"></div>
-          <button class="primary" style="width:100%" id="submit-sell">Sign &amp; Broadcast Sell (#i0-tx)</button>
-        </div>
-
-        <div id="tab-launch" hidden>
-          <div class="row">
-            <div class="field">
-              <label><span>Ticker (A-Z, 0-9, . _ -)</span></label>
-              <input id="launch-ticker" maxlength="12" value="PEPE0">
-            </div>
-            <div class="field">
-              <label><span>Initial Buy (I0, optional)</span></label>
-              <input id="launch-init" type="number" min="0" step="1" value="10">
-            </div>
-          </div>
-          <div class="field">
-            <label><span>Token Name</span></label>
-            <input id="launch-name" maxlength="32" value="Pepe Zero">
-          </div>
-          <div class="quote">
-            <div class="q-line"><span class="mut">Launch fee (to miner)</span><span class="mono">10 I0</span></div>
-            <div class="q-line"><span class="mut">Creator royalty forever</span><span class="mono">0.5% in I0</span></div>
-          </div>
-          <button class="primary" style="width:100%" id="submit-launch">Sign &amp; Launch Token</button>
-        </div>
-
-        <div id="tab-htlc" hidden>
-          <div class="warn-box" id="htlc-safety-banner">
-            Safety lock: Mainnet BTC funding is disabled. Simulated demo escrows are never fundable. Before locking I0, generate and back up Secret S (session-only — lost on reload!).
-          </div>
-          <div class="row">
-            <div class="field">
-              <label><span>Lock I0 for BTC Swap</span></label>
-              <input id="htlc-amount" type="number" min="1" step="1" value="20">
-            </div>
-            <div class="field">
-              <label><span>Counterparty</span></label>
-              <select id="htlc-recipient"></select>
-            </div>
-          </div>
-          <div class="field">
-            <label><span>Bitcoin HTLC Network</span><span class="mut">Signet / Regtest preview</span></label>
-            <select id="htlc-net">
-              <option value="signet">Bitcoin Signet (tb1p…)</option>
-              <option value="regtest">Bitcoin Regtest (bcrt1p…)</option>
-            </select>
-          </div>
-          <button style="width:100%;margin-bottom:6px" id="htlc-prep-secret-btn">Step 1: Generate &amp; Back Up Swap Secret S</button>
-          <div class="quote" id="htlc-secret-backup" hidden></div>
-          <button class="primary" style="width:100%" id="submit-htlc" disabled>Step 2: Sign &amp; Queue I0 HTLC_LOCK</button>
-          <div class="list" id="htlc-list" style="margin-top:10px"></div>
-        </div>
-
-        <div id="tab-wallet" hidden>
-          <div class="warn-box">
-            Session-only key: the strict inscription sandbox does not persist keys across page reloads. Export your hex key before reloading if you want to keep it. Never use demo keys for real BTC.
-          </div>
-          <div class="quote">
-            <div class="q-line"><span class="mut">Active Pubkey (BIP-340 x-only)</span></div>
-            <span class="code-inline" id="wallet-pk-box">—</span>
-            <div class="q-line" style="margin-top:6px">
-              <span class="mut">Session Key (in memory only)</span>
-              <button class="sm" id="wallet-reveal-btn">Reveal Hex</button>
-            </div>
-            <span class="code-inline" id="wallet-sk-box" hidden></span>
-          </div>
-          <div class="field">
-            <label><span>Import 32-byte hex private key (session only)</span></label>
-            <input id="wallet-import-sk" class="mono" placeholder="64 hex chars">
-          </div>
-          <div class="row">
-            <button id="wallet-import-btn">Import Key</button>
-            <button id="wallet-new-btn">Generate New</button>
-          </div>
-          <div class="row" style="margin-top:8px">
-            <button class="primary" id="wallet-faucet-btn">Demo Faucet (+100 I0 to Session Key)</button>
-          </div>
-        </div>
-
-        <div class="toast" id="action-msg" hidden></div>
+      <div class="nav-group">
+        <div class="nav-heading">Account</div>
+        <button class="nav-row" data-page="swap">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 5h10l-2.5-2.5M13 11H3l2.5 2.5"/></svg>
+          Swap BTC &harr; i0
+          <span class="nav-count num" id="nav-htlc-count">0</span>
+        </button>
+        <button class="nav-row" data-page="wallet">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="M10.5 8h3.5"/></svg>
+          Wallet
+        </button>
       </div>
 
-      <div class="card">
-        <div class="card-h">
-          <span class="card-t">Pending Mempool <span class="mono mut">#i0-tx</span></span>
-          <span class="mut" style="font-size:11.5px" id="mempool-count">0 pending</span>
-        </div>
-        <div class="list" id="mempool-list"></div>
+      <div class="nav-group">
+        <div class="nav-heading">Protocol</div>
+        <button class="nav-row" data-page="verify">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 2l5 2.2v3.6c0 3.1-2.1 5.3-5 6.2-2.9-.9-5-3.1-5-6.2V4.2L8 2z"/></svg>
+          Verify proofs
+          <span class="nav-count num" id="nav-mempool-count">0</span>
+        </button>
+      </div>
+
+      <div class="signer-card">
+        <div class="signer-lbl"><span>Active signer</span><span class="dim" id="signer-mode">Demo</span></div>
+        <select class="signer-sel" id="wallet-select" aria-label="Active Signer"></select>
       </div>
     </aside>
-  </main>
+
+    <main class="main">
+      <div class="main-inner">
+        <div class="msg-banner" id="action-msg" hidden></div>
+
+        <!-- ================================================================
+             PAGE 1: EXPLORE (Option A — OMP KPI Strip + Dense Market Table)
+             ================================================================ -->
+        <section id="view-explore" class="col">
+          <div class="h-row">
+            <div>
+              <h1>Explore markets <span class="chip" id="chain-mode-chip">Syncing</span></h1>
+              <div class="h-sub" id="chain-mode-sub">Bitcoin-native tokens with uniform batch clearing (0% MEV)</div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-ghost" id="explore-swap-btn">Swap BTC &harr; i0</button>
+              <button class="btn-primary sm" id="explore-launch-btn">+ Launch token</button>
+            </div>
+          </div>
+
+          <section class="card kpi-strip" id="explore-kpis"></section>
+
+          <section class="card">
+            <div class="card-h" style="padding-bottom:12px">
+              <div class="seg" id="explore-sort">
+                <button class="seg-opt active" data-sort="reserve">Top Liquidity</button>
+                <button class="seg-opt" data-sort="holdings">My Holdings</button>
+                <button class="seg-opt" data-sort="all">All</button>
+              </div>
+              <input class="field-in num" id="explore-search" style="max-width:220px;height:30px;padding:0 10px;background:var(--panel);border:1px solid var(--line-2);border-radius:7px;font-size:12px" placeholder="Search ticker or ID…" />
+            </div>
+            <div class="tbl-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Token</th>
+                    <th class="r">Spot Price (I0)</th>
+                    <th class="r hide-sm">Pending Move</th>
+                    <th class="r">Pool Reserve</th>
+                    <th class="r hide-sm">You Hold</th>
+                    <th class="r"></th>
+                  </tr>
+                </thead>
+                <tbody id="explore-tbody" class="num"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <!-- ================================================================
+             PAGE 2: TOKEN DETAIL (Option C — Ordinals Art-First + Curve)
+             ================================================================ -->
+        <section id="view-token" class="col" hidden>
+          <div class="h-row">
+            <button class="btn-ghost" id="token-back-btn">&larr; Back to Explore</button>
+            <span class="chip acc num" id="token-batch-chip">0 orders queued · 0% MEV</span>
+          </div>
+
+          <div class="g2-rev">
+            <!-- Left: Ordinals Art Showcase + Provenance -->
+            <section class="card card-b" style="display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px">
+              <div class="art-sq xl" id="token-art-box"></div>
+              <div>
+                <h1 style="justify-content:center;font-size:18px" id="token-title">—</h1>
+                <div class="dim num" style="font-size:11.5px;margin-top:3px" id="token-prov">—</div>
+              </div>
+              <div class="div-line" style="width:100%;margin:4px 0"></div>
+              <div class="kv-list" style="width:100%" id="token-metrics"></div>
+            </section>
+
+            <!-- Right: Bonding Curve + Horizontal Buy/Sell Trade Composer -->
+            <div class="col">
+              <section class="card">
+                <div class="card-h">
+                  <div>
+                    <div class="card-t" id="chart-title">Bonding Curve</div>
+                    <div class="card-d num" id="chart-sub">—</div>
+                  </div>
+                  <span class="chip ok">Uniform clearing</span>
+                </div>
+                <div class="card-b">
+                  <svg id="curve-svg" viewBox="0 0 580 165" style="width:100%;height:175px"></svg>
+                </div>
+              </section>
+
+              <section class="card card-b">
+                <div class="h-row" style="margin-bottom:12px">
+                  <div class="seg" id="trade-side-seg">
+                    <button class="seg-opt active" data-side="buy">Buy</button>
+                    <button class="seg-opt" data-side="sell">Sell</button>
+                  </div>
+                  <span class="num dim" id="trade-avail-lbl">Avail: 0.00 I0</span>
+                </div>
+
+                <div id="trade-buy-pane">
+                  <div class="g2-eq">
+                    <div>
+                      <div class="field">
+                        <div class="field-t"><span>Pay I0</span><span class="num" id="buy-avail">Avail: 0.00 I0</span></div>
+                        <input class="field-in big num" id="buy-amount" type="number" step="any" min="0" value="10" />
+                      </div>
+                      <div class="pct-row num">
+                        <button class="pct-btn" data-buy-pct="0.1">10%</button>
+                        <button class="pct-btn" data-buy-pct="0.25">25%</button>
+                        <button class="pct-btn" data-buy-pct="0.5">50%</button>
+                        <button class="pct-btn" data-buy-pct="1">Max</button>
+                      </div>
+                      <div class="field" style="margin-bottom:0">
+                        <div class="field-t"><span>Max slippage (%)</span></div>
+                        <input class="field-in num" id="buy-slip" type="number" min="0" max="99" value="15" />
+                      </div>
+                    </div>
+                    <div style="display:flex;flex-direction:column;justify-content:space-between;height:100%">
+                      <div class="quote-box" id="buy-quote"></div>
+                      <button class="btn-primary" id="submit-buy">Sign &amp; Place Buy Order</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div id="trade-sell-pane" hidden>
+                  <div class="g2-eq">
+                    <div>
+                      <div class="field">
+                        <div class="field-t"><span>Sell tokens</span><span class="num" id="sell-avail">Avail: 0</span></div>
+                        <input class="field-in big num" id="sell-amount" type="number" step="any" min="0" value="1000" />
+                      </div>
+                      <div class="pct-row num">
+                        <button class="pct-btn" data-sell-pct="0.25">25%</button>
+                        <button class="pct-btn" data-sell-pct="0.5">50%</button>
+                        <button class="pct-btn" data-sell-pct="0.75">75%</button>
+                        <button class="pct-btn" data-sell-pct="1">Max</button>
+                      </div>
+                      <div class="field" style="margin-bottom:0">
+                        <div class="field-t"><span>Max slippage (%)</span></div>
+                        <input class="field-in num" id="sell-slip" type="number" min="0" max="99" value="15" />
+                      </div>
+                    </div>
+                    <div style="display:flex;flex-direction:column;justify-content:space-between;height:100%">
+                      <div class="quote-box" id="sell-quote"></div>
+                      <button class="btn-primary sell" id="submit-sell">Sign &amp; Place Sell Order</button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <section class="card">
+            <div class="card-h" style="padding-bottom:10px">
+              <div>
+                <div class="card-t">Pending next batch orders</div>
+                <div class="card-d">Broadcast over Entmoot P2P · all trades settle at one uniform price</div>
+              </div>
+              <span class="chip num" id="token-pending-count">0 active</span>
+            </div>
+            <div class="card-b" style="padding-top:4px" id="token-pending-list"></div>
+          </section>
+        </section>
+
+        <!-- ================================================================
+             PAGE 3: LAUNCH TOKEN (Option B — Centered Focused 3-Step Card)
+             ================================================================ -->
+        <section id="view-launch" class="center-narrow" hidden>
+          <div style="text-align:center">
+            <h1 style="justify-content:center">Launch a Bitcoin token</h1>
+            <div class="h-sub">Fair bonding curve · zero pre-mine · 0.5% creator royalty forever</div>
+          </div>
+
+          <div class="step-bar" id="launch-steps">
+            <button class="step-pill active" data-lstep="1"><span class="step-num">1</span>Identity</button>
+            <span class="dim">&rarr;</span>
+            <button class="step-pill" data-lstep="2"><span class="step-num">2</span>Curve &amp; Fee</button>
+            <span class="dim">&rarr;</span>
+            <button class="step-pill" data-lstep="3"><span class="step-num">3</span>Sign</button>
+          </div>
+
+          <section class="card card-b">
+            <div id="lstep-1">
+              <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+                <div class="art-sq lg" id="launch-art-preview"></div>
+                <div>
+                  <div style="font-weight:600">Token Identity &amp; Ordinals Art</div>
+                  <div class="mut" style="font-size:12px">Plain-text ticker &amp; name; immutable launch-bound tokenId</div>
+                </div>
+              </div>
+              <div class="field">
+                <div class="field-t"><span>Ticker (2–10 uppercase A–Z / 0–9)</span></div>
+                <input class="field-in num" id="launch-ticker" maxlength="10" placeholder="CYBER" value="SAT0" />
+              </div>
+              <div class="field">
+                <div class="field-t"><span>Token name</span></div>
+                <input class="field-in" id="launch-name" maxlength="40" placeholder="Satoshi Zero" value="Satoshi Zero" />
+              </div>
+              <div class="field">
+                <div class="field-t"><span>Art Inscription ID (optional — defaults to Genesis)</span></div>
+                <input class="field-in num" id="launch-art" placeholder="64-hex...i0" />
+              </div>
+              <button class="btn-primary" id="launch-next-1">Review Curve &amp; Fee &rarr;</button>
+            </div>
+
+            <div id="lstep-2" hidden>
+              <div class="field">
+                <div class="field-t"><span>Optional initial buy (I0)</span><span class="dim">0 for pure fair launch</span></div>
+                <input class="field-in big num" id="launch-init" type="number" step="any" min="0" value="0" />
+              </div>
+              <div class="quote-box">
+                <div class="q-line"><span class="mut">Protocol launch fee</span><strong class="num">10.00 I0</strong></div>
+                <div class="q-line"><span class="mut">Creator royalty (forever)</span><strong class="num ok">0.5% in I0</strong></div>
+                <div class="q-line"><span class="mut">Miner batch fee</span><strong class="num">0.5% in I0</strong></div>
+                <div class="q-line"><span class="mut">MEV protection</span><strong>Uniform batch clearing</strong></div>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button class="btn-ghost" id="launch-prev-2">&larr; Back</button>
+                <button class="btn-primary" style="flex:1" id="launch-next-2">Continue to Sign &rarr;</button>
+              </div>
+            </div>
+
+            <div id="lstep-3" hidden>
+              <div class="quote-box" id="launch-review-box"></div>
+              <div style="display:flex;gap:8px">
+                <button class="btn-ghost" id="launch-prev-3">&larr; Back</button>
+                <button class="btn-primary" style="flex:1" id="submit-launch">Sign &amp; Broadcast Launch</button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <!-- ================================================================
+             PAGE 4: SWAP BTC <-> i0 (Option C — P2P Orderbook + Post Offer)
+             ================================================================ -->
+        <section id="view-swap" class="col" hidden>
+          <div class="h-row">
+            <div>
+              <h1>P2P BTC &harr; i0 Orderbook <span class="chip ok">Taproot HTLC</span></h1>
+              <div class="h-sub">Trustless atomic swaps on Bitcoin L1 — BTC funding addresses only unlock for active-block verified escrows</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <select class="field-sel" id="htlc-net" style="width:auto;height:30px">
+                <option value="signet">Signet (tb1p…)</option>
+                <option value="regtest">Regtest (bcrt1p…)</option>
+              </select>
+              <button class="btn-primary sm" id="toggle-post-htlc">+ Post HTLC Offer</button>
+            </div>
+          </div>
+
+          <!-- Post New HTLC Offer Composer (mandatory Secret S backup preserved!) -->
+          <section class="card card-b" id="post-htlc-card">
+            <div class="h-row" style="margin-bottom:12px">
+              <div>
+                <div class="card-t">Lock I0 in Trustless HTLC Offer</div>
+                <div class="card-d">Step 1: Generate &amp; back up Secret S offline &rarr; Step 2: Sign HTLC_LOCK</div>
+              </div>
+              <span class="chip warn">2-step backup required</span>
+            </div>
+            <div class="g2-eq">
+              <div class="field" style="margin-bottom:0">
+                <div class="field-t"><span>Counterparty (recipient)</span></div>
+                <select class="field-sel" id="htlc-recipient"></select>
+              </div>
+              <div class="field" style="margin-bottom:0">
+                <div class="field-t"><span>Amount to lock (I0)</span></div>
+                <input class="field-in big num" id="htlc-amount" type="number" step="any" min="0" value="25" />
+              </div>
+            </div>
+            <div class="quote-box" id="htlc-secret-backup" style="margin-top:12px" hidden></div>
+            <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+              <button class="btn-ghost" id="htlc-prep-secret-btn">1. Generate &amp; Back Up Secret S</button>
+              <button class="btn-primary sm" id="submit-htlc" disabled>2. Sign &amp; Lock I0 in HTLC</button>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-h" style="padding-bottom:12px">
+              <div>
+                <div class="card-t">Active P2P HTLC Escrows</div>
+                <div class="card-d">Every escrow displays its verification status, Taproot BTC address (when verified), and 1-click claim</div>
+              </div>
+              <span class="chip num" id="htlc-count-chip">0 active</span>
+            </div>
+            <div class="card-b" style="padding-top:4px;display:flex;flex-direction:column;gap:10px" id="htlc-list"></div>
+          </section>
+        </section>
+
+        <!-- ================================================================
+             PAGE 5: WALLET (Option B — Tabbed Portfolio)
+             ================================================================ -->
+        <section id="view-wallet" class="col" hidden>
+          <section class="card card-b">
+            <div class="h-row">
+              <div>
+                <div class="dim" style="font-size:12px">Active signer portfolio</div>
+                <div class="num" style="font-size:28px;font-weight:650;letter-spacing:-0.03em" id="wallet-total-i0">0.00 I0</div>
+                <div class="dim num" style="font-size:11.5px;margin-top:2px;word-break:break-all" id="wallet-pk-box">—</div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button class="btn-primary sm" id="wallet-go-swap">Swap BTC &harr; i0</button>
+                <button class="btn-ghost" id="wallet-go-keys">Keys &amp; Backup</button>
+              </div>
+            </div>
+            <div class="div-line"></div>
+            <div class="seg" id="wallet-tabs">
+              <button class="seg-opt active" data-wtab="balances">Balances</button>
+              <button class="seg-opt" data-wtab="orders">Pending orders</button>
+              <button class="seg-opt" data-wtab="swaps">BTC Swaps</button>
+              <button class="seg-opt" data-wtab="keys">Keys &amp; Account</button>
+            </div>
+          </section>
+
+          <!-- Tab: Balances + Quick Transfer -->
+          <div id="wtab-balances" class="col">
+            <section class="card">
+              <div class="card-h" style="padding-bottom:10px"><div class="card-t">Holdings</div></div>
+              <div class="tbl-wrap">
+                <table>
+                  <thead><tr><th>Asset</th><th class="r">Balance</th><th class="r">Est. Value (I0)</th><th class="r"></th></tr></thead>
+                  <tbody id="wallet-holdings-tbody" class="num"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="card card-b">
+              <div class="card-t" style="margin-bottom:10px">Send I0 Transfer</div>
+              <div class="g2-eq">
+                <div class="field" style="margin-bottom:0">
+                  <div class="field-t"><span>Recipient x-only BIP-340 pubkey (64-hex)</span></div>
+                  <input class="field-in num" id="transfer-to" placeholder="64 lowercase hex chars…" />
+                </div>
+                <div class="field" style="margin-bottom:0">
+                  <div class="field-t"><span>Amount (I0)</span></div>
+                  <input class="field-in big num" id="transfer-amount" type="number" step="any" min="0" value="10" />
+                </div>
+              </div>
+              <div style="margin-top:10px;display:flex;justify-content:flex-end">
+                <button class="btn-primary sm" id="submit-transfer">Sign &amp; Send Transfer</button>
+              </div>
+            </section>
+          </div>
+
+          <!-- Tab: Pending Orders (#mempool-list!) -->
+          <div id="wtab-orders" class="col" hidden>
+            <section class="card">
+              <div class="card-h" style="padding-bottom:10px">
+                <div>
+                  <div class="card-t">Pending Entmoot Mempool</div>
+                  <div class="card-d">Replace any of your own pending nonces via RBF cancel before the next block clears</div>
+                </div>
+                <span class="chip num" id="mempool-count">0 active</span>
+              </div>
+              <div class="card-b" style="padding-top:4px;display:flex;flex-direction:column;gap:8px" id="mempool-list"></div>
+            </section>
+          </div>
+
+          <!-- Tab: BTC Swaps summary -->
+          <div id="wtab-swaps" class="col" hidden>
+            <section class="card card-b">
+              <div class="h-row" style="margin-bottom:10px">
+                <div><div class="card-t">Your active BTC &harr; i0 escrows</div><div class="card-d">Manage Taproot funding, Secret S backups, and claims in Swap BTC</div></div>
+                <button class="btn-primary sm" id="wtab-open-swap">Open Swap Orderbook &rarr;</button>
+              </div>
+              <div id="wallet-swaps-summary" class="kv-list"></div>
+            </section>
+          </div>
+
+          <!-- Tab: Keys & Account -->
+          <div id="wtab-keys" class="col" hidden>
+            <section class="card card-b" style="display:flex;flex-direction:column;gap:12px">
+              <div class="h-row">
+                <div><div class="card-t">Session-Only Self-Custody Key</div><div class="card-d">Keys live strictly in memory — never persisted to disk or sent over the network</div></div>
+                <span class="chip ok">BIP-340 Schnorr</span>
+              </div>
+              <div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                  <button class="btn-ghost" id="wallet-reveal-btn">Reveal Hex</button>
+                  <button class="btn-ghost" id="wallet-new-btn">Generate New Key</button>
+                  <button class="btn-ghost" id="wallet-faucet-btn">Demo Faucet (+100 I0)</button>
+                </div>
+                <span class="code-inline" id="wallet-sk-box" hidden></span>
+              </div>
+              <div class="div-line" style="margin:2px 0"></div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <input class="field-in num" id="wallet-import-sk" style="flex:1;min-width:220px;height:34px;padding:0 10px;background:var(--panel);border:1px solid var(--line-2);border-radius:7px;font-size:12px" placeholder="Import 64-hex BIP-340 private key…" />
+                <button class="btn-primary sm" id="wallet-import-btn">Import Key</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <!-- ================================================================
+             PAGE 6: VERIFY PROOFS (Option A — Trust Strip + Block Table)
+             ================================================================ -->
+        <section id="view-verify" class="col" hidden>
+          <div class="h-row">
+            <div>
+              <h1>Chain verification <span class="chip" id="verify-status-chip">Checking</span></h1>
+              <div class="h-sub">Client-side Dual-PoW, raw Bitcoin block Merkle inclusion, and Zero-MEV batch verification</div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-ghost" id="mev-test-btn">Run Zero-MEV Shuffle Proof</button>
+              <button class="btn-ghost" id="mine-btn">Simulate Local Block (Sandbox)</button>
+            </div>
+          </div>
+
+          <section class="card kpi-strip" id="verify-kpis"></section>
+
+          <div class="msg-banner ok-b" id="mev-result" hidden></div>
+
+          <section class="card">
+            <div class="card-h" style="padding-bottom:10px">
+              <div>
+                <div class="card-t">Verified block history</div>
+                <div class="card-d" id="tip-pill">Waiting for tip…</div>
+              </div>
+            </div>
+            <div class="tbl-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Height</th>
+                    <th>Block ID</th>
+                    <th class="r">BTC Block</th>
+                    <th class="r">Txs</th>
+                    <th class="r">Status</th>
+                  </tr>
+                </thead>
+                <tbody id="block-list" class="num"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card card-b" id="block-json-card" hidden>
+            <div class="h-row" style="margin-bottom:8px">
+              <div class="card-t">Block JSON Inspector</div>
+              <button class="btn-ghost" id="close-json-btn">Close</button>
+            </div>
+            <pre class="json-box" id="block-json"></pre>
+          </section>
+        </section>
+      </div>
+    </main>
+  </div>
 
   <script type="module">
     import * as E from '/content/local:g-rules.js';
@@ -277,6 +915,9 @@
     const FETCH_TIMEOUT_MS = 12_000;
     const MAX_PENDING_HINTS = 8;
     const HEX64_RE = /^[0-9a-f]{64}$/;
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+
+    const $ = (id) => document.getElementById(id);
 
     const fmtI0 = (v) => {
       const neg = v < 0n ? '-' : '';
@@ -286,7 +927,7 @@
       return `${neg}${whole.toLocaleString()}.${frac.toString().padStart(2, '0')}`;
     };
     const fmtTok = (v) => (v / UNIT).toLocaleString();
-    const shortId = (id) => id ? `${id.slice(0, 10)}…${id.slice(-6)}` : '—';
+    const shortId = (id) => (id ? `${id.slice(0, 10)}…${id.slice(-6)}` : '—');
 
     function el(tag, props = null, ...children) {
       const node = document.createElement(tag);
@@ -305,9 +946,75 @@
       return node;
     }
 
+    function sEl(tag, attrs = null, ...children) {
+      const node = document.createElementNS(SVG_NS, tag);
+      if (attrs) {
+        for (const [k, v] of Object.entries(attrs)) {
+          if (v !== undefined && v !== null) node.setAttribute(k, String(v));
+        }
+      }
+      for (const c of children) {
+        if (c === null || c === undefined || c === false) continue;
+        node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+      }
+      return node;
+    }
+
+    function makeSpark(pathD, color) {
+      return sEl(
+        'svg',
+        { class: 'spark', viewBox: '0 0 180 24', preserveAspectRatio: 'none' },
+        sEl('path', { d: `${pathD} L180 24 L0 24 Z`, fill: color, opacity: '0.14' }),
+        sEl('path', { d: pathD, fill: 'none', stroke: color, 'stroke-width': '1.5' }),
+      );
+    }
+
+    function makeTokenArtSvg(seedStr, size = 24) {
+      let h = 0;
+      for (let i = 0; i < seedStr.length; i++) h = (h * 31 + seedStr.charCodeAt(i)) >>> 0;
+      const palettes = [
+        ['#5ad8e6', '#ed4abf'],
+        ['#f5a524', '#5ad8e6'],
+        ['#3ecf8e', '#ed4abf'],
+        ['#ed4abf', '#5ad8e6'],
+      ];
+      const [c1, c2] = palettes[h % palettes.length];
+      const mode = h % 3;
+      if (mode === 0) {
+        return sEl(
+          'svg',
+          { viewBox: '0 0 32 32', width: size, height: size, fill: 'none' },
+          sEl('path', { d: 'M3 16C7 9.8 11.4 7 16 7s9 2.8 13 9c-4 6.2-8.4 9-13 9s-9-2.8-13-9z', stroke: c1, 'stroke-width': '1.9' }),
+          sEl('circle', { cx: '16', cy: '16', r: '4.6', stroke: c2, 'stroke-width': '1.8' }),
+          sEl('circle', { cx: '16', cy: '16', r: '1.8', fill: '#ededef' }),
+        );
+      }
+      if (mode === 1) {
+        return sEl(
+          'svg',
+          { viewBox: '0 0 32 32', width: size, height: size, fill: 'none' },
+          sEl('polygon', { points: '16,4 28,16 16,28 4,16', stroke: c1, 'stroke-width': '1.9' }),
+          sEl('circle', { cx: '16', cy: '16', r: '4.5', stroke: c2, 'stroke-width': '1.7' }),
+        );
+      }
+      return sEl(
+        'svg',
+        { viewBox: '0 0 32 32', width: size, height: size, fill: 'none' },
+        sEl('rect', { x: '6', y: '6', width: '20', height: '20', rx: '4', stroke: c1, 'stroke-width': '1.9' }),
+        sEl('path', { d: 'M11 16h10M16 11v10', stroke: c2, 'stroke-width': '1.8' }),
+      );
+    }
+
     function setPill(id, dotClass, text) {
       const node = $(id);
-      node.replaceChildren(el('span', { class: `dot ${dotClass}` }), text);
+      if (node) node.replaceChildren(el('span', { class: `dot ${dotClass}` }), text);
+    }
+
+    function showMsg(elId, text) {
+      const node = $(elId);
+      if (!node) return;
+      node.textContent = text;
+      node.hidden = false;
     }
 
     function randomHex32() {
@@ -332,6 +1039,12 @@
     for (const p of PERSONAS) p.pk = E.getPublicKeyHex(p.sk);
 
     let activePersona = PERSONAS[0];
+    let activePage = 'explore';
+    let activeTradeSide = 'buy';
+    let activeExploreSort = 'reserve';
+    let activeWalletTab = 'balances';
+    let activeLaunchStep = 1;
+
     // Strictly separate Ord-verified chain state/heights from local demo simulator state/heights!
     let ordState = null;
     let ordBootState = null;
@@ -340,9 +1053,7 @@
     let ordBtcHeight = 924_103;
     let ordTipId = null;
     let ordConfirmationVerified = false;
-    let pinnedTrustedCheckpoint = null; // optional out-of-band pinned { blockId, stateRoot, pageIds? }
-    // Cache ONLY immutable inscription content bodies (/content/:id) and hash-verified raw Bitcoin block txid sets!
-    // NEVER cache mutable confirmation metadata (/r/inscription/:id or /r/blockhash/:h).
+    let pinnedTrustedCheckpoint = null;
     const contentBodyCache = new Map();
     const verifiedBlockTxidsCache = new Map();
 
@@ -359,12 +1070,10 @@
     let revealSecretVisible = false;
     let entmootNet = null;
 
-    // Pending HTLC secret backup state (forces explicit backup before Alice can submit HTLC_LOCK).
-    let stagedSwapSecret = null; // { secretHex, hashlock, backedUp: boolean }
-    const sessionHtlcSecrets = new Map(); // swapId -> secretHex (session-only backup for Alice)
+    let stagedSwapSecret = null;
+    const sessionHtlcSecrets = new Map();
 
-    // Mempool deduplicated by (from:nonce) keeping only highest-fee valid tx + verified sig cache!
-    const pendingBySlot = new Map(); // `${from}:${nonce}` -> { tx, fee }
+    const pendingBySlot = new Map();
     const seenTxSigs = new Set();
     const verifiedSigs = new Set();
 
@@ -372,22 +1081,14 @@
     let projectionDirty = true;
     let renderScheduled = false;
 
-    // Coalesced hint queue so rapid #i0-blk messages never stampede ord fetches.
     let hintReplayInFlight = false;
     const queuedHintIds = new Set();
-    const retryHints = new Map(); // tipId -> { retries, nextAt }
+    const retryHints = new Map();
 
-    const $ = (id) => document.getElementById(id);
     const activeState = () => (simActive ? simState : ordState);
     const activeBlocks = () => (simActive ? simBlocks : ordVerifiedBlocks);
     const activeBtcHeight = () => (simActive ? simBtcHeight : ordBtcHeight);
     const isSimulatedView = () => simActive || isSimulatedSeed;
-
-    function showMsg(elId, text) {
-      const node = $(elId);
-      node.textContent = text;
-      node.hidden = false;
-    }
 
     function invalidateProjection() {
       projectionDirty = true;
@@ -460,19 +1161,10 @@
 
       seenTxSigs.add(tx.sig);
       verifiedSigs.add(cacheKey);
-      if (seenTxSigs.size > MAX_SEEN_SIGS) {
-        const oldest = seenTxSigs.values().next().value;
-        seenTxSigs.delete(oldest);
-      }
-      if (verifiedSigs.size > MAX_SEEN_SIGS) {
-        const oldestKey = verifiedSigs.values().next().value;
-        verifiedSigs.delete(oldestKey);
-      }
+      if (seenTxSigs.size > MAX_SEEN_SIGS) seenTxSigs.delete(seenTxSigs.values().next().value);
+      if (verifiedSigs.size > MAX_SEEN_SIGS) verifiedSigs.delete(verifiedSigs.values().next().value);
       pendingBySlot.set(slot, { tx, fee });
-      if (pendingBySlot.size > MAX_MEMPOOL_SLOTS) {
-        const oldestSlot = pendingBySlot.keys().next().value;
-        pendingBySlot.delete(oldestSlot);
-      }
+      if (pendingBySlot.size > MAX_MEMPOOL_SLOTS) pendingBySlot.delete(pendingBySlot.keys().next().value);
       invalidateProjection();
       return true;
     }
@@ -499,7 +1191,7 @@
     }
 
     // Streamed byte-capped + timeout-bounded JSON fetch.
-    // Tags ALL network/stream/timeout/5xx errors as transient so interrupted responses never demote an incumbent tip!
+    // Tags ALL network/stream/timeout/5xx and malformed /r/* JSON errors as transient so incoherent host responses never demote an incumbent tip!
     async function fetchJson(url, maxBytes = MAX_ORD_BODY_BYTES) {
       let res;
       try {
@@ -551,7 +1243,6 @@
       try {
         return JSON.parse(rawText);
       } catch (jsonErr) {
-        // Malformed HTTP 200 JSON on /r/* host endpoints (e.g., HTML proxy/error page) is inconclusive, never proof of invalidity.
         if (typeof url === 'string' && url.startsWith('/r/')) {
           jsonErr.isTransient = true;
         }
@@ -559,15 +1250,12 @@
       }
     }
 
-    // Validated ID-based replay tied strictly to live ord (100% stateless across replays so fork choice
-    // never depends on tab session history or arrival order):
-    //   - Always replays from Genesis unless an EXPLICIT out-of-band pinned trustedCheckpoint matches (never self-certified!).
-    //   - Supports BOTH inline and multi-page pinned checkpoints (fetches & Merkle-verifies companion pages).
-    //   - Always fetches /r/inscription/:id and /r/blockhash/:h fresh, and cryptographically verifies reveal-tx
-    //     membership in the raw active Bitcoin block via /r/block/:hash (header hash + Merkle root + txid set).
-    //   - If the host does not expose raw blocks (404), marks confirmationVerified = false instead of falsely claiming verified.
-    //   - Any torn/inconsistent host observation (e.g. mismatched block header hash or meta.blockhash) is tagged isTransient = true
-    //     so a higher-work incumbent is never demoted on an incoherent observation.
+    // Validated ID-based replay tied strictly to live ord (100% stateless across replays):
+    //   - Always replays from Genesis unless an EXPLICIT out-of-band pinned trustedCheckpoint matches.
+    //   - Supports BOTH inline and multi-page pinned checkpoints.
+    //   - Cryptographically verifies reveal-tx membership in raw active Bitcoin blocks via raw-block Merkle parsing.
+    //   - Leaves confirmationVerified = false on 404 (never falsely claims verified or unlocks BTC funding).
+    //   - Tags torn/inconsistent host responses as isTransient = true so a verified incumbent is never demoted.
     async function replayVerifiedChainFromOrd(genesisId, tipId) {
       if (!E.isValidInscriptionId(genesisId)) throw new Error('Invalid genesis ID');
       if (!E.isValidInscriptionId(tipId)) throw new Error('Invalid tip ID');
@@ -579,7 +1267,9 @@
         if (freshHashes.has(height)) return freshHashes.get(height);
         const h = await fetchJson(`/r/blockhash/${height}`);
         if (typeof h !== 'string' || !HEX64_RE.test(h.toLowerCase())) {
-          throw new Error(`Invalid active blockhash at height ${height}`);
+          const badHostErr = new Error(`Malformed active blockhash response at height ${height}`);
+          badHostErr.isTransient = true;
+          throw badHostErr;
         }
         const norm = h.toLowerCase();
         freshHashes.set(height, norm);
@@ -612,13 +1302,11 @@
             const parsed = E.extractBitcoinBlockTxids(rawBlockHex, activeConfHash);
             txids = parsed.txids;
           } catch (parseErr) {
-            // Host returned a block whose header hash doesn't match the requested active hash or malformed data -> incoherent observation.
             parseErr.isTransient = true;
             throw parseErr;
           }
           if (verifiedBlockTxidsCache.size >= MAX_VERIFIED_BLOCKS_CACHE) {
-            const oldest = verifiedBlockTxidsCache.keys().next().value;
-            verifiedBlockTxidsCache.delete(oldest);
+            verifiedBlockTxidsCache.delete(verifiedBlockTxidsCache.keys().next().value);
           }
           verifiedBlockTxidsCache.set(activeConfHash, txids);
         }
@@ -641,9 +1329,7 @@
       let checkpointEntry = null;
 
       while (cursor && cursor !== genesisId) {
-        if (!E.isValidBlockInscriptionId(cursor)) {
-          throw new Error(`Invalid block ID in ancestry: ${cursor}`);
-        }
+        if (!E.isValidBlockInscriptionId(cursor)) throw new Error(`Invalid block ID in ancestry: ${cursor}`);
         if (visited.has(cursor)) throw new Error('Cyclic block ancestry detected');
         if (rawChain.length >= MAX_SYNC_DEPTH) throw new Error('Max sync depth exceeded');
         visited.add(cursor);
@@ -665,7 +1351,6 @@
         await verifyMembershipInActiveBlock(cursor, meta);
 
         const blk = { ...blkBody, id: cursor };
-        // ONLY boot from a checkpoint whose (blockId, stateRoot) was EXPLICITLY pinned out-of-band!
         if (pinnedTrustedCheckpoint && cursor === pinnedTrustedCheckpoint.blockId) {
           if (blk.stateRoot !== pinnedTrustedCheckpoint.stateRoot.toLowerCase()) {
             throw new Error(`Pinned checkpoint ${cursor} stateRoot mismatch`);
@@ -735,11 +1420,11 @@
     function updateSyncPill() {
       if (!ordState) return;
       if (ordConfirmationVerified) {
-        setPill('sync-pill', 'ok', `Verified ${ordState.height} blocks on chain`);
+        setPill('sync-pill', 'ok', `Verified ${ordState.height} blocks`);
       } else if (isSimulatedSeed) {
-        setPill('sync-pill', 'warn', `Demo seed: ${ordState.height} blocks (confirmation unverified)`);
+        setPill('sync-pill', 'warn', `Demo seed · ${ordState.height} blk (unverified)`);
       } else {
-        setPill('sync-pill', 'warn', `Unverified confirmation · ${ordState.height} blocks (host lacks active-block proof)`);
+        setPill('sync-pill', 'warn', `Unverified · ${ordState.height} blk`);
       }
     }
 
@@ -759,8 +1444,6 @@
           queuedHintIds.delete(tipId);
           try {
             const candidate = await replayVerifiedChainFromOrd(genesisIdPinned, tipId);
-            // Revalidate incumbent Ord tip fresh against live ord using the same symmetric confirmation-hash rule.
-            // NEVER demote the incumbent on a transient network/body-stream/timeout error!
             let incumbentValid = false;
             if (ordTipId) {
               try {
@@ -776,16 +1459,11 @@
                   renderAll();
                 }
               } catch (incErr) {
-                if (incErr?.isTransient) {
-                  continue;
-                }
+                if (incErr?.isTransient) continue;
                 incumbentValid = false;
               }
             }
-            // Never let a candidate lacking active-block membership proof displace an active-block-verified incumbent!
-            if (incumbentValid && ordConfirmationVerified && !candidate.confirmationVerified) {
-              continue;
-            }
+            if (incumbentValid && ordConfirmationVerified && !candidate.confirmationVerified) continue;
             if (!incumbentValid || !ordState || E.compareChainTips(candidate.state, ordState) > 0) {
               ordState = candidate.state;
               ordBootState = candidate.bootState;
@@ -858,16 +1536,13 @@
           } catch {}
         });
 
-        // Cold discovery: replay bounded recent #i0-blk hints + #i0-tx mempool from Entmoot history.
         try {
           const blkHist = await net.history('i0-blk', 16);
           for (const msg of blkHist) {
             try {
               if (typeof msg.text === 'string' && msg.text.length <= 1024) {
                 const hint = JSON.parse(msg.text);
-                if (hint && typeof hint.id === 'string' && E.isValidBlockInscriptionId(hint.id)) {
-                  enqueueTipHint(hint.id);
-                }
+                if (hint && typeof hint.id === 'string' && E.isValidBlockInscriptionId(hint.id)) enqueueTipHint(hint.id);
               }
             } catch {}
           }
@@ -878,9 +1553,7 @@
           let loaded = 0;
           for (const msg of txHist) {
             try {
-              if (typeof msg.text === 'string' && msg.text.length <= 8192 && ingestPendingTx(JSON.parse(msg.text))) {
-                loaded++;
-              }
+              if (typeof msg.text === 'string' && msg.text.length <= 8192 && ingestPendingTx(JSON.parse(msg.text))) loaded++;
             } catch {}
           }
           if (loaded > 0) renderAll();
@@ -920,13 +1593,69 @@
       }
     }
 
+    // Navigation
+    const PAGE_LABELS = {
+      explore: 'Explore',
+      token: 'Token Detail',
+      launch: 'Launch',
+      swap: 'Swap BTC',
+      wallet: 'Wallet',
+      verify: 'Verify Proofs',
+    };
+
+    function setPage(pageId) {
+      if (!PAGE_LABELS[pageId]) return;
+      activePage = pageId;
+      for (const pid of Object.keys(PAGE_LABELS)) {
+        $(`view-${pid}`).hidden = pid !== pageId;
+      }
+      for (const btn of document.querySelectorAll('[data-page]')) {
+        btn.classList.toggle('active', btn.dataset.page === pageId);
+      }
+      const s = activeState();
+      const tok = s?.tokens.get(selectedTokenId);
+      $('topbar-crumb').textContent = pageId === 'token' && tok ? `$${tok.ticker}` : PAGE_LABELS[pageId];
+      renderAll();
+    }
+
+    function setWalletTab(tab) {
+      activeWalletTab = tab;
+      for (const btn of $('wallet-tabs').querySelectorAll('[data-wtab]')) {
+        btn.classList.toggle('active', btn.dataset.wtab === tab);
+      }
+      for (const t of ['balances', 'orders', 'swaps', 'keys']) {
+        $(`wtab-${t}`).hidden = t !== tab;
+      }
+    }
+
+    function setLaunchStep(step) {
+      activeLaunchStep = step;
+      for (const btn of $('launch-steps').querySelectorAll('[data-lstep]')) {
+        const n = Number(btn.dataset.lstep);
+        btn.classList.toggle('active', n === step);
+        btn.classList.toggle('done', n < step);
+      }
+      for (const n of [1, 2, 3]) $(`lstep-${n}`).hidden = n !== step;
+      if (step === 3) {
+        const ticker = $('launch-ticker').value.trim().toUpperCase() || '—';
+        const name = $('launch-name').value.trim() || '—';
+        const initBuy = Number($('launch-init').value || 0);
+        $('launch-review-box').replaceChildren(
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Ticker'), el('strong', { class: 'num' }, `$${ticker}`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Name'), el('strong', null, name)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Launch fee'), el('strong', { class: 'num' }, '10.00 I0')),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Initial buy'), el('strong', { class: 'num' }, `${initBuy.toFixed(2)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Creator royalty'), el('strong', { class: 'num ok' }, '0.5% forever')),
+        );
+      }
+    }
+
     function parseSlippagePct(raw) {
       const s = String(raw ?? '').trim();
       const val = s === '' ? 15 : Number(s);
       return BigInt(Math.max(0, Math.min(99, Number.isFinite(val) ? Math.round(val) : 15)));
     }
 
-    // Single quote helpers used for BOTH displaying and signing buys & sells.
     function computeBuyQuote(tok, i0In, slipRaw) {
       const fee = (i0In * PARAMS.tradeFeeBps) / PARAMS.bpsDenom;
       const netB = i0In - fee;
@@ -958,45 +1687,39 @@
       const pMin = priceAt(0);
       const pMax = priceAt(maxX);
       const span = Math.max(1e-12, pMax - pMin);
-      const yFor = (p) => 126 - (96 * (p - pMin)) / span;
+      const yFor = (p) => 136 - (104 * (p - pMin)) / span;
 
       let pathD = '';
       for (let i = 0; i <= 40; i++) {
         const xVal = (maxX * i) / 40;
-        const px = 36 + (504 * i) / 40;
+        const px = 36 + (520 * i) / 40;
         const py = yFor(priceAt(xVal));
         pathD += (i === 0 ? 'M' : 'L') + `${px.toFixed(1)},${py.toFixed(1)}`;
       }
-      const areaD = `${pathD} L540.0,132 L36.0,132 Z`;
-      const curX = 36 + (504 * rI0) / maxX;
+      const areaD = `${pathD} L556.0,142 L36.0,142 Z`;
+      const curX = 36 + (520 * rI0) / maxX;
       const curY = yFor(priceAt(rI0));
-      const prjX = 36 + (504 * pI0) / maxX;
+      const prjX = 36 + (520 * pI0) / maxX;
       const prjY = yFor(priceAt(pI0));
 
-      const NS = 'http://www.w3.org/2000/svg';
-      const sEl = (tag, attrs, text) => {
-        const n = document.createElementNS(NS, tag);
-        for (const [k2, v2] of Object.entries(attrs)) n.setAttribute(k2, String(v2));
-        if (text !== undefined) n.textContent = text;
-        return n;
-      };
       const nodes = [
-        sEl('line', { x1: 36, y1: 132, x2: 544, y2: 132, stroke: '#2a2d35', 'stroke-width': 1 }),
-        sEl('line', { x1: 36, y1: 22, x2: 36, y2: 132, stroke: '#2a2d35', 'stroke-width': 1 }),
-        sEl('path', { d: areaD, fill: '#30a46c', 'fill-opacity': 0.09 }),
-        sEl('path', { d: pathD, fill: 'none', stroke: '#8b909e', 'stroke-width': 1.8 }),
-        sEl('circle', { cx: curX.toFixed(1), cy: curY.toFixed(1), r: 4.5, fill: '#30a46c' }),
+        sEl('line', { x1: 36, y1: 48, x2: 556, y2: 48, stroke: 'rgba(255,255,255,0.06)', 'stroke-width': 1 }),
+        sEl('line', { x1: 36, y1: 95, x2: 556, y2: 95, stroke: 'rgba(255,255,255,0.06)', 'stroke-width': 1 }),
+        sEl('line', { x1: 36, y1: 142, x2: 556, y2: 142, stroke: 'rgba(255,255,255,0.1)', 'stroke-width': 1 }),
+        sEl('path', { d: areaD, fill: '#5ad8e6', 'fill-opacity': 0.11 }),
+        sEl('path', { d: pathD, fill: 'none', stroke: '#5ad8e6', 'stroke-width': 2 }),
+        sEl('circle', { cx: curX.toFixed(1), cy: curY.toFixed(1), r: 4.5, fill: '#5ad8e6' }),
       ];
       if (pI0 !== rI0) {
         nodes.push(
-          sEl('line', { x1: curX.toFixed(1), y1: curY.toFixed(1), x2: prjX.toFixed(1), y2: prjY.toFixed(1), stroke: '#e2a336', 'stroke-dasharray': '3 2', 'stroke-width': 1.5 }),
-          sEl('circle', { cx: prjX.toFixed(1), cy: prjY.toFixed(1), r: 4.5, fill: '#e2a336' }),
+          sEl('line', { x1: curX.toFixed(1), y1: curY.toFixed(1), x2: prjX.toFixed(1), y2: prjY.toFixed(1), stroke: '#ed4abf', 'stroke-dasharray': '3 3', 'stroke-width': 1.6 }),
+          sEl('circle', { cx: prjX.toFixed(1), cy: prjY.toFixed(1), r: 5, fill: '#ed4abf' }),
         );
       }
       nodes.push(
-        sEl('text', { x: 42, y: 148, fill: '#838793', 'font-size': 10.5, 'font-family': 'ui-monospace,monospace' }, '0 I0'),
-        sEl('text', { x: 484, y: 148, fill: '#838793', 'font-size': 10.5, 'font-family': 'ui-monospace,monospace' }, `${Math.round(maxX)} I0`),
-        sEl('text', { x: 42, y: 14, fill: '#838793', 'font-size': 10.5, 'font-family': 'ui-monospace,monospace' }, `Final: ${rI0.toFixed(2)} I0${pI0 !== rI0 ? ` · Pending: ${pI0.toFixed(2)} I0` : ''}`),
+        sEl('text', { x: 38, y: 158, fill: '#6c6c74', 'font-size': 10.5, 'font-family': 'ui-monospace,monospace' }, '0 I0'),
+        sEl('text', { x: 496, y: 158, fill: '#6c6c74', 'font-size': 10.5, 'font-family': 'ui-monospace,monospace' }, `${Math.round(maxX)} I0`),
+        sEl('text', { x: 38, y: 16, fill: '#a0a0a8', 'font-size': 11, 'font-family': 'ui-monospace,monospace' }, `Final: ${rI0.toFixed(2)} I0${pI0 !== rI0 ? ` · Pending: ${pI0.toFixed(2)} I0` : ''}`),
       );
       svg.replaceChildren(...nodes);
     }
@@ -1007,6 +1730,9 @@
       const availTok = tok ? E.getBalance(projectedState, activePersona.pk, tok.id) : 0n;
       $('buy-avail').textContent = `Avail: ${fmtI0(availI0)} I0`;
       $('sell-avail').textContent = `Avail: ${fmtTok(availTok)} ${tok ? tok.ticker : ''}`;
+      $('trade-avail-lbl').textContent = activeTradeSide === 'buy'
+        ? `Avail: ${fmtI0(availI0)} I0`
+        : `Avail: ${fmtTok(availTok)} ${tok ? tok.ticker : ''}`;
 
       if (!tok) return;
       const buyVal = Number($('buy-amount').value || 0);
@@ -1014,21 +1740,66 @@
         const i0In = BigInt(Math.round(buyVal * 1e8));
         const q = computeBuyQuote(tok, i0In, $('buy-slip').value);
         $('buy-quote').replaceChildren(
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. output (projected batch)'), el('span', { class: 'mono' }, `${fmtTok(q.estOut)} ${tok.ticker}`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minTokOut protection'), el('span', { class: 'mono' }, `${fmtTok(q.minTokOut)} ${tok.ticker}`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% fee (0.5% miner / 0.5% creator)'), el('span', { class: 'mono' }, `${fmtI0(q.fee)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. output (projected batch)'), el('strong', { class: 'num' }, `${fmtTok(q.estOut)} ${tok.ticker}`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minTokOut'), el('span', { class: 'num' }, `${fmtTok(q.minTokOut)} ${tok.ticker}`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% fee (0.5% cr / 0.5% mn)'), el('span', { class: 'num' }, `${fmtI0(q.fee)} I0`)),
         );
+      } else {
+        $('buy-quote').replaceChildren(el('div', { class: 'dim' }, 'Enter an I0 amount to preview uniform batch fill.'));
       }
       const sellVal = Number($('sell-amount').value || 0);
       if (sellVal > 0) {
         const tokIn = BigInt(Math.round(sellVal)) * UNIT;
         const q = computeSellQuote(tok, tokIn, $('sell-slip').value);
         $('sell-quote').replaceChildren(
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. net payout'), el('span', { class: 'mono' }, `${fmtI0(q.netI0)} I0`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minI0Out protection'), el('span', { class: 'mono' }, `${fmtI0(q.minI0Out)} I0`)),
-          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% I0 fee (0.5% miner / 0.5% creator)'), el('span', { class: 'mono' }, `${fmtI0(q.fee)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Est. net payout'), el('strong', { class: 'num' }, `${fmtI0(q.netI0)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, 'Signed minI0Out'), el('span', { class: 'num' }, `${fmtI0(q.minI0Out)} I0`)),
+          el('div', { class: 'q-line' }, el('span', { class: 'mut' }, '1% I0 fee (0.5% cr / 0.5% mn)'), el('span', { class: 'num' }, `${fmtI0(q.fee)} I0`)),
         );
+      } else {
+        $('sell-quote').replaceChildren(el('div', { class: 'dim' }, 'Enter a token amount to preview sell payout.'));
       }
+    }
+
+    function buildMempoolNodes(s, accepted) {
+      if (!accepted.length) {
+        return [el('div', { class: 'dim', style: 'font-size:12px;padding:6px 0' }, 'No pending orders in Entmoot mempool.')];
+      }
+      return accepted.map((tx) => {
+        const who = PERSONAS.find((p) => p.pk === tx.from)?.name.split(' ')[0] ?? tx.from.slice(0, 8);
+        const tokRef = tx.tokenId && s.tokens.get(tx.tokenId);
+        const tokLabel = tokRef ? `$${tokRef.ticker}` : String(tx.tokenId ?? '');
+        const desc = tx.type === 'BUY' ? `BUY ${tokLabel} · ${fmtI0(BigInt(tx.i0In))} I0`
+          : tx.type === 'SELL' ? `SELL ${tokLabel} · ${fmtTok(BigInt(tx.tokIn))} tok`
+          : tx.type === 'LAUNCH' ? `LAUNCH $${tx.ticker}`
+          : tx.type === 'HTLC_LOCK' ? `HTLC_LOCK ${fmtI0(BigInt(tx.amount))} I0`
+          : tx.type === 'TRANSFER' ? `TRANSFER ${fmtI0(BigInt(tx.amount))} I0`
+          : tx.type;
+        const right = el('div', { style: 'display:flex;align-items:center;gap:8px' }, el('span', { class: 'dim num' }, `n=${tx.nonce}`));
+        if (tx.from === activePersona.pk && tx.type !== 'CANCEL') {
+          right.appendChild(el('button', {
+            class: 'btn-ghost',
+            style: 'height:24px;padding:0 8px;font-size:11px;color:var(--bad)',
+            onclick: async () => {
+              const nextFee = (BigInt(tx.fee || '0') + 1000n).toString();
+              const cancelTx = E.signTx(s.chainId, { type: 'CANCEL', from: activePersona.pk, nonce: tx.nonce, fee: nextFee }, activePersona.sk);
+              const live = await broadcastTx(cancelTx);
+              showMsg('action-msg', `Replaced nonce ${tx.nonce} with CANCEL${live ? ' (gossiped over Entmoot)' : ''}`);
+            },
+          }, 'Cancel (RBF)'));
+        }
+        const dotCls = tx.type === 'BUY' ? 'ok' : tx.type === 'SELL' ? 'err' : 'warn';
+        return el(
+          'div',
+          { style: 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border-radius:8px;background:var(--panel);border:1px solid var(--line-1)' },
+          el('div', { style: 'display:flex;align-items:center;gap:8px;min-width:0' },
+            el('span', { class: `dot ${dotCls}` }),
+            el('strong', null, who),
+            el('span', { class: 'num' }, desc),
+          ),
+          right,
+        );
+      });
     }
 
     function renderAll() {
@@ -1036,127 +1807,145 @@
       if (!s) return;
       const { projectedState, accepted } = getProjected();
 
-      $('chain-mode-sub').textContent = isSimulatedView() ? '(Simulated Local Demo — Not Bitcoin Mainnet)' : '(Confirmed Bitcoin Inscriptions)';
-      $('tip-pill').textContent = `${simActive ? 'Sim ' : ''}Block #${s.height} · ${shortId(s.tipId)}`;
+      // Ensure a token is selected
+      if (!selectedTokenId || !s.tokens.has(selectedTokenId)) {
+        selectedTokenId = s.tokens.keys().next().value ?? null;
+      }
+
       const myI0 = E.getBalance(s, activePersona.pk, 0);
       const myProjI0 = E.getBalance(projectedState, activePersona.pk, 0);
       $('bal-pill').textContent = myProjI0 !== myI0
-        ? `${fmtI0(myI0)} I0 (pend: ${fmtI0(myProjI0)})`
+        ? `${fmtI0(myI0)} I0 (pend ${fmtI0(myProjI0)})`
         : `${fmtI0(myI0)} I0`;
-      $('wallet-pk-box').textContent = activePersona.pk;
-      $('wallet-sk-box').hidden = !revealSecretVisible;
-      $('wallet-sk-box').textContent = revealSecretVisible ? localWallet.sk : '';
-      $('wallet-reveal-btn').textContent = revealSecretVisible ? 'Hide Hex' : 'Reveal Hex';
+      $('signer-mode').textContent = activePersona.demo ? 'Demo' : 'Session';
+      $('nav-tok-count').textContent = String(s.tokens.size);
+      $('nav-htlc-count').textContent = String(s.htlcs.size);
+      $('nav-mempool-count').textContent = String(accepted.length);
 
-      // Token grid
-      const gridNodes = [];
-      for (const tok of s.tokens.values()) {
-        if (!selectedTokenId) selectedTokenId = tok.id;
-        const pTok = projectedState.tokens.get(tok.id) ?? tok;
-        const myBal = E.getBalance(projectedState, activePersona.pk, tok.id);
-        gridNodes.push(el(
-          'button',
-          {
-            class: `tok ${tok.id === selectedTokenId ? 'on' : ''}`,
-            onclick: () => { selectedTokenId = tok.id; renderAll(); },
-          },
-          el('div', { class: 'tok-sym' }, el('span', null, `$${tok.ticker}`), el('span', { class: 'mono mut' }, tok.id.slice(0, 8))),
-          el('div', { class: 'tok-sub' }, tok.name),
-          el('div', { class: 'tok-stat' }, el('span', { class: 'mut' }, 'Reserve'), el('span', { class: 'mono' }, `${fmtI0(pTok.realI0)} I0`)),
-          el('div', { class: 'tok-stat' }, el('span', { class: 'mut' }, 'You hold'), el('span', { class: 'mono' }, fmtTok(myBal))),
-        ));
+      const selTok = s.tokens.get(selectedTokenId);
+      $('nav-token-label').textContent = selTok ? `$${selTok.ticker}` : 'Token Detail';
+      if (activePage === 'token' && selTok) $('topbar-crumb').textContent = `$${selTok.ticker}`;
+
+      // 1. EXPLORE (Option A: KPI Strip + Dense Market Table)
+      let totalPoolI0 = 0n;
+      for (const t of projectedState.tokens.values()) totalPoolI0 += t.realI0;
+      $('chain-mode-chip').textContent = isSimulatedView() ? 'Simulated Demo' : ordConfirmationVerified ? 'Active-Block Verified' : 'Unverified Host';
+      $('chain-mode-chip').className = `chip ${!isSimulatedView() && ordConfirmationVerified ? 'ok' : 'warn'}`;
+      $('chain-mode-sub').textContent = isSimulatedView()
+        ? 'Simulated local demo seed — not Bitcoin mainnet'
+        : `Confirmed on Bitcoin · Block #${s.height} (BTC #${activeBtcHeight()})`;
+
+      $('explore-kpis').replaceChildren(
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Active pools'), el('div', { class: 'kpi-v num' }, `${s.tokens.size} tokens`), el('div', { class: 'kpi-s' }, 'Uniform 0% MEV'), makeSpark('M0 20 L45 16 L90 14 L135 9 L180 4', '#ed4abf')),
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Total liquidity'), el('div', { class: 'kpi-v num' }, `${fmtI0(totalPoolI0)} I0`), el('div', { class: 'kpi-s' }, 'Bonding curve pools'), makeSpark('M0 21 L45 18 L90 15 L135 10 L180 6', '#5ad8e6')),
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Next batch queue'), el('div', { class: 'kpi-v num' }, `${accepted.length} orders`), el('div', { class: 'kpi-s num' }, `BTC #${activeBtcHeight() + 1}`), makeSpark('M0 19 L45 11 L90 18 L135 7 L180 12', '#3ecf8e')),
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Total I0 minted'), el('div', { class: 'kpi-v num' }, `${fmtI0(s.totalI0Minted)} I0`), el('div', { class: 'kpi-s num' }, `Block #${s.height}`), makeSpark('M0 22 L60 17 L120 11 L180 5', '#f5a524')),
+      );
+
+      const q = ($('explore-search').value || '').trim().toLowerCase();
+      let tokList = [...s.tokens.values()].filter((t) => {
+        if (!q) return true;
+        return t.ticker.toLowerCase().includes(q) || t.name.toLowerCase().includes(q) || t.id.toLowerCase().includes(q);
+      });
+      if (activeExploreSort === 'reserve') {
+        tokList.sort((a, b) => ((projectedState.tokens.get(b.id)?.realI0 ?? b.realI0) > (projectedState.tokens.get(a.id)?.realI0 ?? a.realI0) ? 1 : -1));
+      } else if (activeExploreSort === 'holdings') {
+        tokList.sort((a, b) => (E.getBalance(projectedState, activePersona.pk, b.id) > E.getBalance(projectedState, activePersona.pk, a.id) ? 1 : -1));
       }
-      $('token-grid').replaceChildren(...gridNodes);
-
-      const tok = s.tokens.get(selectedTokenId) ?? [...s.tokens.values()][0];
-      if (tok) {
-        selectedTokenId = tok.id;
-        const pTok = projectedState.tokens.get(tok.id) ?? tok;
-        const priceNow = Number(tok.virtualI0 + tok.realI0) / Number(tok.realTok);
-        const priceProj = Number(pTok.virtualI0 + pTok.realI0) / Number(pTok.realTok);
-        const pct = ((priceProj - priceNow) / priceNow) * 100;
-        $('chart-title').textContent = `$${tok.ticker} · ${tok.name}`;
-        $('chart-sub').textContent = pct !== 0
-          ? `Projected round move: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`
-          : `Final price: ${priceNow.toFixed(7)} I0`;
-        renderCurveSvg(tok, pTok);
-        $('token-metrics').replaceChildren(
-          el('div', { class: 'm-item' }, el('div', { class: 'm-k' }, 'Real I0 Reserve'), el('div', { class: 'm-v mono' }, `${fmtI0(pTok.realI0)} I0`)),
-          el('div', { class: 'm-item' }, el('div', { class: 'm-k' }, 'Virtual Cushion'), el('div', { class: 'm-v mono' }, `${fmtI0(tok.virtualI0)} I0`)),
-          el('div', { class: 'm-item' }, el('div', { class: 'm-k' }, 'Curve Tokens'), el('div', { class: 'm-v mono' }, fmtTok(pTok.realTok))),
-          el('div', { class: 'm-item' }, el('div', { class: 'm-k' }, 'Creator Royalty'), el('div', { class: 'm-v mono' }, '0.5% in I0')),
-        );
-      }
-
-      renderQuotes(projectedState);
-
-      // Pending mempool
-      $('mempool-count').textContent = `${accepted.length} active`;
-      if (!accepted.length) {
-        $('mempool-list').replaceChildren(el('div', { class: 'mut', style: 'font-size:12px' }, 'No pending orders. Submit a Buy, Sell, Launch, or HTLC above.'));
+      if (!tokList.length) {
+        $('explore-tbody').replaceChildren(el('tr', null, el('td', { colspan: '6', class: 'dim' }, 'No matching tokens found.')));
       } else {
-        const items = accepted.map((tx) => {
-          const who = PERSONAS.find((p) => p.pk === tx.from)?.name.split(' ')[0] ?? tx.from.slice(0, 8);
-          const tokRef = tx.tokenId && s.tokens.get(tx.tokenId);
-          const tokLabel = tokRef ? `$${tokRef.ticker}` : String(tx.tokenId ?? '');
-          const desc = tx.type === 'BUY' ? `BUY ${tokLabel} · ${fmtI0(BigInt(tx.i0In))} I0`
-            : tx.type === 'SELL' ? `SELL ${tokLabel} · ${fmtTok(BigInt(tx.tokIn))} tok`
-            : tx.type === 'LAUNCH' ? `LAUNCH $${tx.ticker}`
-            : tx.type === 'HTLC_LOCK' ? `HTLC_LOCK ${fmtI0(BigInt(tx.amount))} I0`
-            : tx.type;
-          const right = el('div', { class: 'item-r' });
-          if (tx.from === activePersona.pk && tx.type !== 'CANCEL') {
-            right.appendChild(el('button', {
-              class: 'sm',
-              onclick: async () => {
-                const nextFee = (BigInt(tx.fee || '0') + 1000n).toString();
-                const cancelTx = E.signTx(s.chainId, { type: 'CANCEL', from: activePersona.pk, nonce: tx.nonce, fee: nextFee }, activePersona.sk);
-                const live = await broadcastTx(cancelTx);
-                showMsg('action-msg', `Replaced nonce ${tx.nonce} with CANCEL${live ? ' (gossiped over Entmoot)' : ''}`);
-              },
-            }, 'Cancel (RBF)'));
-          }
+        $('explore-tbody').replaceChildren(...tokList.map((tok) => {
+          const pTok = projectedState.tokens.get(tok.id) ?? tok;
+          const pNow = Number(tok.virtualI0 + tok.realI0) / Number(tok.realTok);
+          const pProj = Number(pTok.virtualI0 + pTok.realI0) / Number(pTok.realTok);
+          const pct = ((pProj - pNow) / pNow) * 100;
+          const myBal = E.getBalance(projectedState, activePersona.pk, tok.id);
+          const openToken = () => { selectedTokenId = tok.id; setPage('token'); };
           return el(
-            'div',
-            { class: 'item' },
-            el('div', { class: 'item-l' }, el('span', { class: 'dot warn' }), el('strong', null, who), ' ', el('span', { class: 'mono' }, desc), ' ', el('span', { class: 'mut mono' }, `n=${tx.nonce}`)),
-            right,
+            'tr',
+            { class: `clickable ${tok.id === selectedTokenId ? 'selected' : ''}`, onclick: openToken },
+            el('td', null, el('div', { style: 'display:flex;align-items:center;gap:10px' },
+              el('div', { class: 'art-sq' }, makeTokenArtSvg(tok.id, 20)),
+              el('div', null, el('div', { style: 'font-family:var(--font-sans);font-weight:550' }, tok.name), el('div', { class: 'dim' }, `$${tok.ticker}`)),
+            )),
+            el('td', { class: 'r' }, `${pNow.toFixed(7)} I0`),
+            el('td', { class: `r hide-sm ${pct > 0 ? 'ok' : pct < 0 ? 'bad' : 'dim'}` }, pct === 0 ? '0.00%' : `${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`),
+            el('td', { class: 'r' }, `${fmtI0(pTok.realI0)} I0`),
+            el('td', { class: 'r hide-sm mut' }, fmtTok(myBal)),
+            el('td', { class: 'r' }, el('button', { class: 'btn-ghost', onclick: (ev) => { ev.stopPropagation(); openToken(); } }, 'Trade')),
           );
-        });
-        $('mempool-list').replaceChildren(...items);
+        }));
       }
 
-      // HTLCs — clearly distinguish simulated demo escrows from real Ord-confirmed escrows!
+      // 2. TOKEN DETAIL (Option C: Ordinals Art-First + Bonding Curve)
+      $('token-batch-chip').textContent = `${accepted.length} queued · BTC #${activeBtcHeight() + 1} · 0% MEV`;
+      if (selTok) {
+        const pTok = projectedState.tokens.get(selTok.id) ?? selTok;
+        const pNow = Number(selTok.virtualI0 + selTok.realI0) / Number(selTok.realTok);
+        const pProj = Number(pTok.virtualI0 + pTok.realI0) / Number(pTok.realTok);
+        const pct = ((pProj - pNow) / pNow) * 100;
+        const myBal = E.getBalance(projectedState, activePersona.pk, selTok.id);
+
+        $('token-art-box').replaceChildren(makeTokenArtSvg(selTok.id, 78));
+        $('token-title').replaceChildren(selTok.name, ' ', el('span', { class: 'chip num' }, `$${selTok.ticker}`));
+        $('token-prov').textContent = `ID ${shortId(selTok.id)} · Creator ${shortId(selTok.creator)}`;
+        $('token-metrics').replaceChildren(
+          el('div', { class: 'kv' }, el('span', null, 'Real I0 reserve'), el('strong', { class: 'num' }, `${fmtI0(pTok.realI0)} I0`)),
+          el('div', { class: 'kv' }, el('span', null, 'Virtual cushion'), el('strong', { class: 'num' }, `${fmtI0(selTok.virtualI0)} I0`)),
+          el('div', { class: 'kv' }, el('span', null, 'Curve tokens'), el('strong', { class: 'num' }, fmtTok(pTok.realTok))),
+          el('div', { class: 'kv' }, el('span', null, 'Creator royalty'), el('strong', { class: 'num ok' }, '0.5% forever')),
+          el('div', { class: 'kv' }, el('span', null, 'You hold'), el('strong', { class: 'num' }, `${fmtTok(myBal)} $${selTok.ticker}`)),
+        );
+        $('chart-title').textContent = `Bonding Curve · ${pNow.toFixed(7)} I0`;
+        $('chart-sub').textContent = pct !== 0
+          ? `Projected batch move: ${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`
+          : `Final reserve: ${fmtI0(selTok.realI0)} I0`;
+        renderCurveSvg(selTok, pTok);
+      }
+      renderQuotes(projectedState);
+      $('token-pending-count').textContent = `${accepted.length} active`;
+      $('token-pending-list').replaceChildren(...buildMempoolNodes(s, accepted));
+
+      // 3. LAUNCH ART PREVIEW
+      $('launch-art-preview').replaceChildren(makeTokenArtSvg($('launch-ticker').value || 'SAT0', 38));
+
+      // 4. SWAP BTC (Option C: P2P Orderbook + Security-Audited HTLC Cards)
       const netName = $('htlc-net').value;
+      const canFundEscrow = !isSimulatedView() && ordConfirmationVerified;
+      $('htlc-count-chip').textContent = `${s.htlcs.size} active`;
       const hNodes = [];
       for (const h of s.htlcs.values()) {
         const recName = PERSONAS.find((p) => p.pk === h.recipient)?.name.split(' ')[0] ?? h.recipient.slice(0, 6);
+        const senderName = PERSONAS.find((p) => p.pk === h.sender)?.name.split(' ')[0] ?? h.sender.slice(0, 6);
         const btcTimeout = h.timeoutBtcHeight - PARAMS.htlcSafeMarginBtcBlocks;
         const timeRemainingOk = btcTimeout > ordBtcHeight + 2;
 
-        const canFundEscrow = !isSimulatedView() && ordConfirmationVerified;
-        const card = el('div', { class: 'quote' });
         const statusLabel = isSimulatedView()
           ? 'Simulated Demo Escrow (NOT on Bitcoin)'
           : ordConfirmationVerified
             ? 'Ord-Confirmed I0 Escrow'
             : 'Unverified I0 Escrow (no active-block proof)';
+
+        const card = el('div', { class: 'quote-box', style: 'margin-bottom:0' });
         card.appendChild(
           el('div', { class: 'q-line' },
-            el('span', null, el('span', { class: `dot ${canFundEscrow ? 'ok' : 'warn'}` }), `${statusLabel}: ${fmtI0(h.amount)} I0 → ${recName}`),
-            el('span', { class: 'mono mut' }, `I0 exp #${h.timeoutBtcHeight}`),
+            el('span', { style: 'display:inline-flex;align-items:center;gap:7px' },
+              el('span', { class: `dot ${canFundEscrow ? 'ok' : 'warn'}` }),
+              el('strong', null, `${statusLabel}:`),
+              el('span', { class: 'num' }, `${fmtI0(h.amount)} I0 (${senderName} → ${recName})`),
+            ),
+            el('span', { class: 'num dim' }, `I0 exp #${h.timeoutBtcHeight}`),
           ),
         );
         card.appendChild(el('span', { class: 'code-inline' }, `H=${h.hashlock}`));
 
-        // If Alice created this lock in this session, allow her to inspect/export her Secret S backup!
         const mySecret = activePersona.pk === h.sender ? sessionHtlcSecrets.get(h.id) : null;
         if (mySecret) {
-          card.appendChild(el('div', { class: 'mut', style: 'font-size:11px;margin-top:5px' }, 'Your saved claim secret S (back up before reload):'));
+          card.appendChild(el('div', { class: 'dim', style: 'font-size:11px;margin-top:4px' }, 'Your saved claim secret S (back up before reload):'));
           card.appendChild(el('span', { class: 'code-inline' }, mySecret));
         }
 
-        // Only derive & show a Taproot BTC HTLC address when NOT simulated, active-block confirmation is verified, and deadline has sufficient margin!
         if (canFundEscrow && timeRemainingOk && (netName === 'signet' || netName === 'regtest')) {
           try {
             const btcHtlc = E.deriveTaprootHtlc({
@@ -1175,14 +1964,18 @@
             : !ordConfirmationVerified
               ? 'BTC funding address hidden until active-block confirmation is verified.'
               : `Escrow deadline too close to BTC tip #${ordBtcHeight} — funding locked.`;
-          card.appendChild(el('div', { class: 'mut', style: 'font-size:11px;margin-top:5px' }, reason));
+          card.appendChild(el('div', { class: 'dim', style: 'font-size:11.5px;margin-top:4px' }, reason));
         }
 
         if (activePersona.pk === h.recipient) {
-          const preInput = el('input', { class: 'mono', placeholder: 'Paste 64-hex preimage S from confirmed BTC claim witness', style: 'margin-top:6px' });
+          const preInput = el('input', {
+            class: 'field-in num',
+            placeholder: 'Paste 64-hex preimage S from confirmed BTC claim witness',
+            style: 'margin-top:6px;height:32px;padding:0 10px;background:var(--card);border:1px solid var(--line-2);border-radius:6px;font-size:12px',
+          });
           card.appendChild(preInput);
           card.appendChild(el('button', {
-            class: 'sm primary',
+            class: 'btn-primary sm',
             style: 'margin-top:6px',
             onclick: async () => {
               try {
@@ -1194,42 +1987,97 @@
                 }, activePersona.sk);
                 await broadcastTx(tx);
                 showMsg('action-msg', `Signed HTLC_CLAIM for ${shortId(h.id)}`);
-              } catch (err) {
-                showMsg('action-msg', `Claim error: ${err.message}`);
-              }
+              } catch (err) { showMsg('action-msg', `Claim error: ${err.message}`); }
             },
           }, 'Claim I0 with Witness Preimage S'));
         }
         hNodes.push(card);
       }
-      $('htlc-list').replaceChildren(...hNodes);
+      $('htlc-list').replaceChildren(...(hNodes.length ? hNodes : [el('div', { class: 'dim', style: 'font-size:12px' }, 'No active HTLC escrows on chain yet.')]));
 
-      // Blocks explorer
-      const bNodes = [...activeBlocks()].reverse().map((entry) => {
+      // 5. WALLET (Option B: Tabbed Portfolio)
+      let estTotalI0 = myProjI0;
+      const holdRows = [
+        el('tr', null,
+          el('td', null, el('strong', null, 'I0'), ' ', el('span', { class: 'dim' }, 'Native')),
+          el('td', { class: 'r' }, fmtI0(myProjI0)),
+          el('td', { class: 'r' }, `${fmtI0(myProjI0)} I0`),
+          el('td', { class: 'r' }, el('button', { class: 'btn-ghost', onclick: () => setPage('swap') }, 'Swap BTC')),
+        ),
+      ];
+      for (const tok of s.tokens.values()) {
+        const bal = E.getBalance(projectedState, activePersona.pk, tok.id);
+        if (bal <= 0n) continue;
+        const pTok = projectedState.tokens.get(tok.id) ?? tok;
+        const valI0 = (bal * (pTok.virtualI0 + pTok.realI0)) / pTok.realTok;
+        estTotalI0 += valI0;
+        holdRows.push(el('tr', null,
+          el('td', null, el('strong', null, `$${tok.ticker}`), ' ', el('span', { class: 'dim' }, tok.name)),
+          el('td', { class: 'r' }, fmtTok(bal)),
+          el('td', { class: 'r' }, `${fmtI0(valI0)} I0`),
+          el('td', { class: 'r' }, el('button', { class: 'btn-ghost', onclick: () => { selectedTokenId = tok.id; setPage('token'); } }, 'Trade')),
+        ));
+      }
+      $('wallet-total-i0').textContent = `${fmtI0(estTotalI0)} I0`;
+      $('wallet-pk-box').textContent = activePersona.pk;
+      $('wallet-holdings-tbody').replaceChildren(...holdRows);
+      $('mempool-count').textContent = `${accepted.length} active`;
+      $('mempool-list').replaceChildren(...buildMempoolNodes(s, accepted));
+      $('wallet-sk-box').hidden = !revealSecretVisible;
+      $('wallet-sk-box').textContent = revealSecretVisible ? localWallet.sk : '';
+      $('wallet-reveal-btn').textContent = revealSecretVisible ? 'Hide Hex' : 'Reveal Hex';
+
+      const mySwaps = [...s.htlcs.values()].filter((h) => h.sender === activePersona.pk || h.recipient === activePersona.pk);
+      $('wallet-swaps-summary').replaceChildren(
+        ...(mySwaps.length
+          ? mySwaps.map((h) => el('div', { class: 'kv' },
+              el('span', null, `${h.sender === activePersona.pk ? 'Locked' : 'Incoming'} · H=${h.hashlock.slice(0, 12)}…`),
+              el('strong', { class: 'num' }, `${fmtI0(h.amount)} I0 (exp #${h.timeoutBtcHeight})`),
+            ))
+          : [el('div', { class: 'dim', style: 'font-size:12px' }, 'No HTLC escrows for this signer.')]),
+      );
+
+      // 6. VERIFY PROOFS (Option A: Trust Strip + Verified Block History Table)
+      const verLabel = isSimulatedView() ? 'Demo Sandbox' : ordConfirmationVerified ? 'Active-Block Verified' : 'Unverified Host';
+      $('verify-status-chip').textContent = verLabel;
+      $('verify-status-chip').className = `chip ${!isSimulatedView() && ordConfirmationVerified ? 'ok' : 'warn'}`;
+      $('tip-pill').textContent = `${simActive ? 'Sim ' : ''}Block #${s.height} · ${shortId(s.tipId)}`;
+      const lastBlk = activeBlocks()[activeBlocks().length - 1]?.block;
+      $('verify-kpis').replaceChildren(
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Verification'), el('div', { class: `kpi-v ${!isSimulatedView() && ordConfirmationVerified ? 'ok' : 'warn'}` }, ordConfirmationVerified && !isSimulatedView() ? 'Merkle OK' : 'Unverified'), el('div', { class: 'kpi-s' }, ordConfirmationVerified ? 'Raw block proof' : 'Host lacks proof')),
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Eyezero tip'), el('div', { class: 'kpi-v num' }, `#${s.height}`), el('div', { class: 'kpi-s num' }, `BTC #${activeBtcHeight()}`)),
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'State root'), el('div', { class: 'kpi-v num' }, lastBlk ? `${lastBlk.stateRoot.slice(0, 10)}…` : '—'), el('div', { class: 'kpi-s' }, 'Conservation OK')),
+        el('div', { class: 'kpi' }, el('div', { class: 'kpi-k' }, 'Entmoot P2P'), el('div', { class: 'kpi-v num' }, entmootNet?.connected ? 'Live' : 'Local'), el('div', { class: 'kpi-s num' }, `${accepted.length} pending`)),
+      );
+
+      const bRows = [...activeBlocks()].reverse().map((entry) => {
         const b = entry.block;
-        const left = el('div', { class: 'item-l' },
-          el('span', { class: `dot ${entry.simulated ? 'warn' : 'ok'}` }),
-          el('strong', { class: 'mono' }, `#${b.h}`), ' ',
-          el('span', { class: 'mono' }, shortId(b.id)),
-        );
-        if (entry.simulated) left.appendChild(el('span', { class: 'pill', style: 'margin-left:6px' }, 'Simulated'));
-        if (b.checkpoint) left.appendChild(el('span', { class: 'pill', style: 'margin-left:6px' }, 'Checkpoint 1.5×'));
-        return el('div', {
-          class: `item blk-row ${inspectedHeight === b.h ? 'on' : ''}`,
+        const badge = entry.simulated
+          ? el('span', { class: 'chip warn' }, 'Simulated')
+          : b.checkpoint
+            ? el('span', { class: 'chip acc' }, 'Checkpoint 1.5×')
+            : el('span', { class: `chip ${ordConfirmationVerified ? 'ok' : 'warn'}` }, ordConfirmationVerified ? 'Merkle OK' : 'Unverified');
+        return el('tr', {
+          class: `clickable ${inspectedHeight === b.h ? 'selected' : ''}`,
           onclick: () => {
             inspectedHeight = b.h;
-            const pre = $('block-json');
-            pre.hidden = false;
-            pre.textContent = JSON.stringify({
+            $('block-json-card').hidden = false;
+            $('block-json').textContent = JSON.stringify({
               id: b.id, h: b.h, prev: b.prev, btcRef: b.btcRef,
               stateRoot: b.stateRoot, diffCount: b.diff.length,
               hasCheckpoint: Boolean(b.checkpoint), txs: b.txs,
             }, null, 2);
             renderAll();
           },
-        }, left, el('div', { class: 'item-r mono mut' }, `${b.txs.length} txs · BTC #${entry.meta.height}`));
+        },
+          el('td', null, `#${b.h}`),
+          el('td', { class: 'mut' }, shortId(b.id)),
+          el('td', { class: 'r' }, `#${entry.meta.height}`),
+          el('td', { class: 'r' }, String(b.txs.length)),
+          el('td', { class: 'r' }, badge),
+        );
       });
-      $('block-list').replaceChildren(...bNodes);
+      $('block-list').replaceChildren(...bRows);
     }
 
     function refreshWalletSelects() {
@@ -1247,28 +2095,86 @@
     }
     refreshWalletSelects();
 
+    // Wire Navigation & Controls
+    for (const btn of document.querySelectorAll('[data-page]')) {
+      btn.onclick = () => setPage(btn.dataset.page);
+    }
+    $('sync-pill').onclick = () => setPage('verify');
+    $('bal-pill').onclick = () => setPage('wallet');
+    $('explore-swap-btn').onclick = () => setPage('swap');
+    $('explore-launch-btn').onclick = () => { setLaunchStep(1); setPage('launch'); };
+    $('token-back-btn').onclick = () => setPage('explore');
+    $('wallet-go-swap').onclick = () => setPage('swap');
+    $('wtab-open-swap').onclick = () => setPage('swap');
+    $('wallet-go-keys').onclick = () => setWalletTab('keys');
+    $('close-json-btn').onclick = () => { $('block-json-card').hidden = true; };
+    $('toggle-post-htlc').onclick = () => { $('post-htlc-card').hidden = !$('post-htlc-card').hidden; };
+
+    for (const btn of $('explore-sort').querySelectorAll('[data-sort]')) {
+      btn.onclick = () => {
+        activeExploreSort = btn.dataset.sort;
+        for (const b of $('explore-sort').querySelectorAll('[data-sort]')) b.classList.toggle('active', b === btn);
+        renderAll();
+      };
+    }
+    $('explore-search').oninput = () => renderAll();
+
+    for (const btn of $('trade-side-seg').querySelectorAll('[data-side]')) {
+      btn.onclick = () => {
+        activeTradeSide = btn.dataset.side;
+        for (const b of $('trade-side-seg').querySelectorAll('[data-side]')) b.classList.toggle('active', b === btn);
+        $('trade-buy-pane').hidden = activeTradeSide !== 'buy';
+        $('trade-sell-pane').hidden = activeTradeSide !== 'sell';
+        if (activeState()) renderQuotes(getProjected().projectedState);
+      };
+    }
+
+    for (const btn of document.querySelectorAll('[data-buy-pct]')) {
+      btn.onclick = () => {
+        if (!activeState()) return;
+        const avail = E.getBalance(getProjected().projectedState, activePersona.pk, 0);
+        const pct = Number(btn.dataset.buyPct);
+        const val = (Number(avail) / 1e8) * pct;
+        $('buy-amount').value = val > 0 ? val.toFixed(2) : '0';
+        renderQuotes(getProjected().projectedState);
+      };
+    }
+    for (const btn of document.querySelectorAll('[data-sell-pct]')) {
+      btn.onclick = () => {
+        if (!activeState() || !selectedTokenId) return;
+        const avail = E.getBalance(getProjected().projectedState, activePersona.pk, selectedTokenId);
+        const pct = Number(btn.dataset.sellPct);
+        const val = Math.floor((Number(avail) / 1e8) * pct);
+        $('sell-amount').value = String(val);
+        renderQuotes(getProjected().projectedState);
+      };
+    }
+
+    for (const btn of $('wallet-tabs').querySelectorAll('[data-wtab]')) {
+      btn.onclick = () => setWalletTab(btn.dataset.wtab);
+    }
+
+    for (const btn of $('launch-steps').querySelectorAll('[data-lstep]')) {
+      btn.onclick = () => setLaunchStep(Number(btn.dataset.lstep));
+    }
+    $('launch-next-1').onclick = () => setLaunchStep(2);
+    $('launch-prev-2').onclick = () => setLaunchStep(1);
+    $('launch-next-2').onclick = () => setLaunchStep(3);
+    $('launch-prev-3').onclick = () => setLaunchStep(2);
+    $('launch-ticker').oninput = () => $('launch-art-preview').replaceChildren(makeTokenArtSvg($('launch-ticker').value || 'SAT0', 38));
+
     $('wallet-select').onchange = () => {
       activePersona = PERSONAS.find((p) => p.id === $('wallet-select').value) ?? PERSONAS[0];
       renderAll();
     };
     $('htlc-net').onchange = () => activeState() && renderAll();
-    $('wallet-reveal-btn').onclick = () => {
-      revealSecretVisible = !revealSecretVisible;
-      renderAll();
-    };
-
-    for (const btn of $('action-tabs').querySelectorAll('button')) {
-      btn.onclick = () => {
-        for (const b of $('action-tabs').querySelectorAll('button')) b.classList.toggle('on', b === btn);
-        for (const t of ['buy', 'sell', 'launch', 'htlc', 'wallet']) $(`tab-${t}`).hidden = btn.dataset.tab !== t;
-      };
-    }
-    $('show-launch-btn').onclick = () => $('action-tabs').querySelector('[data-tab="launch"]').click();
+    $('wallet-reveal-btn').onclick = () => { revealSecretVisible = !revealSecretVisible; renderAll(); };
     $('buy-amount').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
     $('buy-slip').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
     $('sell-amount').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
     $('sell-slip').oninput = () => activeState() && renderQuotes(getProjected().projectedState);
 
+    // Transaction Handlers
     $('submit-buy').onclick = async () => {
       try {
         const s = activeState();
@@ -1308,13 +2214,32 @@
         const s = activeState();
         const ticker = $('launch-ticker').value.trim().toUpperCase();
         const name = $('launch-name').value.trim();
+        const rawArt = $('launch-art').value.trim();
+        const artId = rawArt && E.isValidInscriptionId(rawArt) ? rawArt : s.genesisId;
         const initialBuy = BigInt(Math.round(Number($('launch-init').value || 0) * 1e8));
         const tx = E.signTx(s.chainId, {
-          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId: s.genesisId,
+          type: 'LAUNCH', from: activePersona.pk, ticker, name, artId,
           initialBuy: initialBuy.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
         }, activePersona.sk);
         const live = await broadcastTx(tx);
-        showMsg('action-msg', `Signed LAUNCH $${ticker} ${live ? '-> gossiped live over Entmoot!' : '-> simulate/mine next block to deploy'}`);
+        showMsg('action-msg', `Signed LAUNCH $${ticker} ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
+        setPage('explore');
+      } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
+    };
+
+    $('submit-transfer').onclick = async () => {
+      try {
+        const s = activeState();
+        const to = $('transfer-to').value.trim().toLowerCase();
+        if (!HEX64_RE.test(to)) throw new Error('Recipient pubkey must be 64 lowercase hex chars');
+        const amount = BigInt(Math.round(Number($('transfer-amount').value) * 1e8));
+        if (amount <= 0n) throw new Error('Transfer amount must be positive');
+        const tx = E.signTx(s.chainId, {
+          type: 'TRANSFER', from: activePersona.pk, to, tokenId: 0,
+          amount: amount.toString(), nonce: nextNonceFor(activePersona.pk), fee: '0',
+        }, activePersona.sk);
+        const live = await broadcastTx(tx);
+        showMsg('action-msg', `Signed TRANSFER (${fmtI0(amount)} I0) ${live ? '-> gossiped live over Entmoot!' : '-> queued locally'}`);
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
@@ -1329,7 +2254,7 @@
 
       const box = $('htlc-secret-backup');
       box.hidden = false;
-      const chk = el('input', { type: 'checkbox', style: 'width:auto;margin-right:6px' });
+      const chk = el('input', { type: 'checkbox', style: 'width:auto;margin-right:7px' });
       chk.onchange = () => {
         stagedSwapSecret.backedUp = chk.checked;
         $('submit-htlc').disabled = !chk.checked;
@@ -1339,16 +2264,14 @@
         el('span', { class: 'code-inline' }, secretHex),
         el('div', { class: 'q-line', style: 'margin-top:6px' }, el('span', { class: 'mut' }, 'Hashlock H = SHA256(S)')),
         el('span', { class: 'code-inline' }, hashlock),
-        el('label', { style: 'display:flex;align-items:center;margin-top:8px;font-size:11.5px;color:var(--ink2)' }, chk, 'I have backed up Secret S offline'),
+        el('label', { style: 'display:flex;align-items:center;margin-top:8px;font-size:12px;color:var(--ink-1)' }, chk, 'I have backed up Secret S offline'),
       );
     };
 
     $('submit-htlc').onclick = async () => {
       try {
         const s = activeState();
-        if (!stagedSwapSecret || !stagedSwapSecret.backedUp) {
-          throw new Error('Generate and confirm backup of Secret S first');
-        }
+        if (!stagedSwapSecret || !stagedSwapSecret.backedUp) throw new Error('Generate and confirm backup of Secret S first');
         const amount = BigInt(Math.round(Number($('htlc-amount').value) * 1e8));
         const recipient = $('htlc-recipient').value;
         const nonce = nextNonceFor(activePersona.pk);
@@ -1406,11 +2329,11 @@
         await broadcastTx(tx);
         activePersona = localWallet;
         refreshWalletSelects();
-        showMsg('action-msg', 'Queued +100 I0 transfer to Session Wallet — click Simulate Local Block to test locally!');
+        showMsg('action-msg', 'Queued +100 I0 transfer to Session Wallet — open Verify Proofs -> Simulate Local Block to test locally!');
       } catch (e) { showMsg('action-msg', `Error: ${e.message}`); }
     };
 
-    // Local demo simulator: operates strictly in isolated simState/simBlockHashCache (NEVER mutates ordState!).
+    // Isolated local demo simulator (NEVER mutates ordState!)
     $('mine-btn').onclick = async () => {
       try {
         const t0 = performance.now();
@@ -1448,8 +2371,7 @@
         );
         simState = E.applyBlock(simState, block, ctx, PARAMS);
         simBtcHeight = nextBtcH;
-        const meta = { height: nextBtcH, number: ctx.inscriptionNumber };
-        simBlocks.push({ block, meta, simulated: true });
+        simBlocks.push({ block, meta: { height: nextBtcH, number: ctx.inscriptionNumber }, simulated: true });
         pruneConfirmedMempool(simState);
         invalidateProjection();
         const ms = (performance.now() - t0).toFixed(1);
@@ -1458,7 +2380,7 @@
       } catch (e) { showMsg('action-msg', `Simulate error: ${e.message}`); }
     };
 
-    // Permute independent sender groups using actual verified parent state & genesisBtcHeight!
+    // Zero-MEV permutation proof starting from verified bootState
     $('mev-test-btn').onclick = () => {
       try {
         const blocks = activeBlocks();
@@ -1481,8 +2403,6 @@
           );
         }
         const b = targetEntry.block;
-        // Group consecutive/same-sender transactions strictly preserving every sender's nonce sequence,
-        // keeping LAUNCH senders first so newly created tokens exist, then reversing pure-trade sender groups!
         const bySender = new Map();
         for (const t of b.txs) {
           if (!bySender.has(t.from)) bySender.set(t.from, []);
@@ -1510,7 +2430,7 @@
         const match = revBlk.stateRoot === b.stateRoot;
         showMsg('mev-result', match
           ? `Zero-MEV proven on Block #${b.h}: permuted sender groups passed applyBlock() with identical stateRoot (${b.stateRoot.slice(0, 16)}…)`
-          : `Mismatch!`);
+          : 'Mismatch!');
       } catch (err) {
         showMsg('mev-result', `Shuffle error: ${err.message}`);
       }

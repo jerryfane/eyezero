@@ -6,14 +6,31 @@ import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { meetsTarget } from '../../engine/src/pow.js';
 
-const ORD_INSCRIBE_ROOT =
-  process.env.ORD_INSCRIBE_ROOT ??
-  '/mnt/storagebox-workspaces/checkouts/ordinals-lab/ord-inscribe';
+let _depsPromise = null;
 
-const ordInscribe = await import(`${ORD_INSCRIBE_ROOT}/dist/index.js`);
-const reqFromOrd = createRequire(`${ORD_INSCRIBE_ROOT}/package.json`);
-const { Transaction } = reqFromOrd('@scure/btc-signer');
-const { schnorr } = reqFromOrd('@noble/curves/secp256k1.js');
+export async function loadOrdInscribeDeps() {
+  if (!_depsPromise) {
+    _depsPromise = (async () => {
+      const root =
+        process.env.ORD_INSCRIBE_ROOT ??
+        '/mnt/storagebox-workspaces/checkouts/ordinals-lab/ord-inscribe';
+      let ordInscribe;
+      try {
+        ordInscribe = await import(`${root}/dist/index.js`);
+      } catch (err) {
+        throw new Error(
+          `Unable to load ord-inscribe from "${root}/dist/index.js". ` +
+          `Set ORD_INSCRIBE_ROOT to a built jerryfane/ord-inscribe checkout. (${err.message})`,
+        );
+      }
+      const reqFromOrd = createRequire(`${root}/package.json`);
+      const { Transaction } = reqFromOrd('@scure/btc-signer');
+      const { schnorr } = reqFromOrd('@noble/curves/secp256k1.js');
+      return { ordInscribe, Transaction, schnorr };
+    })();
+  }
+  return _depsPromise;
+}
 
 const SIGHASH_DEFAULT = 0;
 const LEAF_VERSION_TAPSCRIPT = 0xc0;
@@ -38,8 +55,6 @@ function doubleSha256ReversedHex(buf) {
 // (exact byte layout hashed for txid per BIP-141) and return byte offsets for nSequence and nLockTime.
 function buildRevealPreimageTemplate({ version, commitTxidHex, vout, outputAmount, outputScript }) {
   const scriptLen = outputScript.length;
-  // 4(ver) + 1(vin) + 32(txid) + 4(vout) + 1(scriptSigLen=0) + 4(seq)
-  // + 1(voutCount) + 8(amount) + 1(scriptLen) + scriptLen + 4(lockTime)
   const totalLen = 4 + 1 + 32 + 4 + 1 + 4 + 1 + 8 + 1 + scriptLen + 4;
   const buf = Buffer.alloc(totalLen);
   let off = 0;
@@ -64,8 +79,9 @@ function buildRevealPreimageTemplate({ version, commitTxidHex, vout, outputAmoun
 }
 
 /**
- * Build a commit+reveal inscription plan for `bodyBytes`, grind reveal_txid offline until
- * `<reveal_txid>i0 <= target`, sign both reveal and commit, and return raw hex transactions.
+ * Build a commit+reveal Taproot inscription plan for `bodyBytes`, grind reveal_txid offline until
+ * `<reveal_txid>i0 <= target`, sign both reveal and commit, verify finalized commit outpoint match,
+ * and return raw hex transactions + recovery metadata.
  */
 export async function mineVanityInscription({
   bodyBytes,
@@ -83,8 +99,9 @@ export async function mineVanityInscription({
   maxHashes = 5_000_000,
 }) {
   if (network === 'mainnet') {
-    throw new Error('Refusing mainnet broadcast from test vanity miner without explicit mainnet override');
+    throw new Error('Mainnet mining is disabled in eyezero v1 preview (supported networks: regtest, signet, testnet)');
   }
+  const { ordInscribe, Transaction, schnorr } = await loadOrdInscribeDeps();
   const t0 = Date.now();
 
   const planInput = {
@@ -194,12 +211,20 @@ export async function mineVanityInscription({
   const signedCommit = ordInscribe.parsePsbt(signedCommitPsbt);
   signedCommit.finalize();
 
+  // Verify the finalized commit txid still matches the exact outpoint spent by revealTx!
+  if (signedCommit.id !== planned.commitTxid) {
+    throw new Error(
+      `Finalized commit txid mismatch: got ${signedCommit.id}, reveal expects ${planned.commitTxid}`,
+    );
+  }
+
   return {
     commitHex: signedCommit.hex,
     revealHex: revealTx.hex,
     commitTxid: signedCommit.id,
     revealTxid: revealTx.id,
     inscriptionId: `${revealTx.id}i0`,
+    recovery,
     lockTime: winLockTime,
     sequence: winSeq,
     hashes,

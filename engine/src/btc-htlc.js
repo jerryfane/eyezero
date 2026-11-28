@@ -10,17 +10,23 @@
 import {
   bytesToHex,
   concatBytes,
+  getPublicKeyHex,
   hexToBytes,
+  isValidXOnlyPubkey,
   schnorrSign,
   sha256,
+  sha256Hex,
   taggedHash,
   taprootTweakPubkey,
 } from './crypto.js';
 
-// Standard BIP-341 provably unspendable NUMS internal key (lift_x(SHA256(G_uncompressed))).
-export const BIP341_NUMS_XONLY = hexToBytes(
-  '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0',
-);
+// Private copy of standard BIP-341 provably unspendable NUMS internal key (lift_x(SHA256(G_uncompressed))).
+// Never expose a mutable Uint8Array reference directly to callers.
+const BIP341_NUMS_HEX = '50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0';
+
+export function getBip341NumsXOnly() {
+  return hexToBytes(BIP341_NUMS_HEX);
+}
 
 const LEAF_VERSION_TAPSCRIPT = 0xc0;
 const OP_SHA256 = 0xa8;
@@ -28,6 +34,8 @@ const OP_EQUALVERIFY = 0x88;
 const OP_CHECKSIG = 0xac;
 const OP_CHECKLOCKTIMEVERIFY = 0xb1;
 const OP_DROP = 0x75;
+const MAX_BTC_SATS = 2_100_000_000_000_000n;
+const HTLC_HEX64_RE = /^[0-9a-f]{64}$/i;
 
 const HRP_BY_NETWORK = Object.freeze({
   mainnet: 'bc',
@@ -37,7 +45,7 @@ const HRP_BY_NETWORK = Object.freeze({
   regtest: 'bcrt',
 });
 
-// --- Bech32 / Bech32m (BIP-173 / BIP-350) ---
+// --- Strict Bech32 / Bech32m (BIP-173 / BIP-350) ---
 
 const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
 const BECH32_CONST = 1;
@@ -88,6 +96,18 @@ function convertBits(data, fromBits, toBits, pad) {
 }
 
 export function encodeSegwitAddress(hrp, witnessVersion, programBytes) {
+  if (!Number.isInteger(witnessVersion) || witnessVersion < 0 || witnessVersion > 16) {
+    throw new Error(`Invalid witness version: ${witnessVersion}`);
+  }
+  if (programBytes.length < 2 || programBytes.length > 40) {
+    throw new Error(`Invalid witness program length: ${programBytes.length}`);
+  }
+  if (witnessVersion === 0 && programBytes.length !== 20 && programBytes.length !== 32) {
+    throw new Error('Witness v0 program must be 20 or 32 bytes');
+  }
+  if (witnessVersion === 1 && programBytes.length !== 32) {
+    throw new Error('Witness v1 (Taproot) program must be 32 bytes');
+  }
   const words = [witnessVersion, ...convertBits(programBytes, 8, 5, true)];
   const specConst = witnessVersion === 0 ? BECH32_CONST : BECH32M_CONST;
   const pm = polymod([...hrpExpand(hrp), ...words, 0, 0, 0, 0, 0, 0]) ^ specConst;
@@ -96,27 +116,66 @@ export function encodeSegwitAddress(hrp, witnessVersion, programBytes) {
   return `${hrp}1${[...words, ...checksum].map((w) => BECH32_CHARSET[w]).join('')}`;
 }
 
-export function decodeSegwitAddress(addr) {
+export function decodeSegwitAddress(addr, expectedNetwork = null) {
+  if (typeof addr !== 'string' || addr.length < 8 || addr.length > 90) {
+    throw new Error(`Invalid segwit address length: ${addr}`);
+  }
+  // BIP-173 / BIP-350 forbid mixed-case strings.
+  const hasLower = /[a-z]/.test(addr);
+  const hasUpper = /[A-Z]/.test(addr);
+  if (hasLower && hasUpper) {
+    throw new Error(`Mixed-case segwit address forbidden: ${addr}`);
+  }
+  for (let i = 0; i < addr.length; i++) {
+    const code = addr.charCodeAt(i);
+    if (code < 33 || code > 126) throw new Error(`Invalid ASCII char in address: ${addr}`);
+  }
+
   const lower = addr.toLowerCase();
   const pos = lower.lastIndexOf('1');
   if (pos < 1 || pos + 7 > lower.length) throw new Error(`Invalid segwit address: ${addr}`);
   const hrp = lower.slice(0, pos);
+  if (expectedNetwork) {
+    const expectedHrp = HRP_BY_NETWORK[expectedNetwork];
+    if (!expectedHrp) throw new Error(`Unsupported network: ${expectedNetwork}`);
+    if (hrp !== expectedHrp) {
+      throw new Error(`Address network mismatch: got HRP "${hrp}", expected "${expectedHrp}" (${expectedNetwork})`);
+    }
+  } else if (hrp !== 'bc' && hrp !== 'tb' && hrp !== 'bcrt') {
+    throw new Error(`Unknown Bitcoin segwit HRP: ${hrp}`);
+  }
+
   const data = [];
   for (let i = pos + 1; i < lower.length; i++) {
     const idx = BECH32_CHARSET.indexOf(lower[i]);
     if (idx < 0) throw new Error(`Invalid bech32 char in ${addr}`);
     data.push(idx);
   }
-  const check = polymod([...hrpExpand(hrp), ...data]);
+  if (data.length < 7) throw new Error(`Truncated bech32 payload in ${addr}`);
+
   const witnessVersion = data[0];
+  if (witnessVersion < 0 || witnessVersion > 16) {
+    throw new Error(`Invalid witness version ${witnessVersion} in ${addr}`);
+  }
+  const check = polymod([...hrpExpand(hrp), ...data]);
   const want = witnessVersion === 0 ? BECH32_CONST : BECH32M_CONST;
-  if (check !== want) throw new Error(`Invalid bech32 checksum for ${addr}`);
+  if (check !== want) throw new Error(`Invalid bech32/bech32m checksum for ${addr}`);
+
   const program = new Uint8Array(convertBits(data.slice(1, -6), 5, 8, false));
+  if (program.length < 2 || program.length > 40) {
+    throw new Error(`Invalid witness program length ${program.length} in ${addr}`);
+  }
+  if (witnessVersion === 0 && program.length !== 20 && program.length !== 32) {
+    throw new Error(`Invalid v0 witness program length ${program.length} in ${addr}`);
+  }
+  if (witnessVersion === 1 && program.length !== 32) {
+    throw new Error(`Invalid v1 Taproot program length ${program.length} in ${addr}`);
+  }
   return { hrp, witnessVersion, program };
 }
 
-export function addressToScriptPubKey(address) {
-  const { witnessVersion, program } = decodeSegwitAddress(address);
+export function addressToScriptPubKey(address, expectedNetwork = null) {
+  const { witnessVersion, program } = decodeSegwitAddress(address, expectedNetwork);
   const opVer = witnessVersion === 0 ? 0x00 : 0x50 + witnessVersion;
   return concatBytes(new Uint8Array([opVer, program.length]), program);
 }
@@ -124,18 +183,26 @@ export function addressToScriptPubKey(address) {
 // --- Bitcoin Script & Serialization Helpers ---
 
 function u32LE(n) {
+  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) {
+    throw new Error(`u32LE out of range: ${n}`);
+  }
   const b = new Uint8Array(4);
-  new DataView(b.buffer).setUint32(0, n >>> 0, true);
+  new DataView(b.buffer).setUint32(0, n, true);
   return b;
 }
 
 function u64LE(n) {
+  const bi = BigInt(n);
+  if (bi < 0n || bi > 0xffffffffffffffffn) {
+    throw new Error(`u64LE out of range: ${bi}`);
+  }
   const b = new Uint8Array(8);
-  new DataView(b.buffer).setBigUint64(0, BigInt(n), true);
+  new DataView(b.buffer).setBigUint64(0, bi, true);
   return b;
 }
 
 function encodeVarInt(n) {
+  if (!Number.isInteger(n) || n < 0 || n > 0xffffffff) throw new Error(`Invalid varint: ${n}`);
   if (n < 0xfd) return new Uint8Array([n]);
   if (n <= 0xffff) {
     const b = new Uint8Array(3);
@@ -206,7 +273,7 @@ export function deriveTaprootHtlc({
   bobPubkey,
   hashlock,
   timeoutBtcHeight,
-  network = 'mainnet',
+  network = 'signet',
 }) {
   const alicePk = typeof alicePubkey === 'string' ? hexToBytes(alicePubkey) : alicePubkey;
   const bobPk = typeof bobPubkey === 'string' ? hexToBytes(bobPubkey) : bobPubkey;
@@ -214,11 +281,19 @@ export function deriveTaprootHtlc({
   if (alicePk.length !== 32 || bobPk.length !== 32 || hashBytes.length !== 32) {
     throw new Error('alicePubkey, bobPubkey, and hashlock must each be 32 bytes');
   }
+  if (!isValidXOnlyPubkey(alicePk)) {
+    throw new Error('alicePubkey is not a valid secp256k1 x-only public key');
+  }
+  if (!isValidXOnlyPubkey(bobPk)) {
+    throw new Error('bobPubkey is not a valid secp256k1 x-only public key');
+  }
   if (!Number.isInteger(timeoutBtcHeight) || timeoutBtcHeight < 1 || timeoutBtcHeight >= 500_000_000) {
     throw new Error('timeoutBtcHeight must be a valid Bitcoin block height (< 500,000,000)');
   }
   const hrp = HRP_BY_NETWORK[network];
   if (!hrp) throw new Error(`Unsupported network: ${network}`);
+
+  const numsKey = getBip341NumsXOnly();
 
   // Leaf 1 (Claim): OP_SHA256 <32B H> OP_EQUALVERIFY <32B alicePk> OP_CHECKSIG
   const claimScript = concatBytes(
@@ -240,11 +315,11 @@ export function deriveTaprootHtlc({
   const claimLeafHash = tapLeafHash(claimScript);
   const refundLeafHash = tapLeafHash(refundScript);
   const merkleRoot = tapBranchHash(claimLeafHash, refundLeafHash);
-  const { xOnly: outputKey, parity } = taprootTweakPubkey(BIP341_NUMS_XONLY, merkleRoot);
+  const { xOnly: outputKey, parity } = taprootTweakPubkey(numsKey, merkleRoot);
 
   const controlHeader = new Uint8Array([LEAF_VERSION_TAPSCRIPT | (parity & 1)]);
-  const controlBlockClaim = concatBytes(controlHeader, BIP341_NUMS_XONLY, refundLeafHash);
-  const controlBlockRefund = concatBytes(controlHeader, BIP341_NUMS_XONLY, claimLeafHash);
+  const controlBlockClaim = concatBytes(controlHeader, numsKey, refundLeafHash);
+  const controlBlockRefund = concatBytes(controlHeader, numsKey, claimLeafHash);
 
   const outputScript = concatBytes(new Uint8Array([0x51, 0x20]), outputKey);
   const address = encodeSegwitAddress(hrp, 1, outputKey);
@@ -252,6 +327,9 @@ export function deriveTaprootHtlc({
   return {
     network,
     address,
+    alicePubkeyHex: bytesToHex(alicePk),
+    bobPubkeyHex: bytesToHex(bobPk),
+    hashlockHex: bytesToHex(hashBytes),
     outputScript,
     outputScriptHex: bytesToHex(outputScript),
     outputKeyHex: bytesToHex(outputKey),
@@ -264,6 +342,56 @@ export function deriveTaprootHtlc({
     controlBlockClaim,
     controlBlockRefund,
   };
+}
+
+function validateSpendInputs({ utxo, htlc, feeSats }) {
+  if (!utxo || typeof utxo.txid !== 'string' || !HTLC_HEX64_RE.test(utxo.txid)) {
+    throw new Error('Invalid UTXO txid (must be 64 hex chars)');
+  }
+  if (!Number.isInteger(utxo.vout) || utxo.vout < 0 || utxo.vout > 0xffffffff) {
+    throw new Error(`Invalid UTXO vout: ${utxo?.vout}`);
+  }
+  if (typeof utxo.value !== 'bigint' && (!Number.isSafeInteger(utxo.value) || utxo.value <= 0)) {
+    throw new Error(`Invalid UTXO value: ${utxo?.value}`);
+  }
+  const prevAmount = BigInt(utxo.value);
+  if (prevAmount <= 0n || prevAmount > MAX_BTC_SATS) {
+    throw new Error(`UTXO value out of valid Bitcoin range: ${prevAmount}`);
+  }
+  if (typeof feeSats !== 'bigint' && (!Number.isSafeInteger(feeSats) || feeSats <= 0)) {
+    throw new Error(`Invalid feeSats: ${feeSats}`);
+  }
+  const fee = BigInt(feeSats);
+  if (fee <= 0n || fee >= prevAmount) {
+    throw new Error(`Invalid fee ${fee} for UTXO value ${prevAmount}`);
+  }
+  const outAmount = prevAmount - fee;
+  if (outAmount < 330n) throw new Error(`Spend output below Taproot dust (330 sats): ${outAmount}`);
+
+  if (!htlc || !htlc.alicePubkeyHex || !htlc.bobPubkeyHex || !htlc.hashlockHex) {
+    throw new Error('Malformed HTLC descriptor: missing canonical contract parameters');
+  }
+  // Rederive the Taproot contract to prevent signing against tampered scripts or outputKeys.
+  const verifiedHtlc = deriveTaprootHtlc({
+    alicePubkey: htlc.alicePubkeyHex,
+    bobPubkey: htlc.bobPubkeyHex,
+    hashlock: htlc.hashlockHex,
+    timeoutBtcHeight: htlc.timeoutBtcHeight,
+    network: htlc.network,
+  });
+  if (verifiedHtlc.outputScriptHex !== htlc.outputScriptHex || verifiedHtlc.address !== htlc.address) {
+    throw new Error('HTLC descriptor failed deterministic contract rederivation');
+  }
+  // Require independently verified scriptPubKeyHex AND confirmed status (>= 1 confirmation)
+  // before signing any spend (prevents leaking preimage S on an unconfirmed or fake funding output).
+  if (typeof utxo.scriptPubKeyHex !== 'string' || utxo.scriptPubKeyHex.toLowerCase() !== verifiedHtlc.outputScriptHex) {
+    throw new Error('Confirmed UTXO scriptPubKeyHex is required and must match Taproot HTLC outputScript');
+  }
+  if (!Number.isInteger(utxo.confirmations) || utxo.confirmations < 1) {
+    throw new Error(`HTLC funding UTXO must include confirmations >= 1 before signing spend (got ${utxo.confirmations})`);
+  }
+
+  return { prevAmount, fee, outAmount, verifiedHtlc };
 }
 
 // Compute BIP-341 Tapscript sighash (SIGHASH_DEFAULT = 0x00) for a 1-input, 1-output spend.
@@ -360,7 +488,7 @@ function serializeSegwitTx({
 
 /**
  * Build and sign Alice's Taproot HTLC claim transaction (reveals secret S on Bitcoin L1).
- * utxo: { txid: 64-hex, vout: number, value: bigint | number }
+ * utxo: { txid: 64-hex, vout: number, value: bigint | number, scriptPubKeyHex?: string }
  */
 export function buildAndSignHtlcClaimTx({
   utxo,
@@ -370,16 +498,19 @@ export function buildAndSignHtlcClaimTx({
   destinationAddress,
   feeSats = 500n,
 }) {
-  const prevAmount = BigInt(utxo.value);
-  const fee = BigInt(feeSats);
-  const outAmount = prevAmount - fee;
-  if (outAmount < 330n) throw new Error(`Claim output below dust: ${outAmount}`);
+  const { prevAmount, outAmount, verifiedHtlc } = validateSpendInputs({ utxo, htlc, feeSats });
 
   const secretBytes = typeof secretHex === 'string' ? hexToBytes(secretHex) : secretHex;
   if (secretBytes.length !== 32) throw new Error('HTLC secret must be 32 bytes');
+  if (sha256Hex(secretBytes) !== verifiedHtlc.hashlockHex) {
+    throw new Error('HTLC secret does not match contract hashlock (refusing to sign)');
+  }
+  if (getPublicKeyHex(alicePrivKey) !== verifiedHtlc.alicePubkeyHex) {
+    throw new Error('alicePrivKey does not match HTLC claim pubkey (refusing to disclose secret)');
+  }
 
   const prevTxidLE = new Uint8Array([...hexToBytes(utxo.txid)].reverse());
-  const outScriptPubKey = addressToScriptPubKey(destinationAddress);
+  const outScriptPubKey = addressToScriptPubKey(destinationAddress, verifiedHtlc.network);
   const version = 2;
   const lockTime = 0;
   const sequence = 0xfffffffd;
@@ -391,10 +522,10 @@ export function buildAndSignHtlcClaimTx({
     prevVout: utxo.vout,
     sequence,
     prevAmount,
-    prevScriptPubKey: htlc.outputScript,
+    prevScriptPubKey: verifiedHtlc.outputScript,
     outAmount,
     outScriptPubKey,
-    leafHash: htlc.claimLeafHash,
+    leafHash: verifiedHtlc.claimLeafHash,
   });
   const sig = schnorrSign(sighash, alicePrivKey);
 
@@ -408,12 +539,14 @@ export function buildAndSignHtlcClaimTx({
     sequence,
     outAmount,
     outScriptPubKey,
-    witnessItems: [sig, secretBytes, htlc.claimScript, htlc.controlBlockClaim],
+    witnessItems: [sig, secretBytes, verifiedHtlc.claimScript, verifiedHtlc.controlBlockClaim],
   });
 }
 
 /**
- * Build and sign Bob's Taproot HTLC timeout refund transaction (valid at btcHeight >= timeoutBtcHeight).
+ * Build and sign Bob's Taproot HTLC timeout refund transaction.
+ * With nLockTime = H (timeoutBtcHeight) and non-final nSequence = 0xfffffffe,
+ * the transaction becomes mempool-eligible once Bitcoin tip reaches H and can first confirm in block H + 1.
  */
 export function buildAndSignHtlcRefundTx({
   utxo,
@@ -422,15 +555,16 @@ export function buildAndSignHtlcRefundTx({
   destinationAddress,
   feeSats = 500n,
 }) {
-  const prevAmount = BigInt(utxo.value);
-  const fee = BigInt(feeSats);
-  const outAmount = prevAmount - fee;
-  if (outAmount < 330n) throw new Error(`Refund output below dust: ${outAmount}`);
+  const { prevAmount, outAmount, verifiedHtlc } = validateSpendInputs({ utxo, htlc, feeSats });
+
+  if (getPublicKeyHex(bobPrivKey) !== verifiedHtlc.bobPubkeyHex) {
+    throw new Error('bobPrivKey does not match HTLC refund pubkey');
+  }
 
   const prevTxidLE = new Uint8Array([...hexToBytes(utxo.txid)].reverse());
-  const outScriptPubKey = addressToScriptPubKey(destinationAddress);
+  const outScriptPubKey = addressToScriptPubKey(destinationAddress, verifiedHtlc.network);
   const version = 2;
-  const lockTime = htlc.timeoutBtcHeight;
+  const lockTime = verifiedHtlc.timeoutBtcHeight;
   const sequence = 0xfffffffe; // non-final so CLTV checks nLockTime; BIP-68 bit 31 set
 
   const sighash = computeTapscriptSighash({
@@ -440,10 +574,10 @@ export function buildAndSignHtlcRefundTx({
     prevVout: utxo.vout,
     sequence,
     prevAmount,
-    prevScriptPubKey: htlc.outputScript,
+    prevScriptPubKey: verifiedHtlc.outputScript,
     outAmount,
     outScriptPubKey,
-    leafHash: htlc.refundLeafHash,
+    leafHash: verifiedHtlc.refundLeafHash,
   });
   const sig = schnorrSign(sighash, bobPrivKey);
 
@@ -455,6 +589,6 @@ export function buildAndSignHtlcRefundTx({
     sequence,
     outAmount,
     outScriptPubKey,
-    witnessItems: [sig, htlc.refundScript, htlc.controlBlockRefund],
+    witnessItems: [sig, verifiedHtlc.refundScript, verifiedHtlc.controlBlockRefund],
   });
 }

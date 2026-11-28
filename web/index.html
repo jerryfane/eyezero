@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>eyezero (i0) — Xverse Companion Wrapper</title>
+  <title>eyezero (i0) — Preview Wrapper</title>
   <style>
     :root {
       color-scheme: dark;
@@ -13,7 +13,6 @@
       --line2: #31343c;
       --ink: #ededef;
       --mut: #8b8e96;
-      --ok: #30a46c;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; font-size: 13px; display: flex; flex-direction: column; }
@@ -29,23 +28,24 @@
 <body>
   <div class="bar">
     <div class="bar-l">
-      <strong>eyezero <span class="mono">wrapper</span></strong>
-      <span class="status" id="status">Bridges Xverse + mempool.space to the immutable Genesis Inscription iframe</span>
+      <strong>eyezero <span class="mono">preview</span></strong>
+      <span class="status" id="status">Pinned cross-origin OrdStudio demo (read-only preview; no wallet funding bridge active)</span>
     </div>
     <div class="bar-r">
-      <span class="mono" id="xverse-addr">Xverse: not connected</span>
-      <button class="primary" id="connect-btn">Connect Xverse</button>
+      <span class="mono" id="xverse-addr">Wallet: preview only</span>
+      <button class="primary" id="connect-btn">Check Xverse (Signet)</button>
     </div>
   </div>
-  <iframe id="genesis-frame" sandbox="allow-scripts allow-same-origin" title="eyezero Genesis Inscription"></iframe>
+  <!-- Pinned immutable HTTPS document on a separate origin; no public URL query override. -->
+  <iframe
+    id="genesis-frame"
+    src="https://app.ordstudio.app/d/aB8H6Hen95be"
+    sandbox="allow-scripts allow-same-origin"
+    referrerpolicy="no-referrer"
+    title="eyezero Genesis Inscription"
+  ></iframe>
 
   <script>
-    const params = new URLSearchParams(location.search);
-    const defaultSrc = 'https://app.ordstudio.app/d/aB8H6Hen95be';
-    const frame = document.getElementById('genesis-frame');
-    frame.src = params.get('src') || defaultSrc;
-
-    let btcAddress = null;
     const statusEl = document.getElementById('status');
     const addrEl = document.getElementById('xverse-addr');
 
@@ -53,7 +53,24 @@
       return window.XverseProviders?.BitcoinProvider || window.BitcoinProvider || null;
     }
 
-    async function connectXverse() {
+    async function verifySignetNetwork(provider, address) {
+      if (/^(bc1|1|3)/i.test(address)) {
+        throw new Error('Wallet returned a Bitcoin Mainnet address; switch Xverse to Signet.');
+      }
+      try {
+        const netRes = await provider.request('wallet_getNetwork', null);
+        const netName = String(netRes?.result?.bitcoin?.name || netRes?.bitcoin?.name || '').toLowerCase();
+        if (netName && netName !== 'signet') {
+          throw new Error(`Wallet network is "${netName}", expected "signet".`);
+        }
+        return netName === 'signet';
+      } catch (err) {
+        if (err?.message?.includes('expected "signet"')) throw err;
+        return false;
+      }
+    }
+
+    document.getElementById('connect-btn').onclick = async () => {
       const provider = xverseProvider();
       if (!provider) {
         statusEl.textContent = 'Xverse extension not detected in this browser.';
@@ -62,58 +79,19 @@
       try {
         const res = await provider.request('getAccounts', {
           purposes: ['payment', 'ordinals'],
-          message: 'Connect Bitcoin wallet for eyezero HTLC swaps',
+          message: 'Verify Bitcoin Signet wallet for eyezero preview',
         });
         const list = res?.result || res?.addresses || [];
         const pay = list.find((a) => a.purpose === 'payment') || list[0];
         if (!pay?.address) throw new Error('No address returned');
-        btcAddress = pay.address;
-        addrEl.textContent = `${btcAddress.slice(0, 10)}…${btcAddress.slice(-6)}`;
-        statusEl.textContent = 'Xverse connected — 1-click BTC HTLC funding ready.';
-        frame.contentWindow?.postMessage({ type: 'eyezero:wrapper:ready', btcAddress }, '*');
+        const isSignet = await verifySignetNetwork(provider, pay.address);
+        const preview = `${pay.address.slice(0, 8)}…${pay.address.slice(-4)}`;
+        addrEl.textContent = isSignet ? `${preview} (signet)` : `${preview} (unverified net)`;
+        statusEl.textContent = 'Read-only preview: direct dedicated-origin inscription embed is required before enabling live HTLC funding.';
       } catch (err) {
-        statusEl.textContent = `Xverse error: ${err?.message || err}`;
+        statusEl.textContent = `Xverse check: ${err?.message || err}`;
       }
-    }
-
-    document.getElementById('connect-btn').onclick = connectXverse;
-
-    window.addEventListener('message', async (ev) => {
-      const msg = ev.data;
-      if (!msg || typeof msg !== 'object') return;
-
-      if (msg.type === 'eyezero:xverse:fundHtlc') {
-        const provider = xverseProvider();
-        if (!provider) {
-          statusEl.textContent = `Install Xverse or send BTC manually to ${msg.address}`;
-          return;
-        }
-        try {
-          const amountSats = Number(prompt(`Send how many sats to Taproot HTLC ${msg.address}?`, '50000'));
-          if (!amountSats || amountSats < 546) return;
-          const res = await provider.request('sendTransfer', {
-            recipients: [{ address: msg.address, amount: amountSats }],
-          });
-          statusEl.textContent = `Sent ${amountSats} sats to HTLC (${res?.result?.txid || 'submitted'})`;
-        } catch (err) {
-          statusEl.textContent = `Transfer cancelled/failed: ${err?.message || err}`;
-        }
-      }
-
-      if (msg.type === 'eyezero:xverse:broadcastTx' && typeof msg.txHex === 'string') {
-        const apiBase = msg.network === 'signet'
-          ? 'https://mempool.space/signet/api/tx'
-          : 'https://mempool.space/api/tx';
-        try {
-          const r = await fetch(apiBase, { method: 'POST', body: msg.txHex });
-          const text = await r.text();
-          if (!r.ok) throw new Error(text);
-          statusEl.textContent = `Broadcasted Bitcoin HTLC tx: ${text}`;
-        } catch (err) {
-          statusEl.textContent = `Broadcast error: ${err?.message || err}`;
-        }
-      }
-    });
+    };
   </script>
 </body>
 </html>

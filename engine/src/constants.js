@@ -6,7 +6,7 @@ export const I0_TOKEN_ID = 0;
 
 export const V1_MAINNET_PARAMS = Object.freeze({
   version: 1,
-  // Minimum leading zero bits in display-order reveal_txid (20 bits = "00000...i0").
+  // Minimum leading zero bits for dual-bound PoW (payload workHash + display-order reveal_txid).
   powMinBits: 20,
   // Retarget difficulty every 72 eyezero blocks (~12 hours at 1 eyezero block / Bitcoin block).
   retargetInterval: 72,
@@ -33,9 +33,16 @@ export const V1_MAINNET_PARAMS = Object.freeze({
   // Permanent bonding-curve virtual I0 cushion and total token supply per launched token.
   virtualI0: 30_000n * UNIT,
   initialTokSupply: 1_000_000_000n * UNIT,
-  // Ticker / name constraints.
+  // Metadata & block bounds.
   maxTickerLen: 12,
   maxNameLen: 32,
+  maxArtIdLen: 80,
+  maxTxsPerBlock: 500,
+  maxZeroFeeCancelsPerBlock: 16,
+  maxBlockBytes: 350_000,
+  maxCheckpointPageBytes: 280_000,
+  // Recommended minimum gap between Bitcoin HTLC timeout and eyezero I0 HTLC timeout.
+  htlcSafeMarginBtcBlocks: 12,
 });
 
 export const V1_TEST_PARAMS = Object.freeze({
@@ -44,6 +51,9 @@ export const V1_TEST_PARAMS = Object.freeze({
   retargetInterval: 8,
   checkpointInterval: 6,
 });
+
+// Shared preset for the interactive OrdStudio demo & build script.
+export const V1_DEMO_PARAMS = V1_TEST_PARAMS;
 
 export function blockRewardForHeight(height, params = V1_MAINNET_PARAMS) {
   if (!Number.isInteger(height) || height < 1) {

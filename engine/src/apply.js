@@ -1,21 +1,44 @@
-// Core deterministic transaction signing, mempool cancel/replace, uniform batch clearing, and applyBlock().
+// Core deterministic transaction canonicalization, BIP-340 signing, mempool cancel/replace,
+// joint-validated batch selection/preview, uniform zero-MEV batch clearing, and applyBlock().
 
 import { I0_TOKEN_ID, V1_MAINNET_PARAMS, blockRewardForHeight } from './constants.js';
-import { bytesToHex, hexToBytes, schnorrSign, schnorrVerify, sha256, sha256Hex } from './crypto.js';
-import { meetsTarget, nextTarget, targetToWork, validateBtcAnchor } from './pow.js';
+import {
+  bytesToHex,
+  hexToBytes,
+  isValidXOnlyPubkey,
+  schnorrSign,
+  schnorrVerify,
+  sha256,
+  sha256Hex,
+} from './crypto.js';
+import {
+  grindBlockWorkNonce,
+  isValidInscriptionId,
+  meetsTarget,
+  meetsWorkTarget,
+  nextTarget,
+  targetToWork,
+  validateBtcAnchor,
+} from './pow.js';
 import {
   addBalance,
   assertStateConservation,
   cloneState,
+  compareTokenIds,
   computeStateDiff,
-  computeStateRoot,
-  exportCheckpoint,
+  encodeStateCommitment,
   getOrCreateAccount,
   subBalance,
 } from './state.js';
 
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const HEX128_RE = /^[0-9a-f]{128}$/;
+// Full 256-bit launch-bound immutable token ID: "t_<64 lowercase hex>"
+const TOKEN_ID_RE = /^t_[0-9a-f]{64}$/;
+const TICKER_RE = /^[A-Za-z0-9._-]{1,12}$/;
+const NAME_SAFE_RE = /^[ -~]{1,32}$/;
+const HTML_UNSAFE_RE = /[<>&"'`]/;
+const PLACEHOLDER_BLOCK_ID = '0'.repeat(64) + 'i0';
 
 function parseAmount(val, field, allowZero = false) {
   let n;
@@ -33,19 +56,49 @@ function parseAmount(val, field, allowZero = false) {
 }
 
 function assertPubkey(pk, label = 'pubkey') {
-  if (typeof pk !== 'string' || !HEX64_RE.test(pk)) {
-    throw new Error(`Invalid 32-byte hex ${label}`);
+  if (typeof pk !== 'string' || !HEX64_RE.test(pk) || !isValidXOnlyPubkey(pk)) {
+    throw new Error(`Invalid secp256k1 x-only ${label}`);
   }
+}
+
+export function isValidTokenId(tokenId) {
+  return tokenId === I0_TOKEN_ID || (typeof tokenId === 'string' && TOKEN_ID_RE.test(tokenId));
+}
+
+// Full 256-bit launch-bound immutable token ID: binds every signed LAUNCH parameter
+// (chainId, from, nonce, ticker, name, artId, initialBuy) so competing launches on
+// forks can never alias the same tokenId.
+export function computeTokenId(chainId, launch) {
+  if (!launch || typeof launch !== 'object') {
+    throw new Error('computeTokenId requires a launch object');
+  }
+  const payload = {
+    chainId,
+    from: launch.from,
+    nonce: launch.nonce,
+    ticker: launch.ticker,
+    name: launch.name ?? '',
+    artId: launch.artId ?? '',
+    initialBuy: String(launch.initialBuy ?? '0'),
+  };
+  return 't_' + sha256Hex(`eyezero:v1:token:${JSON.stringify(payload)}`);
 }
 
 export function computeSwapId(chainId, sender, nonce) {
   return sha256Hex(`eyezero:v1:htlc:${chainId}:${sender}:${nonce}`);
 }
 
-// Canonical domain-separated transaction digest (32 bytes) signed with BIP-340 Schnorr.
-export function txDigest(chainId, tx) {
-  const canonical = {
-    chainId,
+// Measure exact UTF-8 byte length of the full accepted block representation (including id, diff, checkpoint, txs).
+export function measureAcceptedBlockBytes(block) {
+  const withId = block.id ? block : { ...block, id: PLACEHOLDER_BLOCK_ID };
+  const s = JSON.stringify(withId);
+  return typeof Buffer !== 'undefined' ? Buffer.byteLength(s, 'utf8') : new TextEncoder().encode(s).length;
+}
+
+// Strip all unsigned/extraneous fields so unauthenticated bytes can never inflate block inscriptions.
+export function canonicalizeTx(tx) {
+  if (!tx || typeof tx !== 'object') throw new Error('Transaction must be an object');
+  const out = {
     type: tx.type,
     from: tx.from,
     nonce: tx.nonce,
@@ -53,52 +106,74 @@ export function txDigest(chainId, tx) {
   };
   switch (tx.type) {
     case 'TRANSFER':
-      canonical.to = tx.to;
-      canonical.tokenId = tx.tokenId;
-      canonical.amount = String(tx.amount);
+      out.to = tx.to;
+      out.tokenId = tx.tokenId;
+      out.amount = String(tx.amount);
       break;
     case 'LAUNCH':
-      canonical.ticker = tx.ticker;
-      canonical.name = tx.name;
-      canonical.artId = tx.artId ?? '';
-      canonical.initialBuy = String(tx.initialBuy ?? '0');
+      out.ticker = tx.ticker;
+      out.name = tx.name;
+      out.artId = tx.artId ?? '';
+      out.initialBuy = String(tx.initialBuy ?? '0');
       break;
     case 'BUY':
-      canonical.tokenId = tx.tokenId;
-      canonical.i0In = String(tx.i0In);
-      canonical.minTokOut = String(tx.minTokOut ?? '0');
+      out.tokenId = tx.tokenId;
+      out.i0In = String(tx.i0In);
+      out.minTokOut = String(tx.minTokOut ?? '0');
       break;
     case 'SELL':
-      canonical.tokenId = tx.tokenId;
-      canonical.tokIn = String(tx.tokIn);
-      canonical.minI0Out = String(tx.minI0Out ?? '0');
+      out.tokenId = tx.tokenId;
+      out.tokIn = String(tx.tokIn);
+      out.minI0Out = String(tx.minI0Out ?? '0');
       break;
     case 'HTLC_LOCK':
-      canonical.recipient = tx.recipient;
-      canonical.amount = String(tx.amount);
-      canonical.hashlock = tx.hashlock;
-      canonical.timeoutBtcHeight = tx.timeoutBtcHeight;
+      out.recipient = tx.recipient;
+      out.amount = String(tx.amount);
+      out.hashlock = tx.hashlock;
+      out.timeoutBtcHeight = tx.timeoutBtcHeight;
       break;
     case 'HTLC_CLAIM':
-      canonical.swapId = tx.swapId;
-      canonical.preimage = tx.preimage;
+      out.swapId = tx.swapId;
+      out.preimage = tx.preimage;
       break;
     case 'HTLC_REFUND':
-      canonical.swapId = tx.swapId;
+      out.swapId = tx.swapId;
       break;
     case 'CANCEL':
-      // Explicit zero-op cancel for replace-by-nonce on Entmoot.
       break;
     default:
       throw new Error(`Unknown tx type: ${tx.type}`);
   }
-  return sha256(`eyezero:v1:tx:${JSON.stringify(canonical)}`);
+  if (typeof tx.sig === 'string') out.sig = tx.sig;
+  return out;
+}
+
+function assertCanonicalTxShape(tx) {
+  const canon = canonicalizeTx(tx);
+  const actualKeys = Object.keys(tx);
+  const canonKeys = Object.keys(canon);
+  if (actualKeys.length !== canonKeys.length) {
+    throw new Error(`Transaction contains extra unsigned fields (${tx.type})`);
+  }
+  for (const k of canonKeys) {
+    if (!Object.prototype.hasOwnProperty.call(tx, k)) {
+      throw new Error(`Transaction missing canonical field ${k}`);
+    }
+  }
+}
+
+export function txDigest(chainId, tx) {
+  const canon = canonicalizeTx(tx);
+  delete canon.sig;
+  return sha256(`eyezero:v1:tx:${JSON.stringify({ chainId, ...canon })}`);
 }
 
 export function signTx(chainId, tx, privKeyBytes, auxRandBytes) {
-  const digest = txDigest(chainId, tx);
+  const canon = canonicalizeTx(tx);
+  delete canon.sig;
+  const digest = txDigest(chainId, canon);
   const sig = bytesToHex(schnorrSign(digest, privKeyBytes, auxRandBytes));
-  return { ...tx, sig };
+  return { ...canon, sig };
 }
 
 export function verifyTxSignature(chainId, tx) {
@@ -113,13 +188,24 @@ export function verifyTxSignature(chainId, tx) {
 }
 
 // Cancel / replace-by-nonce selection for pending Entmoot orders.
-// For the same (from, nonce), the valid signed tx with the highest priority fee wins
-// (tie-break: lexicographically lower sig for determinism).
-export function resolvePendingMempool(state, pendingTxs) {
+// Verifies each signature at most once (optionally caching verified sigs in `verifiedSigs`),
+// strips unsigned extra fields, and filters syntactically invalid tokenIds.
+export function resolvePendingMempool(state, pendingTxs, { verifiedSigs = null } = {}) {
   const bestBySenderNonce = new Map();
-  for (const tx of pendingTxs) {
-    if (!verifyTxSignature(state.chainId, tx)) continue;
+  for (const rawTx of pendingTxs) {
+    let tx;
+    try {
+      tx = canonicalizeTx(rawTx);
+    } catch {
+      continue;
+    }
     if (!Number.isInteger(tx.nonce) || tx.nonce < 1) continue;
+    if ((tx.type === 'BUY' || tx.type === 'SELL') && (typeof tx.tokenId !== 'string' || !TOKEN_ID_RE.test(tx.tokenId))) {
+      continue;
+    }
+    if (tx.type === 'TRANSFER' && !isValidTokenId(tx.tokenId)) {
+      continue;
+    }
     let fee;
     try {
       fee = parseAmount(tx.fee ?? '0', 'fee', true);
@@ -130,6 +216,21 @@ export function resolvePendingMempool(state, pendingTxs) {
     const curNonce = acc ? acc.nonce : 0;
     if (tx.nonce <= curNonce) continue;
 
+    // Key verification cache by BOTH canonical tx digest AND signature so a forged copy
+    // reusing a valid tx's sig with modified body/fee can NEVER bypass BIP-340 verification!
+    let digestHex;
+    try {
+      digestHex = bytesToHex(txDigest(state.chainId, tx));
+    } catch {
+      continue;
+    }
+    const cacheKey = `${digestHex}:${tx.sig}`;
+    const sigOk = verifiedSigs && verifiedSigs.has(cacheKey)
+      ? true
+      : verifyTxSignature(state.chainId, tx);
+    if (!sigOk) continue;
+    if (verifiedSigs) verifiedSigs.add(cacheKey);
+
     const key = `${tx.from}:${tx.nonce}`;
     const prev = bestBySenderNonce.get(key);
     if (!prev || fee > prev.fee || (fee === prev.fee && tx.sig < prev.tx.sig)) {
@@ -137,7 +238,6 @@ export function resolvePendingMempool(state, pendingTxs) {
     }
   }
 
-  // Keep only contiguous nonce sequences starting at account.nonce + 1 per sender.
   const bySender = new Map();
   for (const { tx } of bestBySenderNonce.values()) {
     if (!bySender.has(tx.from)) bySender.set(tx.from, []);
@@ -157,16 +257,22 @@ export function resolvePendingMempool(state, pendingTxs) {
 }
 
 // Execute deterministic state transition for a list of transactions inside a block.
-// Used by both applyBlock (consensus verification) and buildBlock / previewPending.
-function executeBlockTxs(next, miner, txs, btcHeight, params) {
-  // 1. Verify all signatures, nonces, and basic syntax first (strict sequential per sender).
+// `skipSigVerify` is strictly internal for pre-verified batches inside previewPending/selectCandidateTxs;
+// consensus applyBlock() ALWAYS passes skipSigVerify=false.
+function executeBlockTxs(next, miner, txs, btcHeight, params, { skipSigVerify = false } = {}) {
+  if (txs.length > params.maxTxsPerBlock) {
+    throw new Error(`Block exceeds maxTxsPerBlock (${txs.length} > ${params.maxTxsPerBlock})`);
+  }
+
   const expectedNonce = new Map();
+  let zeroFeeCancels = 0;
   for (const tx of txs) {
+    assertCanonicalTxShape(tx);
     assertPubkey(tx.from, 'tx.from');
     if (!Number.isInteger(tx.nonce) || tx.nonce < 1) {
       throw new Error(`Invalid nonce ${tx.nonce}`);
     }
-    if (!verifyTxSignature(next.chainId, tx)) {
+    if (!skipSigVerify && !verifyTxSignature(next.chainId, tx)) {
       throw new Error(`Invalid BIP-340 signature for ${tx.from} nonce ${tx.nonce}`);
     }
     const cur = expectedNonce.has(tx.from)
@@ -178,9 +284,17 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     expectedNonce.set(tx.from, cur + 1);
   }
 
-  // Advance account nonces and collect priority tips.
   for (const tx of txs) {
     const fee = parseAmount(tx.fee ?? '0', 'fee', true);
+    if (tx.type === 'CANCEL' && fee === 0n) {
+      if (!next.accounts.has(tx.from)) {
+        throw new Error('Zero-fee CANCEL rejected for unfunded/unknown account');
+      }
+      zeroFeeCancels++;
+      if (zeroFeeCancels > params.maxZeroFeeCancelsPerBlock) {
+        throw new Error(`Block exceeds maxZeroFeeCancelsPerBlock (${params.maxZeroFeeCancelsPerBlock})`);
+      }
+    }
     if (fee > 0n) {
       subBalance(next, tx.from, I0_TOKEN_ID, fee);
       addBalance(next, miner, I0_TOKEN_ID, fee);
@@ -188,8 +302,6 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     getOrCreateAccount(next, tx.from).nonce = tx.nonce;
   }
 
-  // Collect batch buy/sell orders grouped by tokenId.
-  // { buys: [{ from, i0In, netB, minTokOut }], sells: [{ from, tokIn, minI0Out }] }
   const batches = new Map();
   function getBatch(tokenId) {
     let b = batches.get(tokenId);
@@ -200,8 +312,6 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     return b;
   }
 
-  // 2. Non-trade primitives (deterministic in tx order for transfers/launches/HTLCs;
-  //    trades are queued into order-independent batches below).
   for (const tx of txs) {
     switch (tx.type) {
       case 'CANCEL':
@@ -209,7 +319,7 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
 
       case 'TRANSFER': {
         assertPubkey(tx.to, 'tx.to');
-        if (!Number.isInteger(tx.tokenId) || tx.tokenId < 0) {
+        if (!isValidTokenId(tx.tokenId)) {
           throw new Error(`Invalid tokenId ${tx.tokenId}`);
         }
         if (tx.tokenId !== I0_TOKEN_ID && !next.tokens.has(tx.tokenId)) {
@@ -222,31 +332,57 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
       }
 
       case 'LAUNCH': {
-        if (typeof tx.ticker !== 'string' || tx.ticker.length < 1 || tx.ticker.length > params.maxTickerLen) {
-          throw new Error('Invalid ticker length');
+        if (
+          typeof tx.ticker !== 'string' ||
+          tx.ticker.length < 1 ||
+          tx.ticker.length > params.maxTickerLen ||
+          !TICKER_RE.test(tx.ticker)
+        ) {
+          throw new Error('Invalid ticker (must match ^[A-Za-z0-9._-]{1,12}$)');
         }
-        if (typeof tx.name !== 'string' || tx.name.length < 1 || tx.name.length > params.maxNameLen) {
-          throw new Error('Invalid token name length');
+        if (
+          typeof tx.name !== 'string' ||
+          tx.name.length < 1 ||
+          tx.name.length > params.maxNameLen ||
+          !NAME_SAFE_RE.test(tx.name) ||
+          HTML_UNSAFE_RE.test(tx.name)
+        ) {
+          throw new Error('Invalid token name (printable ASCII 1..32 chars, no HTML metacharacters)');
         }
-        if (tx.artId !== undefined && typeof tx.artId !== 'string') {
-          throw new Error('Invalid artId');
+        const artId = tx.artId ?? '';
+        if (
+          typeof artId !== 'string' ||
+          artId.length > params.maxArtIdLen ||
+          (artId !== '' && !isValidInscriptionId(artId))
+        ) {
+          throw new Error('Invalid artId (must be empty or a valid inscription ID)');
         }
         subBalance(next, tx.from, I0_TOKEN_ID, params.launchFee);
         addBalance(next, miner, I0_TOKEN_ID, params.launchFee);
 
-        const tokenId = next.nextTokenId++;
+        const initialBuy = parseAmount(tx.initialBuy ?? '0', 'initialBuy', true);
+        const tokenId = computeTokenId(next.chainId, {
+          from: tx.from,
+          nonce: tx.nonce,
+          ticker: tx.ticker,
+          name: tx.name,
+          artId,
+          initialBuy: initialBuy.toString(),
+        });
+        if (next.tokens.has(tokenId)) {
+          throw new Error(`Duplicate tokenId ${tokenId}`);
+        }
         next.tokens.set(tokenId, {
           id: tokenId,
           ticker: tx.ticker,
           name: tx.name,
-          artId: tx.artId ?? '',
+          artId,
           creator: tx.from,
           virtualI0: params.virtualI0,
           realI0: 0n,
           realTok: params.initialTokSupply,
         });
 
-        const initialBuy = parseAmount(tx.initialBuy ?? '0', 'initialBuy', true);
         if (initialBuy > 0n) {
           subBalance(next, tx.from, I0_TOKEN_ID, initialBuy);
           const totalFee = (initialBuy * params.tradeFeeBps) / params.bpsDenom;
@@ -289,8 +425,8 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
         if (!htlc) throw new Error(`Unknown or closed HTLC ${tx.swapId}`);
         if (tx.from !== htlc.recipient) throw new Error('Only HTLC recipient may claim');
         if (btcHeight >= htlc.timeoutBtcHeight) throw new Error('HTLC has timed out');
-        if (typeof tx.preimage !== 'string' || tx.preimage.length === 0) {
-          throw new Error('Missing HTLC preimage');
+        if (typeof tx.preimage !== 'string' || !HEX64_RE.test(tx.preimage)) {
+          throw new Error('HTLC preimage must be 32 lowercase hex bytes');
         }
         const digest = sha256Hex(hexToBytes(tx.preimage));
         if (digest !== htlc.hashlock) throw new Error('HTLC preimage hash mismatch');
@@ -310,7 +446,7 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
       }
 
       case 'BUY': {
-        if (!Number.isInteger(tx.tokenId) || !next.tokens.has(tx.tokenId)) {
+        if (typeof tx.tokenId !== 'string' || !next.tokens.has(tx.tokenId)) {
           throw new Error(`Unknown tokenId ${tx.tokenId} in BUY`);
         }
         const i0In = parseAmount(tx.i0In, 'i0In');
@@ -329,7 +465,7 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
       }
 
       case 'SELL': {
-        if (!Number.isInteger(tx.tokenId) || !next.tokens.has(tx.tokenId)) {
+        if (typeof tx.tokenId !== 'string' || !next.tokens.has(tx.tokenId)) {
           throw new Error(`Unknown tokenId ${tx.tokenId} in SELL`);
         }
         const tokIn = parseAmount(tx.tokIn, 'tokIn');
@@ -344,8 +480,7 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
     }
   }
 
-  // 3. Order-independent Uniform Batch Clearing per token (sorted ascending by tokenId).
-  const tokenIds = [...batches.keys()].sort((a, b) => a - b);
+  const tokenIds = [...batches.keys()].sort(compareTokenIds);
   for (const tokenId of tokenIds) {
     const tok = next.tokens.get(tokenId);
     const { buys, sells } = batches.get(tokenId);
@@ -403,22 +538,30 @@ function executeBlockTxs(next, miner, txs, btcHeight, params) {
   }
 }
 
-// Helper for miners / tests: construct a complete candidate block payload with exact stateRoot, diff, and checkpoint.
-// Notice: id and btcContext are optional so a real miner can build the exact inscription payload BEFORE grinding reveal_txid!
-export function buildCandidateBlock(state, { id = null, miner, btcRef, txs = [], nonce = 0 }, btcContext = null, params = V1_MAINNET_PARAMS) {
+// Helper for miners / tests: construct a complete candidate block payload with exact stateRoot,
+// diff, bounded checkpoint, exact accepted-representation size check (BEFORE grinding), and payload-bound PoW.
+export function buildCandidateBlock(
+  state,
+  { id = null, miner, btcRef, txs = [], nonce = 0, grindWork = true },
+  btcContext = null,
+  params = V1_MAINNET_PARAMS,
+) {
   assertPubkey(miner, 'miner');
+  const canonicalTxs = txs.map(canonicalizeTx);
   const next = cloneState(state);
   const target = nextTarget(state, params);
   const h = state.height + 1;
 
   next.height = h;
   if (id) next.tipId = id;
+  // epochStartBtcHeight depends only on the already-confirmed parent state.tipBtcHeight,
+  // so set it unconditionally (even when btcContext is null before Bitcoin confirmation!).
+  if (h > 1 && (h - 1) % params.retargetInterval === 0) {
+    next.epochStartBtcHeight = state.tipBtcHeight;
+  }
   if (btcContext) {
     next.tipBtcHeight = btcContext.btcHeight;
     next.tipInscriptionNumber = btcContext.inscriptionNumber;
-    if (h === 1 || (h - 1) % params.retargetInterval === 0) {
-      next.epochStartBtcHeight = btcContext.btcHeight;
-    }
   }
   next.target = target;
   next.cumulativeWork = state.cumulativeWork + targetToWork(target);
@@ -427,14 +570,13 @@ export function buildCandidateBlock(state, { id = null, miner, btcRef, txs = [],
   next.totalI0Minted += reward;
   addBalance(next, miner, I0_TOKEN_ID, reward);
 
-  // HTLC timeouts evaluate deterministically against block.btcRef.h (known before confirmation!).
-  executeBlockTxs(next, miner, txs, btcRef.h, params);
+  executeBlockTxs(next, miner, canonicalTxs, btcRef.h, params);
 
-  const stateRoot = computeStateRoot(next);
+  const { stateRoot, checkpoint: encodedCp } = encodeStateCommitment(next, params);
   const diff = computeStateDiff(state, next);
-  const checkpoint = h % params.checkpointInterval === 0 ? exportCheckpoint(next) : null;
+  const checkpoint = h % params.checkpointInterval === 0 ? encodedCp : null;
 
-  const block = {
+  let block = {
     v: params.version,
     ...(id ? { id } : {}),
     h,
@@ -445,8 +587,19 @@ export function buildCandidateBlock(state, { id = null, miner, btcRef, txs = [],
     stateRoot,
     diff,
     checkpoint,
-    txs,
+    txs: canonicalTxs,
   };
+
+  // Budget the EXACT accepted representation (including placeholder id + diff + checkpoint + txs + max nonce digits)
+  // BEFORE spending CPU grinding payload workHash or reveal_txid!
+  const acceptedBytes = measureAcceptedBlockBytes({ ...block, nonce: 9_999_999_999 });
+  if (acceptedBytes > params.maxBlockBytes) {
+    throw new Error(`Candidate block exceeds maxBlockBytes (${acceptedBytes} > ${params.maxBlockBytes})`);
+  }
+
+  if (grindWork) {
+    block = grindBlockWorkNonce(block, target);
+  }
 
   return {
     block,
@@ -459,6 +612,10 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   if (!block || block.v !== params.version) {
     throw new Error(`Unsupported block version: ${block?.v}`);
   }
+  const serializedLen = measureAcceptedBlockBytes(block);
+  if (serializedLen > params.maxBlockBytes) {
+    throw new Error(`Block exceeds maxBlockBytes (${serializedLen} > ${params.maxBlockBytes})`);
+  }
   const expectedHeight = state.height + 1;
   if (block.h !== expectedHeight) {
     throw new Error(`Invalid block height: got ${block.h}, expected ${expectedHeight}`);
@@ -470,24 +627,27 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   if (!Array.isArray(block.txs)) {
     throw new Error('block.txs must be an array');
   }
+  if (!Number.isInteger(block.nonce) || block.nonce < 0) {
+    throw new Error('block.nonce must be a non-negative integer');
+  }
 
-  // 1. Validate Bitcoin confirmation + anti-premine anchor.
   validateBtcAnchor(state, block, btcContext, params);
 
-  // 2. Validate vanity-ID PoW target.
   const target = nextTarget(state, params);
+  if (!meetsWorkTarget(block, target)) {
+    throw new Error(`Block payload workHash fails PoW target ${target.toString(16)}`);
+  }
   if (!meetsTarget(block.id, target)) {
     throw new Error(`Block ID ${block.id} fails PoW target ${target.toString(16)}`);
   }
 
-  // 3. Apply reward + transactions deterministically.
   const next = cloneState(state);
   next.height = expectedHeight;
   next.tipId = block.id;
   next.tipBtcHeight = btcContext.btcHeight;
   next.tipInscriptionNumber = btcContext.inscriptionNumber;
-  if (expectedHeight === 1 || (expectedHeight - 1) % params.retargetInterval === 0) {
-    next.epochStartBtcHeight = btcContext.btcHeight;
+  if (expectedHeight > 1 && (expectedHeight - 1) % params.retargetInterval === 0) {
+    next.epochStartBtcHeight = state.tipBtcHeight;
   }
   next.target = target;
   next.cumulativeWork = state.cumulativeWork + targetToWork(target);
@@ -496,14 +656,12 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   next.totalI0Minted += reward;
   addBalance(next, block.miner, I0_TOKEN_ID, reward);
 
-  // HTLC timeouts evaluate deterministically against block.btcRef.h.
-  executeBlockTxs(next, block.miner, block.txs, block.btcRef.h, params);
+  // Consensus path ALWAYS verifies every BIP-340 signature (skipSigVerify=false).
+  executeBlockTxs(next, block.miner, block.txs, block.btcRef.h, params, { skipSigVerify: false });
 
-  // 4. Verify strict supply conservation.
   assertStateConservation(next, params);
 
-  // 5. Verify stateRoot, stateDiff, and mandatory checkpoint.
-  const expectedRoot = computeStateRoot(next);
+  const { stateRoot: expectedRoot, checkpoint: expectedCp } = encodeStateCommitment(next, params);
   if (block.stateRoot !== expectedRoot) {
     throw new Error(`stateRoot mismatch: got ${block.stateRoot}, expected ${expectedRoot}`);
   }
@@ -518,9 +676,8 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
     if (!block.checkpoint) {
       throw new Error(`Mandatory checkpoint missing at height ${expectedHeight}`);
     }
-    const cpHash = sha256Hex(JSON.stringify(block.checkpoint));
-    if (cpHash !== expectedRoot) {
-      throw new Error(`Checkpoint content does not match stateRoot at height ${expectedHeight}`);
+    if (JSON.stringify(block.checkpoint) !== JSON.stringify(expectedCp)) {
+      throw new Error(`Checkpoint content does not match canonical checkpoint at height ${expectedHeight}`);
     }
   } else if (block.checkpoint !== null && block.checkpoint !== undefined) {
     throw new Error(`Unexpected checkpoint at non-checkpoint height ${expectedHeight}`);
@@ -529,30 +686,85 @@ export function applyBlock(state, block, btcContext, params = V1_MAINNET_PARAMS)
   return next;
 }
 
-// Preview pending Entmoot mempool orders on top of confirmed state (for live <1s UI charts).
-export function previewPending(state, pendingTxs, previewBtcHeight, params = V1_MAINNET_PARAMS) {
-  const selected = resolvePendingMempool(state, pendingTxs);
-  let incremental = cloneState(state);
-  const dummyMiner = '0'.repeat(64);
+// Joint-validated candidate selection & UI projection with O(n) signature verification
+// (verifies each signature ONCE in resolvePendingMempool, then reuses verification for prefix trials).
+// When `minerPubkey` and `btcRef` are supplied (e.g. by the miner CLI), executes under the EXACT
+// candidate block context (real miner + block reward + full accepted block byte budget including diff & checkpoint!).
+export function previewPending(
+  state,
+  pendingTxs,
+  previewBtcHeight,
+  params = V1_MAINNET_PARAMS,
+  { minerPubkey = null, btcRef = null, verifiedSigs = null } = {},
+) {
+  const sigCache = verifiedSigs ?? new Set();
+  const selected = resolvePendingMempool(state, pendingTxs, { verifiedSigs: sigCache });
+  const miner = minerPubkey ?? '79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
+  const nextHeight = state.height + 1;
+  const includeBlockReward = Boolean(minerPubkey);
+
+  const baseTrialState = () => {
+    const t = cloneState(state);
+    if (includeBlockReward) {
+      const reward = blockRewardForHeight(nextHeight, params);
+      t.totalI0Minted += reward;
+      addBalance(t, miner, I0_TOKEN_ID, reward);
+    }
+    return t;
+  };
+
+  let committedState = baseTrialState();
   const accepted = [];
   const dropped = [];
+  const brokenSenders = new Set();
 
   for (const tx of selected) {
+    if (brokenSenders.has(tx.from)) {
+      dropped.push({ tx, reason: 'Prior nonce from sender was dropped' });
+      continue;
+    }
+    if (accepted.length >= params.maxTxsPerBlock) {
+      brokenSenders.add(tx.from);
+      dropped.push({ tx, reason: 'maxTxsPerBlock reached' });
+      continue;
+    }
     try {
-      const trial = cloneState(incremental);
-      executeBlockTxs(trial, dummyMiner, [tx], previewBtcHeight, params);
-      incremental = trial;
+      const candidateList = [...accepted, tx];
+      const trial = baseTrialState();
+      executeBlockTxs(trial, miner, candidateList, previewBtcHeight, params, { skipSigVerify: true });
+
+      // When building a real miner candidate, enforce the EXACT full accepted block byte budget
+      // (including id placeholder, diff, checkpoint, and txs) BEFORE admitting the tx!
+      if (btcRef) {
+        trial.height = nextHeight;
+        const { stateRoot, checkpoint: encodedCp } = encodeStateCommitment(trial, params);
+        const diff = computeStateDiff(state, trial);
+        const checkpoint = nextHeight % params.checkpointInterval === 0 ? encodedCp : null;
+        const estBytes = measureAcceptedBlockBytes({
+          v: params.version,
+          id: PLACEHOLDER_BLOCK_ID,
+          h: nextHeight,
+          prev: state.tipId,
+          btcRef,
+          miner,
+          nonce: 9_999_999_999,
+          stateRoot,
+          diff,
+          checkpoint,
+          txs: candidateList,
+        });
+        if (estBytes > params.maxBlockBytes) {
+          throw new Error(`Candidate block byte budget exceeded (${estBytes} > ${params.maxBlockBytes})`);
+        }
+      }
+
+      committedState = trial;
       accepted.push(tx);
     } catch (err) {
+      brokenSenders.add(tx.from);
       dropped.push({ tx, reason: err.message });
     }
   }
 
-  const projected = cloneState(state);
-  try {
-    executeBlockTxs(projected, dummyMiner, accepted, previewBtcHeight, params);
-    return { projectedState: projected, accepted, dropped };
-  } catch {
-    return { projectedState: incremental, accepted, dropped };
-  }
+  return { projectedState: committedState, accepted, dropped };
 }
